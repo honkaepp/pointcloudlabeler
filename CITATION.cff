@@ -61,6 +61,9 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.22824705
     description: "Version 0.1.0"
+  - type: doi
+    value: 10.5281/zenodo.22828192
+    description: "Version 0.1.1"
 
 # --- License -----------------------------------------------------------
 # The software. The documentation is CC BY 4.0 (see LICENSE-DOCS);
@@ -85,8 +88,8 @@ keywords:
   - "TreeQSM"
   - "biomass"
 
-version: "0.1.1"
-date-released: "2026-09-18"   # the day v0.1.1 was tagged
+version: "0.1.2"
+date-released: "2026-09-18"   # the day v0.1.2 was tagged
 type: software
 
 # --- Preferred citation (paper, once published) ------------------------

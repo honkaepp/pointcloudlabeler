@@ -396,6 +396,12 @@ export interface FilterConfig {
    *  no ceiling. Read through filterGeometry's marginReach, never
    *  directly. */
   isolateMargin: IsolateMargin;
+  /** Whether Tree Review's margin control edits all six reaches as one
+   *  number (true, the default) or each direction on its own. Filter
+   *  state rather than a flag inside the control, because the control
+   *  is mounted only while a tree is isolated and a flag inside it came
+   *  back as "linked" every time isolation was left and re-entered. */
+  isolateMarginLinked: boolean;
   /** While isolating, also show OTHER trees' assigned points inside the
    *  same margin/Z neighbourhood — useful to see where a neighbouring
    *  crown ends so points can be moved between the two. They keep their
@@ -487,6 +493,7 @@ export const DEFAULT_FILTERS: FilterConfig = {
   isolateBox: null,
   isolateAnchor: null,
   isolateMargin: [2, 2, 2, 2, 2, 2],
+  isolateMarginLinked: true,
   isolateShowOthers: false,
   isolateOtherIds: null,
   isolateRecords: null,

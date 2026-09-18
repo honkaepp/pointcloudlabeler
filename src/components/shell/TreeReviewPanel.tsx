@@ -17,7 +17,8 @@ import { loadTreeMetrics } from '../../metrics/loadMetrics';
 import { treeIdColor, UNASSIGNED_RGB } from '../../three/palette';
 import DualRangeSlider from './DualRangeSlider';
 import { farExtent, isolateGeomFor, neighboursOf } from './treeNeighbourhood';
-import { marginReach, isUniformReach, type IsolateMargin, type MarginReach } from '../../three/filterGeometry';
+import { marginReach, type IsolateMargin, type MarginReach } from '../../three/filterGeometry';
+import { editReach, relinkReach, DIRECTION_LABELS, DIRECTION_TITLES } from './marginFields';
 import { confirmDialog } from '../../ui/dialogs';
 
 type SortMode = 'id' | 'count';
@@ -830,7 +831,14 @@ export default function TreeReviewPanel() {
               nearby (and forced-detail) points reach, so you can pull
               stray points into the tree or trim ones that don't belong.
               Per axis and without a ceiling — see MarginFields. */}
-          <MarginFields value={filters.isolateMargin} onChange={(m) => setFilters({ isolateMargin: m })} />
+          <MarginFields
+            value={filters.isolateMargin}
+            linked={filters.isolateMarginLinked}
+            onChange={(m) => setFilters({ isolateMargin: m })}
+            onLinkedChange={(linked) => setFilters(linked
+              ? { isolateMarginLinked: true, isolateMargin: relinkReach(filters.isolateMargin) }
+              : { isolateMarginLinked: false })}
+          />
           {isolating && selectedEntry && farReach >= 3 && (
             <div className="mono text-[9.5px] flex items-center gap-2" style={{ color: '#e6c068', lineHeight: 1.4 }}>
               <span className="flex-1 min-w-0">
@@ -1780,7 +1788,8 @@ function FilterRange({ label, min, max, setMin, setMax, step, disabled }: {
   );
 }
 
-/** The isolate margin, one field per DIRECTION and no ceiling.
+/** The isolate margin: one number for every direction, or one field per
+ *  DIRECTION, and no ceiling.
  *
  *  It was one slider capped at 10 m. Two things were wrong with that. A
  *  tree whose id also covers a cluster 30 m away — a real case, and the
@@ -1790,54 +1799,68 @@ function FilterRange({ label, min, max, setMin, setMax, step, disabled }: {
  *  and none west, a stump the box cut off wants reach down and none up,
  *  and a crown pressed against its northern neighbour wants none towards
  *  it. Six reaches — west, east, south, north, down, up — say exactly
- *  that. "same" keeps them in step for the common case, and comes on by
- *  itself whenever they already agree. */
-function MarginFields({ value, onChange }: {
+ *  that.
+ *
+ *  "same" decides which shape is on screen. While it is on there is ONE
+ *  field, because six fields that silently moved together read as six
+ *  broken ones — typing 5 into W and watching E, S and N follow was
+ *  reported as "no direction works". Switch it off and the six fields
+ *  appear, each its own. Whether it is on lives in the filter state
+ *  (isolateMarginLinked), so it survives leaving and re-entering
+ *  isolation; the arithmetic is marginFields.ts. */
+function MarginFields({ value, linked, onChange, onLinkedChange }: {
   value: IsolateMargin;
+  linked: boolean;
   onChange: (m: MarginReach) => void;
+  onLinkedChange: (linked: boolean) => void;
 }) {
   const reach = marginReach(value);
-  const [linked, setLinked] = useState(isUniformReach(value));
-  const set = (i: number, v: number) => {
-    const n = Math.max(0, Number.isFinite(v) ? v : 0);
-    if (linked) { onChange([n, n, n, n, n, n]); return; }
-    const next: MarginReach = [...reach];
-    next[i] = n;
-    onChange(next);
-  };
   const field = (i: number, label: string, title: string) => (
     <label className="flex items-center gap-1 flex-1 min-w-0" title={title}>
-      <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)', width: 10, textAlign: 'center' }}>{label}</span>
+      <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)', width: label.length > 1 ? 22 : 10, textAlign: 'center' }}>{label}</span>
       <input
         type="number" min={0} step={0.5} value={reach[i]}
-        onChange={(e) => set(i, parseFloat(e.target.value))}
+        onChange={(e) => onChange(editReach(value, linked, i, parseFloat(e.target.value)))}
         className="mono text-[10.5px] py-0.5 px-1 rounded-md tnum"
         style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--line)', color: 'var(--text)', outline: 'none', width: 0, minWidth: 0, flex: 1 }}
       />
     </label>
   );
+  const sameToggle = (
+    <label className="mono text-[9.5px] flex items-center gap-1 shrink-0 justify-end" style={{ color: 'var(--text-dim)' }}
+      title={linked
+        ? 'One reach for every direction. Switch off to set west, east, south, north, down and up each on its own.'
+        : 'Each direction has its own reach. Switch on to use one number for all six (the W value).'}>
+      <input type="checkbox" checked={linked} onChange={(e) => onLinkedChange(e.target.checked)} />
+      same
+    </label>
+  );
+  const help = "How far (m) the loaded-in-full + shown-nearby region reaches beyond the tree's box. No ceiling: points of the same id 50 m away are still the tree's.";
+  if (linked) {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)', width: 52 }} title={help}>margin</span>
+        {field(0, 'all', 'Reach in every direction (m)')}
+        <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)' }}>m</span>
+        {sameToggle}
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2">
-        <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)', width: 52 }}
-          title="How far (m) the loaded-in-full + shown-nearby region reaches beyond the tree's box, in each direction. No ceiling: points of the same id 50 m away are still the tree's.">
-          margin
-        </span>
-        {field(0, 'W', 'Reach west (m)')}
-        {field(1, 'E', 'Reach east (m)')}
-        {field(2, 'S', 'Reach south (m)')}
-        {field(3, 'N', 'Reach north (m)')}
+        <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-mute)', width: 52 }} title={help}>margin</span>
+        {field(0, DIRECTION_LABELS[0], DIRECTION_TITLES[0])}
+        {field(1, DIRECTION_LABELS[1], DIRECTION_TITLES[1])}
+        {field(2, DIRECTION_LABELS[2], DIRECTION_TITLES[2])}
+        {field(3, DIRECTION_LABELS[3], DIRECTION_TITLES[3])}
       </div>
       <div className="flex items-center gap-2">
         <span className="mono text-[10px] shrink-0" style={{ width: 52 }} />
-        {field(4, '↓', 'Reach down, below the base (m)')}
-        {field(5, '↑', 'Reach up, above the top (m)')}
-        <label className="mono text-[9.5px] flex items-center gap-1 shrink-0 flex-1 justify-end" style={{ color: 'var(--text-dim)' }}
-          title="Keep every reach equal: typing into any one sets all six">
-          <input type="checkbox" checked={linked}
-            onChange={(e) => { setLinked(e.target.checked); if (e.target.checked) onChange([reach[0], reach[0], reach[0], reach[0], reach[0], reach[0]]); }} />
-          same
-        </label>
+        {field(4, DIRECTION_LABELS[4], DIRECTION_TITLES[4])}
+        {field(5, DIRECTION_LABELS[5], DIRECTION_TITLES[5])}
+        <span className="flex-1" />
+        {sameToggle}
       </div>
     </div>
   );

@@ -27,7 +27,7 @@ Releases page; macOS and Linux build from source.
 
 ## Status
 
-Version 0.1.1 is the current release: a Windows installer on the
+Version 0.1.2 is the current release: a Windows installer on the
 [Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page,
 built from this repository. Development continues here, and a
 software article describing PointCloudLabeler is in preparation for
