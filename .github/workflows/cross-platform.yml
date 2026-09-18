@@ -1,0 +1,35 @@
+name: Cross-platform Rust check
+
+# The macOS leg of the Rust tests, on demand instead of on every push.
+#
+# It was costing 20 billed minutes per push (80 seconds of wall clock at
+# the 10x macOS multiplier) to re-run the same `cargo test --lib` the
+# Ubuntu job runs — 51 % of the whole CI bill for the repo. Run it before
+# a release, or after touching anything platform-shaped: paths, file
+# locking, line endings, or a dependency with per-OS code.
+#
+# To put it back on a cadence without putting it back on every push, add:
+#   schedule:
+#     - cron: '0 4 1 * *'   # monthly, ~20 billed minutes
+on:
+  workflow_dispatch:
+
+# Least privilege for GITHUB_TOKEN. Without this block a workflow
+# inherits the repository default, which can be read/write on every
+# scope; none of these jobs writes anything back — they check out, build
+# and upload an artifact.
+permissions:
+  contents: read
+
+jobs:
+  rust-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib

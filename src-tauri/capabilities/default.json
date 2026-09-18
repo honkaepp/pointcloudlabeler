@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main editor window: the core event/invoke surface, and nothing else. The dialog and fs PLUGINS are deliberately not granted — the renderer no longer calls either. File dialogs are this application's own commands (src/commands/file.rs) so that the backend learns which file the user chose and can hold every read and write to it (src/fsgrant.rs); a renderer that could open its own dialog would leave the backend unable to tell a chosen path from an invented one. Nothing here can start a process, open a socket, reach the filesystem plugin, or relaunch the app.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:app:default",
+    "core:resources:default",
+    "core:menu:default",
+    "core:path:default"
+  ]
+}

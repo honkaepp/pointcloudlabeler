@@ -1,0 +1,73 @@
+Documentation licence — Creative Commons Attribution 4.0 International
+=====================================================================
+
+PointCloudLabeler is licensed in two parts.
+
+  * The SOFTWARE — everything under `src/`, `src-tauri/`, `scripts/`,
+    the build configuration, and every file not named below — is
+    licensed under the GNU General Public License, version 3 or (at
+    your option) any later version — SPDX: `GPL-3.0-or-later`. See
+    `LICENSE`.
+
+  * The DOCUMENTATION — `README.md`, `CONTRIBUTING.md`,
+    `CODE_OF_CONDUCT.md` and everything under `docs/` — is licensed
+    under the Creative Commons Attribution 4.0 International licence
+    (CC BY 4.0).
+
+      Copyright 2026 Eppu Honkanen
+
+      https://creativecommons.org/licenses/by/4.0/
+      Full legal code: https://creativecommons.org/licenses/by/4.0/legalcode
+
+You are free to share and adapt the documentation for any purpose,
+including commercially, provided you give appropriate credit, link to
+the licence, and indicate if changes were made.
+
+Why the split
+-------------
+
+Creative Commons licences are the right tool for prose and the wrong
+one for code, and Creative Commons says so themselves: their licences
+carry no terms about source-code distribution, do not address patent
+rights, and are not compatible with the established software licences.
+GPL-3.0 covers exactly those three things — it is built around the
+obligation to convey Corresponding Source (§6), and its §11 grants an
+explicit patent licence from every contributor, which matters for a
+tool that implements published measurement methods.
+
+The reverse also holds, and it is the reason the documentation is NOT
+under the GPL. A research paper, a course handout or a national
+forest-inventory manual can quote and adapt PointCloudLabeler's
+documentation under CC BY without inheriting a software licence and
+without the obligation to distribute source alongside it. Copyleft on
+prose would put a reviewer or a teacher in a position CC BY does not.
+
+CC BY 4.0 is one-way compatible with GPL-3.0 by Creative Commons'
+own compatibility determination, so documentation text may be moved
+into the program; the reverse is not true, and is not intended to be.
+
+Code samples inside the documentation
+-------------------------------------
+
+Snippets of PointCloudLabeler's own source quoted inside a
+documentation file stay under the GPL, the licence of the file they
+came from. Applying a
+documentation licence to code by quoting it would be an accident, not
+a relicensing.
+
+What the GPL does not reach
+---------------------------
+
+Output is not a derivative work of the program that produced it. A
+stand table, a CSV of per-tree measurements, an HTML report or the
+figures in a paper belong to whoever made the measurements, under
+whatever terms they choose. The GPL governs PointCloudLabeler and
+works derived from its own code — not the forests you measure with it.
+
+Third-party material
+--------------------
+
+Neither licence applies to the third-party assets PointCloudLabeler
+bundles or embeds — the typefaces, the EPSG registry, the statically
+linked libraries. Those keep their own licences, reproduced in full in
+`THIRD-PARTY-NOTICES.md`, as those licences require.

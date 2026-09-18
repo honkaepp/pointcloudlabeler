@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PointCloudLabeler",
+  "version": "0.1.0",
+  "identifier": "fi.honkaepp.pointcloudlabeler",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build:web",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "PointCloudLabeler",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "backgroundColor": "#0a110d",
+        "dragDropEnabled": true,
+        "additionalBrowserArgs": "--force_high_performance_gpu --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --enable-features=Vulkan,UseSkiaRenderer"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "Eppu Honkanen",
+    "copyright": "© 2026 Eppu Honkanen. GPL-3.0-or-later.",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../LICENSE-DOCS": "LICENSE-DOCS",
+      "../THIRD-PARTY-NOTICES.md": "THIRD-PARTY-NOTICES.md"
+    },
+    "targets": [
+      "msi"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "category": "GraphicsAndDesign",
+    "shortDescription": "Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans",
+    "longDescription": "PointCloudLabeler — Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans. Desktop editor for segmenting trees from large point clouds (TLS/MLS/ULS/ALS) and computing forest-inventory metrics (DBH, height, basal area, …) on top of the per-tree point data.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "allowDowngrades": true
+    }
+  }
+}

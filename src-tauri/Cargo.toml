@@ -1,0 +1,180 @@
+[package]
+name = "pointcloudlabeler-editor"
+version = "0.1.0"
+description = "Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans"
+authors = ["Eppu Honkanen"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/honkaepp/pointcloudlabeler"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "pointcloudlabeler_editor_lib"
+# rlib is enough for desktop; staticlib/cdylib are only needed for mobile targets.
+# Keeping a single crate type avoids the output-filename collision that confuses
+# the integration test build.
+crate-type = ["rlib"]
+
+[features]
+# Off by default — PointCloudLabeler's binary builds cleanly without RIEGL's
+# proprietary rdblib. Turn on with `--features rdblib` to compile the
+# .rdbx point reader; requires the RDBLIB_DIR env var (or RDB_DIR /
+# rdb_DIR — same names PDAL uses) to point at a local rdblib
+# installation. bindgen runs only when the feature is on, so default
+# builds don't need libclang.
+#
+# A BINARY BUILT WITH THIS FEATURE MUST NOT BE DISTRIBUTED.
+#
+# Not a policy — a licence consequence, and one that only appeared when
+# this project moved from Apache-2.0 to GPL-3. Linking against rdblib
+# makes a combined work, rdblib is proprietary and non-redistributable,
+# and §6 requires the Corresponding Source of the whole of it. There is
+# no System Libraries exception (§1) for a vendor SDK you fetch from a
+# customer portal. Under Apache-2.0 this was fine; under the GPL it is
+# a violation.
+#
+# Building it FOR YOURSELF is entirely fine and always will be: the GPL
+# constrains conveying, not use. Build it, run it, measure with it. Just
+# do not hand that binary to anyone. `scripts/package-release.ps1`
+# refuses to package one, and build.rs records the feature so it can.
+#
+# This is the ONLY way to read a RIEGL `.rdbx` directly: RDB 2 is
+# RIEGL's own format, so the build that ships reads no RIEGL points at
+# all and says so; the route that works there is RiSCAN PRO's own
+# export to E57 / LAS.
+#
+# `rivlib` is the same arrangement for `.rxp`, and there the SDK is the
+# only option there is. `.rxp` is RIEGL's closed streaming format: no
+# published schema, no open reader, and it is what a scanner writes to
+# its own `.PROJ` project — every scan in one, with no `.rdbx` beside
+# it. RiVLib reads it, is free with a RIEGL account, and is no more
+# redistributable than rdblib, so everything above applies word for
+# word: build it for your own measurements, do not hand the binary to
+# anyone, and the packaging script will not let you by accident.
+#
+# Requires RIVLIB_DIR (or RiVLib_DIR / RIVLIB_ROOT) pointing at a local
+# RiVLib installation with include/ and lib/. Without the feature the
+# `.rxp` reader compiles to one clear error and nothing else, and the
+# scanner-project importer still reads a `.PROJ`'s scan positions and
+# poses — it just has no points to give the Editor.
+default = []
+rdblib = ["dep:bindgen"]
+rivlib = ["dep:bindgen"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# Reads the bundle identifier out of tauri.conf.json at build time — see
+# build.rs's emit_app_identifier. Already in the dependency graph, so this
+# adds nothing to fetch.
+serde_json = "1"
+bindgen = { version = "0.69", optional = true }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+parking_lot = "0.12"
+thiserror = "1"
+once_cell = "1"
+dirs = "5"
+# Out-of-core LAZ/LAS streaming reader for the octree converter. `laz`
+# feature pulls in the LASzip decoder so .laz files decode chunk-by-chunk
+# on disk without ever needing the whole compressed file in memory.
+# `laz-parallel` additionally exposes laz-rs's ParLasZipDecompressor for
+# true multi-core decompression (the chunk table dispatches LASzip
+# chunks across threads), which the octree converter uses directly.
+las = { version = "0.9", features = ["laz-parallel"] }
+# Direct laz-rs dep so the converter can reach ParLasZipDecompressor /
+# LazVlr without going through the higher-level `las::Reader` (which
+# is sequential). Cargo deduplicates to the same laz version as
+# las/laz-parallel pulls.
+laz = { version = "0.12", features = ["parallel"] }
+# Fast non-cryptographic hasher for the per-node spacing accelerator —
+# the default SipHash is ~5-10× slower than rustc-hash on the per-point
+# inserts that dominate octree build time.
+rustc-hash = "2"
+# Data-parallel iterators for the per-chunk octree build phase. The
+# converter bins points to disk first (one thread, I/O-bound) and then
+# builds each chunk's sub-octree in parallel across CPU cores via
+# par_iter.
+rayon = "1"
+# Lightweight pull-style XML parser. Used by the Riegl preprocessing
+# importer to read project.rsp (the .RiSCAN / .RiPROJECT root XML
+# carrying SOP/POP matrices + scan-position list). No serde derive —
+# the parser walks a small known schema directly.
+#
+# 0.42 for RUSTSEC-2026-0194 / -0195 (a quadratic duplicate-attribute
+# check and unbounded namespace allocation; both fixed from 0.41). This
+# was held at 0.36 because 0.37 began emitting an entity reference as
+# its own event, so a text node with one arrived split across several
+# and the parser's last-text-wins rule truncated the name. The parser
+# now gathers an element's text across those events and reads it once
+# when the element closes — `an_entity_in_a_name_is_unescaped` pins
+# "Plot 3 &amp; 4 &lt;north&gt;" coming back whole.
+quick-xml = "0.42"
+# E57 reader (ASTM E2807). Pure Rust, no FFI — every major TLS / MLS
+# vendor (FARO, Leica, Trimble, NavVis, Emesent, XGRIDS, GreenValley)
+# exports E57 from their processing software, so one importer covers a
+# wide swath of the Preprocessing module without per-vendor SDKs. Used
+# by the e57_* commands; never touches the existing octree path.
+e57 = "0.11"
+proj4rs = "0.1.10"
+mimalloc = "0.1"
+
+# Windows memory gauges for sysmem.rs — GlobalMemoryStatusEx (what the
+# machine has free) and GetProcessMemoryInfo (this process's working
+# set). windows-sys is already in the dependency tree several times over
+# through tauri; this adds three features to it and no new crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+# WebView2's ProcessFailed event, for crash.rs: the renderer process
+# dying under the page is reported to the host and nowhere else. Both
+# crates are already in the tree through tauri-runtime-wry, at these
+# versions; naming them here adds no new crate.
+webview2-com = "0.38"
+windows-core = "0.61"
+
+[profile.release]
+# panic: UNWIND, deliberately, and not the smaller "abort".
+#
+# Every Tauri command here runs its work through spawn_blocking and ends
+# with `.map_err(|e| format!("join error: {e}"))` — code written on the
+# assumption that a panic comes back as a failed join and reaches the
+# user as an error message. That only holds if the panic unwinds. Under
+# "abort" the same panic ended the process instead: the window vanished
+# mid-run, with no message and with whatever was unsaved. The two
+# reachable panics found so far (a clamp whose bounds crossed at a
+# plausible panel setting, a division by a pointBytes read from a damaged
+# metadata.json) are fixed, but the profile should not be the thing
+# deciding how the next one behaves.
+#
+# The codebase is already unwind-correct: there is no `.lock().unwrap()`
+# anywhere in it, `lock_dataset` maps a poisoned mutex to an error, and
+# `DatasetGuard::drop` — which runs during unwinding and releases the
+# dataset — handles poisoning too.
+codegen-units = 1
+lto = true
+# opt-level: 3, not "s". PointCloudLabeler's work is rayon loops over millions of
+# points — segmentation, the DTM build, the morphological filter, RANSAC
+# — where instruction count is what the user waits on.
+#
+# Measured on this tree, stripped Linux binary: 12.5 MB at `panic =
+# "abort"` + opt-level "s", 18.8 MB with unwind + opt-level 3. The
+# +6.3 MB buys back the error path the commands are written around and
+# the optimiser's full inlining; beside the WebView and Tauri runtime an
+# installer carries anyway it is not the number that decides anything.
+# Revisit with a real plot if download size ever becomes the constraint.
+opt-level = 3
+strip = true
+# overflow-checks stays at the release default (off), deliberately. The
+# measurements are carried in f64 and the index arithmetic is bounded, so
+# a check would cost in every hot loop to convert a wrap into a panic —
+# and a panic is the outcome this profile is trying to make rarer.

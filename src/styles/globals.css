@@ -1,0 +1,374 @@
+/* Fonts are BUNDLED, not fetched.
+ *
+ * PointCloudLabeler ran with a Google Fonts stylesheet in index.html and an @import
+ * here, so every launch made a request to fonts.googleapis.com before
+ * first paint. Three things wrong with that in a shipped desktop app:
+ *
+ *   - Foresters work offline. In the field the request cannot succeed,
+ *     and a render-blocking stylesheet holds first paint until it times
+ *     out — seconds of empty window on a bad connection, and then the
+ *     fallback face anyway.
+ *   - It is an outbound call to a third party on every start, from an
+ *     application whose users are in the EU. Hotlinked Google Fonts has
+ *     been held to be a GDPR problem in its own right.
+ *   - The typeface the interface was designed in was never actually
+ *     guaranteed to be the one it rendered in.
+ *
+ * @fontsource ships the same faces as woff2 under the same SIL OFL 1.1
+ * they are published under; the licences ride along in node_modules and
+ * are reproduced in the repository's third-party notices.
+ *
+ * EVERY SUBSET, not just latin. These were trimmed to latin and
+ * latin-ext at first on the reasoning that PointCloudLabeler is a Finnish forestry
+ * tool — which it is not: it ships worldwide, and a project name, a
+ * species name or a plot name can be written in any of the alphabets
+ * these families cover. A missing subset does not fail loudly; it falls
+ * back to whatever the webview has, so a Russian or Greek forester sees
+ * their own dataset rendered in a different typeface from the interface
+ * around it. The full families cost about 1.3 MB in an installer whose
+ * WebView runtime weighs far more, which is not the number that decides
+ * anything. */
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a110d;
+  --bg-deep: #060b08;
+  --panel: rgba(14, 22, 18, 0.82);
+  --panel-solid: #0f1814;
+  --line: rgba(180, 220, 195, 0.08);
+  --line-strong: rgba(180, 220, 195, 0.16);
+  --text: #e2ebe4;
+  --text-dim: #8aa094;
+  --text-mute: #586a5e;
+  --accent: oklch(0.74 0.14 145);
+  --accent-dim: oklch(0.52 0.11 145);
+  --moss: oklch(0.55 0.10 145);
+  --bark: oklch(0.30 0.04 65);
+  --warn: oklch(0.78 0.14 75);
+  --danger: oklch(0.70 0.17 25);
+  /* The 3D viewport's own background, so the canvas follows the theme
+     without every view hard-coding a hex. Must match ui/theme.ts's
+     VIEWPORT_BG, which is what WebGL is actually cleared to. */
+  --viewport-bg: #0b0d10;
+  /* Severity, as the QC list and Tree Review paint it. Variables rather
+     than constants because a pale pink that reads on a dark surface is
+     barely there on a white one. */
+  --sev-critical: #ffb4be;
+  --sev-warning: #e6c068;
+  --sev-info: var(--text-dim);
+  /* The faint washes a panel paints under an input, a row, a hovered
+     button. White ON the dark surface; a green-grey ink on the light
+     one, where white would simply vanish. Three steps, because that is
+     how many the panels actually use. */
+  --wash-1: rgba(255, 255, 255, 0.025);
+  --wash-2: rgba(255, 255, 255, 0.05);
+  --wash-3: rgba(255, 255, 255, 0.09);
+  --wash: var(--wash-2);
+  --wash-strong: var(--wash-3);
+}
+
+/* WHITE MODE. Opt-in from the Display panel; the dark palette above is
+   the default and what a fresh install gets. Only the variables change
+   — there is no second set of components, and nothing in the
+   application asks which theme is on except the WebGL clear colour. */
+:root[data-theme="light"] {
+  --bg: #f2f5f2;
+  --bg-deep: #e6ebe7;
+  --panel: rgba(255, 255, 255, 0.92);
+  --panel-solid: #ffffff;
+  --line: rgba(18, 45, 30, 0.14);
+  --line-strong: rgba(18, 45, 30, 0.26);
+  --text: #0f1d16;
+  --text-dim: #3f564a;
+  --text-mute: #6b7d71;
+  --accent: oklch(0.50 0.13 145);
+  --accent-dim: oklch(0.62 0.10 145);
+  --moss: oklch(0.45 0.10 145);
+  --bark: oklch(0.38 0.05 65);
+  --warn: oklch(0.58 0.14 75);
+  --danger: oklch(0.52 0.19 25);
+  --viewport-bg: #ffffff;
+  --sev-critical: #b3123a;
+  --sev-warning: #8a5a00;
+  --sev-info: var(--text-dim);
+  --wash-1: rgba(18, 45, 30, 0.035);
+  --wash-2: rgba(18, 45, 30, 0.06);
+  --wash-3: rgba(18, 45, 30, 0.10);
+  --wash: var(--wash-2);
+  --wash-strong: var(--wash-3);
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  /* Forest atmosphere: warmer green up-left (sun-through-canopy), cool
+     moss tint down-right, and a faint scanner-sweep ring centred low to
+     pin the whole frame to the LiDAR-in-the-forest metaphor. */
+  background:
+    radial-gradient(ellipse at 25% 0%, rgba(126,224,168,0.06), transparent 55%),
+    radial-gradient(ellipse at 100% 100%, rgba(60,130,90,0.05), transparent 60%),
+    radial-gradient(ellipse at 50% 130%, rgba(126,224,168,0.04), transparent 55%),
+    var(--bg);
+  /* …and in white mode the same three, at a strength that reads as
+     paper with a tint rather than a lit canopy. */
+  color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  font-feature-settings: "ss01", "cv11";
+}
+
+:root[data-theme="light"] body {
+  background:
+    radial-gradient(ellipse at 25% 0%, rgba(60,150,100,0.05), transparent 55%),
+    radial-gradient(ellipse at 100% 100%, rgba(40,110,75,0.04), transparent 60%),
+    var(--bg);
+}
+
+/* Soft vignette: gives canvas a forest-canopy feel without darkening UI panels.
+   Sits below the editor's z-index layers (>=20). */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 62%, rgba(0,0,0,0.28) 100%);
+  z-index: 1;
+}
+
+/* A dark vignette on a white page reads as dirt on the screen. */
+:root[data-theme="light"] body::after {
+  background: radial-gradient(ellipse at center, transparent 68%, rgba(18,45,30,0.06) 100%);
+}
+
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border: 1px solid var(--line);
+  /* Deep shadow + crisp 1px highlight at the top edge gives panels a
+     subtle floating-glass feel that reads well against the canopy
+     backdrop without being heavy. */
+  box-shadow:
+    0 24px 60px -22px rgba(0,0,0,0.65),
+    0 1px 0 rgba(255,255,255,0.035) inset,
+    0 0 0 1px rgba(126,224,168,0.04) inset;
+}
+
+:root[data-theme="light"] .panel {
+  box-shadow:
+    0 18px 44px -24px rgba(18, 45, 30, 0.28),
+    0 1px 0 rgba(255,255,255,0.8) inset,
+    0 0 0 1px rgba(18,45,30,0.03) inset;
+}
+
+.hairline { border-color: var(--line); }
+.hairline-b { border-bottom: 1px solid var(--line); }
+.hairline-t { border-top: 1px solid var(--line); }
+.hairline-r { border-right: 1px solid var(--line); }
+
+.mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.tnum { font-variant-numeric: tabular-nums; }
+
+.chip {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.btn {
+  font-family: 'Inter', sans-serif;
+  font-size: 12.5px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* A label never wraps: every button here has a fixed height, and a
+     label that wrapped stacked its lines over whatever sat beside it
+     ("Show 3D overlay" in a squeezed M3C2 row). A long label overflows
+     its box instead, which is visible and fixable; overlap is neither. */
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  cursor: pointer;
+  user-select: none;
+}
+.btn:hover { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.22); }
+.btn:active { background: rgba(255,255,255,0.02); }
+.btn[data-active="true"] {
+  background: color-mix(in oklch, var(--accent) 18%, transparent);
+  border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+  color: var(--accent);
+}
+.btn-primary {
+  background: var(--accent);
+  color: #06140d;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.btn-primary:hover { filter: brightness(1.08); background: var(--accent); }
+.btn-ghost { border-color: transparent; background: transparent; color: var(--text-dim); }
+.btn-ghost:hover { color: var(--text); background: var(--wash); }
+
+.input {
+  font-family: 'JetBrains Mono', monospace;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 12.5px;
+  outline: none;
+  width: 100%;
+}
+.input:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+}
+
+/* Native <select> dropdowns. Override the OS default (white bg) so they read
+   as part of the green-on-black UI. The popup itself comes from the OS so the
+   option list will be slightly different per platform — these rules style as
+   much as is reachable in CSS. */
+select {
+  background: rgba(14, 22, 18, 0.92);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%237ee0a8' d='M0 0h10L5 6z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  padding-right: 20px !important;
+  cursor: pointer;
+}
+select:hover { border-color: rgba(126,224,168,0.35); }
+select:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+}
+select:disabled { opacity: 0.45; cursor: not-allowed; }
+select option {
+  background: #0f1814;
+  color: var(--text);
+}
+select option:disabled { color: var(--text-mute); }
+
+/* Text inputs and textareas — same forest treatment so dialogs stay consistent. */
+input[type="text"], input[type="number"], input:not([type]), textarea {
+  background: rgba(14, 22, 18, 0.92) !important;
+  color: var(--text) !important;
+  caret-color: var(--accent);
+}
+input[type="text"]:focus, input[type="number"]:focus, input:not([type]):focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent-dim) !important;
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+}
+input::placeholder, textarea::placeholder { color: var(--text-mute); }
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 2px;
+  background: var(--line-strong);
+  border-radius: 2px;
+}
+input[type="range"]::-moz-range-track {
+  height: 2px;
+  background: var(--line-strong);
+  border-radius: 2px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0a110d;
+  margin-top: -6px;
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0a110d;
+  cursor: pointer;
+}
+
+.range-dual {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+.range-dual::-webkit-slider-runnable-track { background: transparent; border: none; height: 100%; }
+.range-dual::-moz-range-track { background: transparent; border: none; height: 100%; }
+.range-dual::-webkit-slider-thumb { pointer-events: auto; margin-top: -6px; }
+.range-dual::-moz-range-thumb { pointer-events: auto; }
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.15), 0 0 8px -1px currentColor;
+}
+
+.kbd {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.02);
+}
+
+.scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+.blink { animation: blink 1.4s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
+
+.crosshair, .crosshair * { cursor: crosshair !important; }
+
+canvas { outline: none; }

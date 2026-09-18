@@ -1,0 +1,75 @@
+name: Build Windows installer
+
+# Produces a Windows .exe installer (NSIS) for PointCloudLabeler. Runs on a real
+# Windows runner because the Tauri Rust crate + WebView2 bundling can't
+# be cross-built reliably from Linux. Download the installer from the
+# run's "Artifacts" section once the job goes green.
+#
+# The --config below builds only the NSIS installer; the application
+# has no updater, so no updater artifacts are made.
+
+# Trigger: on demand, or on a release tag. NOT on every push.
+#
+# It was building on every commit to the working branch — 8 minutes of
+# Windows runner at the 2x multiplier, 16 billed minutes, for an
+# installer nobody downloaded. Worse, the concurrency rule below cancels
+# superseded runs, and a cancelled run still bills for the time it ran:
+# five of the eight builds in the sample were killed part-way, ~70
+# billed minutes spent on installers that were thrown away before they
+# finished.
+#
+# Click "Run workflow" when you want an installer. The v* tag trigger
+# was removed too: a release tag is exactly the moment someone is not
+# thinking about runner minutes.
+on:
+  workflow_dispatch:
+
+# A newer push to the same branch cancels an in-flight build so we don't
+# burn a 30-minute Windows runner on superseded code.
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for GITHUB_TOKEN. Without this block a workflow
+# inherits the repository default, which can be read/write on every
+# scope; none of these jobs writes anything back — they check out, build
+# and upload an artifact.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows installer (NSIS .exe)
+        # bash (Git Bash on the runner) so the inline JSON's quotes pass
+        # through cleanly. Config override: build only the NSIS installer.
+        shell: bash
+        run: npm run tauri:build -- --config '{"bundle":{"targets":["nsis"],"createUpdaterArtifacts":false}}'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PointCloudLabeler-windows-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

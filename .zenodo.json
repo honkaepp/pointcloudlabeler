@@ -1,0 +1,46 @@
+{
+  "title": "PointCloudLabeler — Tree segmentation and forest inventory from terrestrial and mobile laser scans",
+  "description": "An out-of-core, octree-streaming point-cloud editor for forestry research. Turns raw terrestrial and mobile laser scans into traceable per-tree measurements (height, DBH, stem taper, basal area, crown metrics, biomass, carbon) with end-to-end uncertainty propagation and an occlusion-aware confidence figure on every quantity.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "GPL-3.0-or-later",
+  "creators": [
+    {
+      "name": "Honkanen, Eppu",
+      "orcid": "0009-0003-3352-6340",
+      "affiliation": "School of Forest Sciences, University of Eastern Finland"
+    },
+    {
+      "name": "Yrttimaa, Tuomas",
+      "orcid": "0000-0003-2648-523X",
+      "affiliation": "Department of Forest Sciences, University of Helsinki; School of Forest Sciences, University of Eastern Finland"
+    },
+    {
+      "name": "Kükenbrink, Daniel",
+      "orcid": "0000-0003-3083-640X",
+      "affiliation": "Swiss Federal Institute for Forest, Snow and Landscape Research WSL"
+    },
+    {
+      "name": "Vastaranta, Mikko",
+      "orcid": "0000-0001-6552-9122",
+      "affiliation": "School of Forest Sciences, University of Eastern Finland"
+    }
+  ],
+  "keywords": [
+    "point cloud",
+    "lidar",
+    "close-range sensing",
+    "terrestrial laser scanning",
+    "mobile laser scanning",
+    "forest monitoring plots",
+    "individual tree segmentation",
+    "multi-temporal point clouds",
+    "tree skeleton transfer",
+    "segmentation editing",
+    "quality control",
+    "forest inventory",
+    "quantitative structure model",
+    "TreeQSM",
+    "biomass"
+  ]
+}

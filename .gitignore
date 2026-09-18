@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-electron/
+release/
+
+# Local env / editor
+.env
+.env.local
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS junk
+Thumbs.db
+
+# Signing keys of any kind never belong in the tree
+*.key
+*.key.pub

@@ -1,0 +1,47 @@
+name: Frontend tests
+
+# Split from the Rust job so a frontend-only commit does not spin up a
+# Rust toolchain, and a Rust-only commit does not spin up Node. GitHub
+# only supports `paths` at the workflow level, which is why these are two
+# files rather than two jobs.
+
+# MANUAL ONLY. Nothing here fires on a push or a pull request.
+#
+# The account is out of Actions minutes, and the application is built
+# locally (see README, "From source"). Every workflow in this directory
+# is workflow_dispatch, so a run costs minutes only when someone
+# deliberately starts one from the Actions tab.
+#
+# What that costs you: CI reports nothing. The checks that matter —
+# cargo test, vitest, tsc, vite build — have to be run on the machine
+# doing the work, before the commit. There is no second net.
+
+on:
+  workflow_dispatch:
+
+# Least privilege for GITHUB_TOKEN. Without this block a workflow
+# inherits the repository default, which can be read/write on every
+# scope; none of these jobs writes anything back — they check out, build
+# and upload an artifact.
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      # Type-checking alone never caught the frontend defects the audit
+      # found — a missing field is not a type error, and neither is one
+      # panel measuring DBH over a different band than another.
+      - name: vitest
+        run: npm test

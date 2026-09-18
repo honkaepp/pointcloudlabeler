@@ -1,0 +1,64 @@
+name: Rust tests
+
+# Ubuntu only, and only when Rust actually changed.
+#
+# Why not a cross-platform matrix here: this job runs `cargo test --lib`
+# over pure computation (QSM, GeoTIFF, Kabsch, ICP, importers) plus
+# std::fs. A macOS leg of the same tests was billing 20 minutes a push —
+# ten times the Ubuntu leg, because macOS runners bill at 10x — to
+# re-run identical arithmetic. The genuine macOS risk is in the Tauri
+# app bundle, which that job never built. Cross-platform checking now
+# lives in cross-platform.yml, on demand.
+
+# MANUAL ONLY. Nothing here fires on a push or a pull request.
+#
+# The account is out of Actions minutes, and the application is built
+# locally (see README, "From source"). Every workflow in this directory
+# is workflow_dispatch, so a run costs minutes only when someone
+# deliberately starts one from the Actions tab.
+#
+# What that costs you: CI reports nothing. The checks that matter —
+# cargo test, vitest, tsc, vite build — have to be run on the machine
+# doing the work, before the commit. There is no second net.
+
+on:
+  workflow_dispatch:
+
+# Least privilege for GITHUB_TOKEN. Without this block a workflow
+# inherits the repository default, which can be read/write on every
+# scope; none of these jobs writes anything back — they check out, build
+# and upload an artifact.
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libssl-dev libgtk-3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # `cargo check` and `cargo clippy -- -A warnings` used to run ahead
+      # of this. Both were removed rather than kept: the test build
+      # compiles the whole crate, so any error they could report surfaces
+      # here anyway, and clippy with every warning allowed reported
+      # nothing at all — it was a compile with extra steps. To get lint
+      # signal back, add a clippy step with `-D warnings` once the
+      # existing warnings are cleared; that is a real check, unlike what
+      # was here.
+      - name: cargo test (QSM, GeoTIFF, Kabsch, ICP, importers)
+        working-directory: src-tauri
+        run: cargo test --lib

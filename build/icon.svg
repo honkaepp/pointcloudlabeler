@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TRACE app icon — a conifer silhouette dissolving into a point cloud.
+  Top half: clean, solid silhouette (the recognised tree).
+  Bottom half: the silhouette breaks into discrete returns (the raw scan).
+  Below: a faint horizon line + scattered ground returns.
+  Behind: a soft scanner sweep arc that hints at the LiDAR origin
+          of the data without dominating the mark.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- Background — same dark green-on-black palette as the in-app theme. -->
+    <radialGradient id="bg" cx="35%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#16261d"/>
+      <stop offset="55%" stop-color="#0a140f"/>
+      <stop offset="100%" stop-color="#050a07"/>
+    </radialGradient>
+
+    <!-- Apex highlight — slightly warmer green at the very tip. -->
+    <linearGradient id="canopy" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#bef0d5"/>
+      <stop offset="35%" stop-color="#7ee0a8"/>
+      <stop offset="100%" stop-color="#4ba577"/>
+    </linearGradient>
+
+    <!-- Glow used on the apex + canopy silhouette. -->
+    <filter id="canopyGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Soft sweep behind the tree, suggests LiDAR scanner sweep. -->
+    <radialGradient id="sweep" cx="50%" cy="80%" r="55%">
+      <stop offset="0%" stop-color="rgba(126,224,168,0.18)"/>
+      <stop offset="55%" stop-color="rgba(126,224,168,0.05)"/>
+      <stop offset="100%" stop-color="rgba(126,224,168,0.00)"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded square. -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="511" height="511" rx="95.5" fill="none" stroke="rgba(126,224,168,0.18)" stroke-width="1"/>
+
+  <!-- Scanner sweep (sits behind tree). -->
+  <ellipse cx="256" cy="412" rx="180" ry="46" fill="url(#sweep)"/>
+  <!-- Concentric range rings on the ground plane — subtle. -->
+  <g fill="none" stroke="rgba(126,224,168,0.10)" stroke-width="1">
+    <ellipse cx="256" cy="412" rx="84" ry="22"/>
+    <ellipse cx="256" cy="412" rx="138" ry="34"/>
+    <ellipse cx="256" cy="412" rx="190" ry="46"/>
+  </g>
+
+  <!-- ============================================================
+       SOLID CONIFER SILHOUETTE (top half = recognised tree).
+       Layered triangles with rounded apex + slight ledge each tier
+       — reads as a stylised spruce / pine.
+       ============================================================ -->
+  <g filter="url(#canopyGlow)">
+    <!-- Apex tier (smallest triangle). -->
+    <path d="M256 64 L228 168 L284 168 Z" fill="url(#canopy)"/>
+    <!-- Tier 2. -->
+    <path d="M256 130 L208 234 L304 234 Z" fill="url(#canopy)"/>
+    <!-- Tier 3 (widest of the solid silhouette). -->
+    <path d="M256 196 L184 296 L328 296 Z" fill="url(#canopy)"/>
+  </g>
+
+  <!-- Tier 4 — the dissolve. The silhouette base appears as scattered
+       discrete returns + a soft underlying ghost shape. Reads as
+       "this is where the cloud points are still individual." -->
+  <g opacity="0.30">
+    <path d="M256 270 L160 360 L352 360 Z" fill="url(#canopy)"/>
+  </g>
+
+  <!-- Discrete point returns — the visible "cloud" half of the mark.
+       Hand-placed so the silhouette dissolves outward + downward
+       organically (not the rigid grid an algorithm would produce). -->
+  <g fill="#7ee0a8">
+    <!-- Inside the silhouette, denser cluster. -->
+    <circle cx="206" cy="338" r="5.5"/>
+    <circle cx="234" cy="346" r="6.5"/>
+    <circle cx="258" cy="340" r="6.5"/>
+    <circle cx="282" cy="348" r="6"/>
+    <circle cx="306" cy="338" r="5.5"/>
+    <circle cx="220" cy="358" r="5"/>
+    <circle cx="248" cy="362" r="5.5"/>
+    <circle cx="272" cy="358" r="5.5"/>
+    <circle cx="296" cy="358" r="5"/>
+
+    <!-- Just outside the silhouette — dispersing returns. -->
+    <circle cx="170" cy="346" r="5" opacity="0.85"/>
+    <circle cx="148" cy="358" r="4.5" opacity="0.75"/>
+    <circle cx="124" cy="372" r="4" opacity="0.6"/>
+    <circle cx="338" cy="346" r="5" opacity="0.85"/>
+    <circle cx="362" cy="358" r="4.5" opacity="0.75"/>
+    <circle cx="386" cy="372" r="4" opacity="0.6"/>
+
+    <!-- Trunk + base zone — narrow band of returns suggesting the stem. -->
+    <rect x="244" y="358" width="24" height="50" rx="3" opacity="0.85"/>
+    <circle cx="232" cy="392" r="4" opacity="0.75"/>
+    <circle cx="280" cy="392" r="4" opacity="0.75"/>
+
+    <!-- Ground returns — sparse, low-opacity, asymmetric. -->
+    <circle cx="100" cy="396" r="3.5" opacity="0.45"/>
+    <circle cx="138" cy="406" r="3" opacity="0.50"/>
+    <circle cx="178" cy="412" r="3" opacity="0.55"/>
+    <circle cx="216" cy="416" r="2.5" opacity="0.60"/>
+    <circle cx="296" cy="416" r="2.5" opacity="0.60"/>
+    <circle cx="334" cy="412" r="3" opacity="0.55"/>
+    <circle cx="374" cy="406" r="3" opacity="0.50"/>
+    <circle cx="412" cy="396" r="3.5" opacity="0.45"/>
+
+    <!-- Far / nearer ground perspective. -->
+    <circle cx="80"  cy="412" r="2.5" opacity="0.35"/>
+    <circle cx="432" cy="412" r="2.5" opacity="0.35"/>
+    <circle cx="60"  cy="426" r="2"   opacity="0.28"/>
+    <circle cx="452" cy="426" r="2"   opacity="0.28"/>
+
+    <!-- A handful of mid-air returns that catch foliage / branches —
+         break the tier symmetry slightly. -->
+    <circle cx="194" cy="248" r="3.5" opacity="0.55"/>
+    <circle cx="324" cy="252" r="3.5" opacity="0.55"/>
+    <circle cx="178" cy="304" r="3"   opacity="0.45"/>
+    <circle cx="340" cy="306" r="3"   opacity="0.45"/>
+  </g>
+</svg>
