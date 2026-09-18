@@ -1,6 +1,6 @@
 [package]
 name = "pointcloudlabeler-editor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tree segmentation, editing and label transfer for close-range forest point clouds"
 authors = ["Eppu Honkanen"]
 license = "GPL-3.0-or-later"

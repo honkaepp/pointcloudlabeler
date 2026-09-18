@@ -31,6 +31,7 @@ import OctreeView from '../../three/OctreeView';
 import CompareView from '../../three/CompareView';
 import type { CompareApi, CompareRequest } from '../../three/comparePose';
 import ColorLegend from './ColorLegend';
+import { menuTarget } from './menuActions';
 import {
   OctreeShellContext, DEFAULT_DISPLAY, DEFAULT_TOOLS, DEFAULT_FILTERS, ZERO_STATS, countActiveFilters,
   type DisplayConfig, type ToolsConfig, type FilterConfig, type ViewerStats, type OctreeShellApi,
@@ -634,6 +635,24 @@ export default function EditorShell({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // The native menu. Each click arrives through the desktop bridge as
+  // `menu:<id>`; the id names a keybinding action or a panel
+  // (menuActions.ts), and both go through the same dispatch the keyboard
+  // and the command palette use, so the three cannot disagree. Refs, as
+  // above, so the one subscription always calls the latest closures.
+  const togglePanelRef = useRef(togglePanel);
+  togglePanelRef.current = togglePanel;
+  useEffect(() => {
+    const d = (window as unknown as { desktop?: { onMenuAction?: (cb: (action: string) => void) => () => void } }).desktop;
+    if (!d?.onMenuAction) return;
+    return d.onMenuAction((action) => {
+      const target = menuTarget(action);
+      if (!target) return;
+      if (target.kind === 'action') runActionRef.current(target.id);
+      else togglePanelRef.current(target.id);
+    });
   }, []);
 
   // Command palette contents — everything the panels can do, reachable

@@ -147,6 +147,15 @@ export default function App() {
         <div style={{ display: activeModule === 'figures' ? 'block' : 'none' }}>
           <ErrorBoundary label="Figures"><FigureModule /></ErrorBoundary>
         </div>
+        {/* Project → New Project… is on the menu while a project is open
+            too; the dialog used to render only on the welcome screen, so
+            the click set a flag nothing showed. */}
+        {showNewProject && (
+          <NewProjectDialog
+            onClose={() => setShowNewProject(false)}
+            onCreated={(p) => { setProject(p); setShowNewProject(false); setActiveModule('editor'); }}
+          />
+        )}
       </div>
     </ProjectProvider>
   );

@@ -81,20 +81,9 @@ export default function EditorModule() {
     return () => { cancelled = true; };
   }, [octreeList, viewingOctree]);
 
-  // Native menu actions — Save / Export / Close hand off to the shell's
-  // imperative API where possible. We don't tie undo/redo here since the
-  // shell already binds those globally inside its viewport.
-  useEffect(() => {
-    const api = (window as unknown as Record<string, unknown>).desktop as {
-      onMenuAction?: (cb: (action: string, payload?: unknown) => void) => () => void;
-    } | undefined;
-    if (!api?.onMenuAction) return () => { /* noop */ };
-    const unsub = api.onMenuAction((action) => {
-      if (action === 'menu:open-cloud') void triggerImport();
-    });
-    return unsub;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Native menu clicks are dispatched by EditorShell (File → Add Cloud…
+  // reaches triggerImport through the shell's onImport), so that the
+  // menu, the keyboard and the command palette run one and the same code.
 
   // Open a LAS/LAZ via the OS file dialog → show the import-mapping
   // dialog → convert via the Rust pipeline → list refresh.

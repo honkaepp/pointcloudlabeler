@@ -85,31 +85,20 @@ interface SkeletonAlignmentRecord {
 function installShim(ctx: BridgeCtx) {
   const menuHandlers = new Set<ProjectChangedHandler>();
 
-  // Forward every event the renderer ever cared about (menu clicks + project
-  // state change) so subscribers see them as "menu actions" — App.tsx
-  // (onMenuAction) subscribes once and dispatches based on event name.
-  const TAURI_EVENTS = [
-    'project:changed',
-    'menu:open-cloud',
-    'menu:save',
-    'menu:export',
-    'menu:project-new',
-    'menu:project-open',
-    'menu:project-close',
-    'menu:undo',
-    'menu:redo',
-    'menu:invert-selection',
-    'menu:clear-selection',
-    'menu:delete-points',
-    'menu:toggle-legend',
-    'menu:toggle-filters',
-    'menu:shortcuts',
-  ] as const;
-  for (const ev of TAURI_EVENTS) {
-    ctx.listen<unknown>(ev, (e) => {
-      for (const cb of menuHandlers) cb(ev, e.payload);
-    }).catch(() => { /* ignore */ });
-  }
+  // Every native-menu click arrives as ONE event, `menu`, whose payload
+  // names the item (`action`) and, for a recent project, its folder
+  // (src-tauri/src/menu.rs). Subscribers see it as `menu:<action>` with
+  // the folder as payload — what App.tsx and EditorShell dispatch on.
+  // One event rather than one per item: the list of per-item events
+  // this used to hold had to be kept in step with menu.rs by hand, and
+  // every item it was missing did nothing when clicked.
+  ctx.listen<{ action: string; folder?: string }>('menu', (e) => {
+    for (const cb of menuHandlers) cb(`menu:${e.payload.action}`, e.payload.folder);
+  }).catch(() => { /* ignore */ });
+  // …and the backend's own announcement that the open project changed.
+  ctx.listen<unknown>('project:changed', (e) => {
+    for (const cb of menuHandlers) cb('project:changed', e.payload);
+  }).catch(() => { /* ignore */ });
 
   // Native file drag-drop. Tauri intercepts the drop, so the browser's onDrop
   // never sees the file paths; we forward the dropped path as menu:open-file
@@ -1368,8 +1357,9 @@ function installShim(ctx: BridgeCtx) {
         title: mode === 'open' ? 'Open Project' : 'Choose parent folder for new project',
       }),
 
-    // Menu actions — under Tauri the only thing the renderer subscribes to is
-    // project:changed. Native menus will be added in a later iteration.
+    // Menu actions: `menu:<id>` for every native-menu click (payload: the
+    // folder, for a recent project), `menu:open-file` for a dropped file,
+    // and `project:changed` from the backend.
     onMenuAction: (cb: ProjectChangedHandler) => {
       menuHandlers.add(cb);
       return () => { menuHandlers.delete(cb); };

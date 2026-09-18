@@ -50,8 +50,10 @@ authors:
 repository-code: "https://github.com/honkaepp/pointcloudlabeler"
 url: "https://github.com/honkaepp/pointcloudlabeler"
 # The persistent archive: Zenodo, fed from GitHub releases. `doi` is the
-# DOI of this version; the concept DOI below resolves to the latest.
-doi: 10.5281/zenodo.22824705
+# concept DOI, which resolves to the latest version; Zenodo mints each
+# version's own DOI when its GitHub release is made, and it is listed
+# below once known.
+doi: 10.5281/zenodo.22824704
 identifiers:
   - type: doi
     value: 10.5281/zenodo.22824704
@@ -83,8 +85,8 @@ keywords:
   - "TreeQSM"
   - "biomass"
 
-version: "0.1.0"
-date-released: "2026-09-17"   # the day v0.1.0 was tagged
+version: "0.1.1"
+date-released: "2026-09-18"   # the day v0.1.1 was tagged
 type: software
 
 # --- Preferred citation (paper, once published) ------------------------
