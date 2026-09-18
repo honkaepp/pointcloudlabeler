@@ -9,7 +9,7 @@ metrics, biomass and carbon — with end-to-end uncertainty propagation
 and an occlusion-aware confidence figure on every quantity.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-<!-- [![DOI](https://zenodo.org/badge/DOI/PENDING.svg)](https://doi.org/PENDING) — once the Zenodo archive exists -->
+[![DOI](https://zenodo.org/badge/1354385548.svg)](https://doi.org/10.5281/zenodo.22824704)
 
 ## Status
 
@@ -204,10 +204,12 @@ tilted-stem trunk segmentation.
 
 ## Citing PointCloudLabeler
 
-A machine-readable citation is in [`CITATION.cff`](CITATION.cff). A
-software article is in preparation for **SoftwareX**. Until the article
-appears, please cite the GitHub repository (the Zenodo DOI for the
-release you used, once available).
+A machine-readable citation is in [`CITATION.cff`](CITATION.cff), and
+every release is archived on Zenodo: <https://doi.org/10.5281/zenodo.22824704>
+resolves to the latest version, and each version has a DOI of its own
+(v0.1.0: [10.5281/zenodo.22824705](https://doi.org/10.5281/zenodo.22824705)).
+A software article is in preparation for **SoftwareX**; until it
+appears, please cite the Zenodo record of the version you used.
 
 If you use a specific algorithm in PointCloudLabeler, please also cite the
 underlying reference. Every method below is implemented from its

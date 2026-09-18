@@ -38,13 +38,16 @@ authors:
 # --- Repository --------------------------------------------------------
 repository-code: "https://github.com/honkaepp/pointcloudlabeler"
 url: "https://github.com/honkaepp/pointcloudlabeler"
-# Once Zenodo integration is set up, the persistent archive lives here.
-# The CONCEPT DOI (all versions) belongs in this file; a VERSIONED DOI
-# names one release and belongs wherever that release is cited.
-# identifiers:
-#   - type: doi
-#     value: 10.5281/zenodo.PENDING
-#     description: "Concept DOI (all versions)"
+# The persistent archive: Zenodo, fed from GitHub releases. `doi` is the
+# DOI of this version; the concept DOI below resolves to the latest.
+doi: 10.5281/zenodo.22824705
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.22824704
+    description: "Concept DOI — all versions, resolves to the latest"
+  - type: doi
+    value: 10.5281/zenodo.22824705
+    description: "Version 0.1.0"
 
 # --- License -----------------------------------------------------------
 # The software. The documentation is CC BY 4.0 (see LICENSE-DOCS);
