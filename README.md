@@ -171,7 +171,10 @@ Metrics ▶ Biomass & carbon  # density / carbon fraction → kg, kg CO₂e
 Metrics ▶ Export CSV        # per-tree table including QSM uncertainty
 ```
 
-A step-by-step tutorial is in [`docs/TUTORIAL.md`](docs/TUTORIAL.md).
+A step-by-step tutorial is in [`docs/TUTORIAL.md`](docs/TUTORIAL.md),
+and a demo dataset to follow it with — two clouds of one plot, a 2021
+terrestrial scan with a corrected segmentation and a 2023 helicopter
+scan, 1.2 GB — is on Zenodo: <https://doi.org/10.5281/zenodo.22810788>.
 
 ## Architecture
 

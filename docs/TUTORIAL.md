@@ -3,8 +3,12 @@
 This walks through the typical PointCloudLabeler workflow: import a forest plot,
 classify the ground, segment trees, fit QSMs, and read out per-tree
 biomass with traceable uncertainty. It names the panels and the
-parameter values as they appear in the program; substitute your own
-dataset. No example dataset ships with PointCloudLabeler yet.
+parameter values as they appear in the program. A demo dataset to
+follow along with is on Zenodo — <https://doi.org/10.5281/zenodo.22810788>:
+two clouds of one forest plot (Evo, Finland), a 2021 terrestrial scan
+with a corrected tree segmentation (1.1 GB) and a 2023 helicopter-borne
+scan of the same plot (58 MB), the pair the Tree Skeleton Transfer
+carries labels across. Or substitute your own.
 
 ## 0. Install
 
