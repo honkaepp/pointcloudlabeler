@@ -97,7 +97,8 @@ interface Shot {
 let shotSeq = 1;
 
 export default function FigureModule() {
-  const { project } = useProject();
+  const { project, activeModule } = useProject();
+  const shown = activeModule === 'figures';
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
   const theme = useTheme();
   const [list, setList] = useState<OctreeListEntry[]>([]);
@@ -215,12 +216,17 @@ export default function FigureModule() {
     cmpIsolateMargin, cmpDistance, panelDir, rowCount,
     layoutWidth, dpr, panelPrintedCm, hiddenCodes, cols, gutter, margin, composedCm, crop, held]);
 
+  // Taken each time the module is shown, not only when the project
+  // changes: the module stays mounted behind its tab while the Editor
+  // imports datasets, and a list taken when a new project was still
+  // empty would otherwise stay empty.
   useEffect(() => {
+    if (!shown) return;
     if (!project?.folder) { setList([]); return; }
     let cancelled = false;
     void listOctrees(project.folder).then((l) => { if (!cancelled) setList(l); }).catch(() => { if (!cancelled) setList([]); });
     return () => { cancelled = true; };
-  }, [project?.folder]);
+  }, [project?.folder, shown]);
 
   useEffect(() => {
     if (list.length === 0) return;

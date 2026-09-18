@@ -27,7 +27,8 @@ interface Desktop {
 }
 
 export default function InventoryModule() {
-  const { project } = useProject();
+  const { project, activeModule } = useProject();
+  const shown = activeModule === 'inventory';
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
 
   const [list, setList] = useState<OctreeListEntry[]>([]);
@@ -43,7 +44,12 @@ export default function InventoryModule() {
   const entry = useMemo(() => list.find(l => l.dir === dir) ?? null, [list, dir]);
   const canRun = !!desktop?.octreeTreeMetrics && !!dir;
 
+  // The list is taken each time this module is shown, not only when the
+  // project changes: the module stays mounted behind its tab while the
+  // Editor imports, subsets and shifts datasets, and a list taken when a
+  // new project was still empty would otherwise stay empty.
   useEffect(() => {
+    if (!shown) return;
     let cancelled = false;
     (async () => {
       if (!project?.folder) { setList([]); return; }
@@ -51,6 +57,7 @@ export default function InventoryModule() {
         const ls = await listOctrees(project.folder);
         if (cancelled) return;
         setList(ls);
+        setListError(null);
         setDir(prev => (prev && ls.some(l => l.dir === prev)) ? prev : (ls[0]?.dir ?? null));
       } catch (e) {
         // "No datasets" and "couldn't read the datasets" look identical
@@ -60,7 +67,7 @@ export default function InventoryModule() {
       }
     })();
     return () => { cancelled = true; };
-  }, [project?.folder]);
+  }, [project?.folder, shown]);
 
   useEffect(() => { setRows(null); setError(null); }, [dir]);
 

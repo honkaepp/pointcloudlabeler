@@ -94,7 +94,7 @@ export default function App() {
     return unsub;
   }, [handleProjectOpenDialog, handleProjectClose]);
 
-  const ctxValue = useMemo(() => ({ project, setProject }), [project]);
+  const ctxValue = useMemo(() => ({ project, setProject, activeModule }), [project, activeModule]);
 
   // No project open → welcome / new-project dialog instead of any module.
   if (!project) {

@@ -46,7 +46,8 @@ interface Params { crownCell: number; bhLow: number; bhHigh: number; dtmCell: nu
 const DEFAULT_PARAMS: Params = DEFAULT_METRIC_PARAMS;
 
 export default function MetricsModule() {
-  const { project } = useProject();
+  const { project, activeModule } = useProject();
+  const shown = activeModule === 'metrics';
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
 
   const [list, setList] = useState<OctreeListEntry[]>([]);
@@ -109,8 +110,12 @@ export default function MetricsModule() {
 
   const canRun = !!desktop?.octreeTreeMetrics && !!dir;
 
-  // Refresh the dataset list when the project changes.
+  // The list is taken each time this module is shown, not only when the
+  // project changes: the module stays mounted behind its tab while the
+  // Editor imports, subsets and shifts datasets, and a list taken when a
+  // new project was still empty would otherwise stay empty.
   useEffect(() => {
+    if (!shown) return;
     let cancelled = false;
     (async () => {
       if (!project?.folder) { setList([]); return; }
@@ -118,6 +123,7 @@ export default function MetricsModule() {
         const ls = await listOctrees(project.folder);
         if (cancelled) return;
         setList(ls);
+        setListError(null);
         setDir(prev => (prev && ls.some(l => l.dir === prev)) ? prev : (ls[0]?.dir ?? null));
       } catch (e) {
         // "No datasets" and "couldn't read the datasets" look identical
@@ -127,7 +133,7 @@ export default function MetricsModule() {
       }
     })();
     return () => { cancelled = true; };
-  }, [project?.folder]);
+  }, [project?.folder, shown]);
 
   // A new dataset invalidates the table.
   useEffect(() => { setRows(null); setError(null); setStatus(null); setStems(null); }, [dir]);
