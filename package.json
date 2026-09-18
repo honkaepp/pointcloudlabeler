@@ -8,7 +8,7 @@
     "url": "https://github.com/honkaepp/pointcloudlabeler.git"
   },
   "private": true,
-  "description": "Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans",
+  "description": "Tree segmentation, editing and label transfer for close-range forest point clouds",
   "author": "Eppu Honkanen",
   "scripts": {
     "dev": "vite",

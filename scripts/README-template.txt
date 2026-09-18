@@ -3,13 +3,25 @@ PointCloudLabeler — Install Guide
 
 What this is
 ------------
-PointCloudLabeler — Point-cloud tree labelling, forest inventory and
-biomass from terrestrial and mobile laser scans.
-An out-of-core point-cloud editor for forestry: import a LAS / LAZ
-plot of any size, classify the ground, segment individual trees,
-review and correct them, and measure them — height, DBH, taper, stem
-volume with a confidence interval, biomass and carbon — then export
-the labelled cloud, the per-tree table and the terrain rasters.
+PointCloudLabeler — Tree segmentation, editing and label transfer for close-range forest point clouds.
+PointCloudLabeler is an open-source desktop application for tree-level
+work on close-range laser scanning point clouds of forest plots,
+whatever produced them: terrestrial, mobile and handheld scanners, and
+low-altitude airborne lidar from UAVs or helicopters. It streams plots
+of hundreds of millions of points from disk and puts the segmentation
+itself in the user's hands. Individual trees are found with published
+methods, then reviewed and corrected in the viewport with lasso, split
+and merge on the full data, guided by a quality-control engine that
+ranks the trees most likely to be wrong and a review record of what
+was checked and decided.
+A corrected segmentation is transferred to any other cloud of the same
+plot, whether a later epoch or a different sensor, through the trees'
+skeletons, so tree identities stay stable across a time series and the
+manual correction is done once. Per-tree metrics (height, DBH, taper,
+stem volume with confidence intervals, biomass and carbon), terrain
+rasters, side-by-side comparison of epochs and exports to LAS/LAZ, CSV
+and GeoTIFF complete the workflow. A Windows installer is on the
+GitHub Releases page; macOS and Linux build from source.
 
 
 Requirements

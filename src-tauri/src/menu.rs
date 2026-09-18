@@ -201,7 +201,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         .website(Some(env!("CARGO_PKG_REPOSITORY")))
         .website_label(Some("Source code"))
         .comments(Some(concat!(
-            "Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans.\n\n",
+            "Tree segmentation, editing and label transfer for close-range forest point clouds.\n\n",
             "This program comes with ABSOLUTELY NO WARRANTY. It is free ",
             "software, and you are welcome to redistribute it under the ",
             "terms of the GNU General Public License, version 3 or later. ",

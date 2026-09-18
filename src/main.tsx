@@ -1,4 +1,4 @@
-// PointCloudLabeler — Point-cloud tree labelling, forest inventory and biomass from terrestrial and mobile laser scans
+// PointCloudLabeler — Tree segmentation, editing and label transfer for close-range forest point clouds
 // Copyright (C) 2026 Eppu Honkanen
 //
 // This program is free software: you can redistribute it and/or modify
