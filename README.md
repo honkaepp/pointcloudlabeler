@@ -29,9 +29,9 @@ Releases page; macOS and Linux build from source.
 
 Version 0.1.3 is the current release: a Windows installer on the
 [Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page,
-built from this repository. Development continues here, and a
-software article describing PointCloudLabeler is in preparation for
-SoftwareX.
+built from this repository. Development continues here. A scientific
+article describing PointCloudLabeler is in preparation; a preprint is
+on SSRN: <https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7602662>.
 
 > **Licence**: the software is [GPL-3.0-or-later](LICENSE); the
 > documentation is [CC BY 4.0](LICENSE-DOCS). Third-party assets
@@ -308,8 +308,10 @@ A machine-readable citation is in [`CITATION.cff`](CITATION.cff), and
 every release is archived on Zenodo: <https://doi.org/10.5281/zenodo.22824704>
 resolves to the latest version, and each version has a DOI of its own
 (v0.1.0: [10.5281/zenodo.22824705](https://doi.org/10.5281/zenodo.22824705)).
-A software article is in preparation for **SoftwareX**; until it
-appears, please cite the Zenodo record of the version you used.
+A scientific article is in preparation, with a preprint on SSRN:
+<https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7602662>. Until the
+article appears, please cite the Zenodo record of the version you used
+and, for the method, the preprint.
 
 If you use a specific algorithm in PointCloudLabeler, please also cite the
 underlying reference. Every method below is implemented from its

@@ -93,7 +93,8 @@ date-released: "2026-10-13"   # the day v0.1.3 was tagged
 type: software
 
 # --- Preferred citation (paper, once published) ------------------------
-# A software article is in preparation for SoftwareX (Elsevier). Fill in
+# A scientific article is in preparation; the preprint is on SSRN,
+# https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7602662. Fill in
 # and uncomment on acceptance, when the title, year and DOI are known —
 # a `preferred-citation` block pointing at a paper that does not exist
 # yet would redirect every citation of PointCloudLabeler to nothing.
@@ -111,5 +112,5 @@ type: software
 #     - family-names: "Vastaranta"
 #       given-names: "Mikko"
 #   year: TODO
-#   journal: "SoftwareX"
+#   journal: "TODO"
 #   doi: "TODO"
