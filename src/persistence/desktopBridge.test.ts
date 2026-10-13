@@ -29,7 +29,8 @@ describe('cloud_export_octree_las option plumbing', () => {
     'includeTreeId', 'includeSemantic',
     'includeStandingDeadwood', 'includeLayingDeadwood',
     'keepClassification', 'keepIntensity',
-    'decimals', 'extrasToExport', 'filter', 'targetCrs', 'geoid', 'las14',
+    'decimals', 'extrasToExport', 'filter', 'targetCrs', 'geoid', 'las14', 'standardFields',
+    'delimiter', 'header', 'plyAscii',
   ];
 
   const invokePayload = (() => {

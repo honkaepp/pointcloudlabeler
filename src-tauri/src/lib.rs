@@ -22,7 +22,12 @@ pub mod fsgrant;
 pub mod sysmem;
 pub mod commands;
 pub mod error;
-mod crash;
+pub mod headless;
+pub mod ops;
+pub mod progress;
+pub mod rt;
+pub mod crash;
+#[cfg(feature = "gui")]
 mod menu;
 
 /// Measure what this process holds, because four crashes were
@@ -32,12 +37,18 @@ mod menu;
 #[global_allocator]
 static ALLOCATOR: memtrack::Tracking = memtrack::Tracking;
 
+#[cfg(feature = "gui")]
 use commands::{
-    cancel, cloud, coregister, crs, e57, file, geodata, geoid, layers, nadgrid, octree, project,
-    ptx, recent, riegl, settings, xyz,
+    cancel, cloud, coregister, crs, e57, file, geodata, geoid, layers, nadgrid, octree, pointfile,
+    project, ptx, recent, settings, xyz,
 };
+#[cfg(feature = "gui")]
 use state::AppState;
 
+/// The desktop application. Everything below needs the Tauri runtime,
+/// so it exists only with the `gui` feature; the headless binary has its
+/// own entry point and never calls this.
+#[cfg(feature = "gui")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Install the panic hook before anything else so failures during Tauri
@@ -130,6 +141,7 @@ pub fn run() {
             cloud::cloud_rename,
             // out-of-core LAZ → octree converter + reader
             octree::cloud_import_octree,
+            pointfile::pointfile_probe,
             octree::octree_list,
             octree::octree_read_meta,
             octree::octree_read_block,
@@ -175,6 +187,8 @@ pub fn run() {
             octree::octree_skeleton_alignment_read,
             octree::octree_skeleton_alignment_clear,
             octree::octree_shift_georeference,
+            octree::octree_register,
+            octree::octree_transform_dataset,
             octree::octree_build_skeletons,
             octree::octree_read_skeletons,
             octree::octree_skeleton_info,
@@ -212,13 +226,6 @@ pub fn run() {
             octree::octree_read_stems,
             octree::octree_tree_qsm,
             octree::octree_read_qsm,
-            // Riegl preprocessing (.RiSCAN / .RiPROJECT — XML metadata
-            // only for now; point export needs user-installed rdblib).
-            riegl::riegl_list_projects,
-            riegl::riegl_import_project,
-            riegl::riegl_remove_project,
-            riegl::riegl_export_region,
-            riegl::riegl_capabilities,
             // E57 preprocessing (ASTM E2807 — pure Rust, no SDK
             // needed). Covers FARO / Leica / Trimble / NavVis / Emesent
             // / XGRIDS / GreenValley via their export paths.

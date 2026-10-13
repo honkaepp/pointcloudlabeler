@@ -23,6 +23,7 @@ pub enum AppError {
         source: serde_json::Error,
     },
 
+    #[cfg(feature = "gui")]
     #[error("{0}")]
     Tauri(#[from] tauri::Error),
 
@@ -48,6 +49,7 @@ impl AppError {
             AppError::Io { .. } => "Io",
             AppError::Sql { .. } => "Sql",
             AppError::Json { .. } => "Json",
+            #[cfg(feature = "gui")]
             AppError::Tauri(_) => "Tauri",
             AppError::NotFound { .. } => "NotFound",
             AppError::InvalidArgument { .. } => "InvalidArgument",
@@ -60,7 +62,11 @@ impl AppError {
     pub fn retryable(&self) -> bool {
         // Conservative default — the renderer can offer "retry" for transient
         // I/O and Tauri-layer failures but not for invalid arguments / state.
-        matches!(self, AppError::Io { .. } | AppError::Tauri(_))
+        #[cfg(feature = "gui")]
+        if matches!(self, AppError::Tauri(_)) {
+            return true;
+        }
+        matches!(self, AppError::Io { .. })
     }
 
     pub fn msg<S: Into<String>>(s: S) -> Self {
@@ -159,10 +165,9 @@ impl Serialize for AppError {
                 m.serialize_entry("field", field)?;
                 m.serialize_entry("reason", reason)?;
             }
-            AppError::Tauri(_)
-            | AppError::InvalidState(_)
-            | AppError::Conflict(_)
-            | AppError::Other(_) => {}
+            #[cfg(feature = "gui")]
+            AppError::Tauri(_) => {}
+            AppError::InvalidState(_) | AppError::Conflict(_) | AppError::Other(_) => {}
         }
         m.end()
     }

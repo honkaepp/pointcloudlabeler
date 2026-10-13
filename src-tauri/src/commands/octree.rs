@@ -96,14 +96,21 @@
 // recorded in hierarchy.bin. Uncompressed in v1; a Brotli pass is
 // straightforward to slot in later if file size matters.
 //
-// The on-disk format is ours, not Riegl's (their RDB2 is proprietary),
+// The on-disk format is ours, not a scanner vendor's (those are proprietary),
 // but the structure mirrors how Potree organises out-of-
 // core point clouds: per-node binary blocks + a small hierarchy index
 // that points at them.
 
+#[cfg(feature = "gui")]
+
 use tauri::State;
 
+#[cfg(feature = "gui")]
 use crate::state::AppState;
+use crate::progress::Progress;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
+use tauri::Window;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -113,7 +120,6 @@ use laz::laszip::parallel::ParLasZipDecompressor;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Window};
 
 /// The LAS 1.4 `Generating Software` field is `char[32]`. The `las`
 /// crate refuses to build a header from anything longer, so this is the
@@ -160,7 +166,7 @@ const ACCEL_GRID: f64 = 16.0;
 const TARGET_NODE_CELLS: f64 = 128.0;
 
 /// Hard cap on subdivision below the tile root.
-const HARD_MAX_DEPTH: u32 = 16;
+pub const HARD_MAX_DEPTH: u32 = 16;
 
 /// Base bytes per point on disk — the fixed prefix of every point in the
 /// chunk files and octree.bin. Layout: i32 xi, i32 yi, i32 zi, i32 tree_id,
@@ -203,9 +209,185 @@ fn point_source_id_offset(format_id: u8) -> usize {
     if format_id <= 5 { 18 } else { 20 }
 }
 
-fn is_point_source_id_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(POINT_SOURCE_ID_NAME)
-        || name.eq_ignore_ascii_case("pointsourceid")
+/// The standard LAS point fields the base record does not keep, each
+/// importable as a column under a reserved name and written back into
+/// the record on export. Every one of them was dropped before this —
+/// GPS time, the scan angle, the colour of a colourised MLS delivery —
+/// and the import dialog said so in a footnote. Now they are columns
+/// like any other: colourable, filterable, exported as they came.
+///
+/// GPS time is the one that needs eight bytes (see ExtraKind); the rest
+/// are small integers or a flag, exact in f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdField {
+    GpsTime,
+    ScanAngle,
+    UserData,
+    PointSourceId,
+    Red,
+    Green,
+    Blue,
+    Nir,
+    ScanDirection,
+    EdgeOfFlightLine,
+    Synthetic,
+    KeyPoint,
+    Withheld,
+    Overlap,
+    ScannerChannel,
+}
+
+pub const STD_FIELDS: [StdField; 15] = [
+    StdField::GpsTime, StdField::ScanAngle, StdField::UserData, StdField::PointSourceId,
+    StdField::Red, StdField::Green, StdField::Blue, StdField::Nir,
+    StdField::ScanDirection, StdField::EdgeOfFlightLine,
+    StdField::Synthetic, StdField::KeyPoint, StdField::Withheld, StdField::Overlap, StdField::ScannerChannel,
+];
+
+impl StdField {
+    /// The reserved column name.
+    pub fn name(self) -> &'static str {
+        match self {
+            StdField::GpsTime => "gps_time",
+            StdField::ScanAngle => "scan_angle",
+            StdField::UserData => "user_data",
+            StdField::PointSourceId => POINT_SOURCE_ID_NAME,
+            StdField::Red => "red",
+            StdField::Green => "green",
+            StdField::Blue => "blue",
+            StdField::Nir => "nir",
+            StdField::ScanDirection => "scan_direction",
+            StdField::EdgeOfFlightLine => "edge_of_flight_line",
+            StdField::Synthetic => "synthetic",
+            StdField::KeyPoint => "key_point",
+            StdField::Withheld => "withheld",
+            StdField::Overlap => "overlap",
+            StdField::ScannerChannel => "scanner_channel",
+        }
+    }
+
+    /// The field a column name means, with the spellings other tools use.
+    pub fn by_name(name: &str) -> Option<StdField> {
+        let n = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        Some(match n.as_str() {
+            "gps_time" | "gpstime" | "time" => StdField::GpsTime,
+            "scan_angle" | "scanangle" | "scan_angle_rank" | "scananglerank" => StdField::ScanAngle,
+            "user_data" | "userdata" => StdField::UserData,
+            "point_source_id" | "pointsourceid" => StdField::PointSourceId,
+            "red" => StdField::Red,
+            "green" => StdField::Green,
+            "blue" => StdField::Blue,
+            "nir" | "near_infrared" | "nearinfrared" => StdField::Nir,
+            "scan_direction" | "scan_direction_flag" | "scandirectionflag" => StdField::ScanDirection,
+            "edge_of_flight_line" | "edgeofflightline" => StdField::EdgeOfFlightLine,
+            "synthetic" => StdField::Synthetic,
+            "key_point" | "keypoint" => StdField::KeyPoint,
+            "withheld" => StdField::Withheld,
+            "overlap" => StdField::Overlap,
+            "scanner_channel" | "scannerchannel" => StdField::ScannerChannel,
+            _ => return None,
+        })
+    }
+
+    pub fn kind(self) -> ExtraKind {
+        match self { StdField::GpsTime => ExtraKind::F64, _ => ExtraKind::F32 }
+    }
+
+    /// Whether point format `f` carries the field at all.
+    pub fn available(self, f: u8) -> bool {
+        match self {
+            StdField::GpsTime => matches!(f, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10),
+            StdField::Red | StdField::Green | StdField::Blue => matches!(f, 2 | 3 | 5 | 7 | 8 | 10),
+            StdField::Nir => matches!(f, 8 | 10),
+            StdField::Overlap | StdField::ScannerChannel => (6..=10).contains(&f),
+            _ => f <= 10,
+        }
+    }
+
+    /// The fields point format `f` carries, by reserved name.
+    pub fn names_for(f: u8) -> Vec<&'static str> {
+        STD_FIELDS.iter().filter(|s| s.available(f)).map(|s| s.name()).collect()
+    }
+
+    fn rgb_base(f: u8) -> Option<usize> {
+        match f { 2 => Some(20), 3 | 5 => Some(28), 7 | 8 | 10 => Some(30), _ => None }
+    }
+
+    /// The value in a raw point record of format `f` (bounds per the
+    /// LAS 1.4 R15 record layouts; `pt` is at least the base record).
+    pub fn read(self, pt: &[u8], f: u8) -> f64 {
+        let u16_at = |o: usize| u16::from_le_bytes([pt[o], pt[o + 1]]) as f64;
+        let bit = |b: u8, k: u32| ((b >> k) & 1) as f64;
+        let legacy = f <= 5;
+        match self {
+            StdField::GpsTime => {
+                let o = if legacy { 20 } else { 22 };
+                f64::from_le_bytes(pt[o..o + 8].try_into().unwrap())
+            }
+            StdField::ScanAngle => if legacy { (pt[16] as i8) as f64 } else { i16::from_le_bytes([pt[18], pt[19]]) as f64 * 0.006 },
+            StdField::UserData => pt[17] as f64,
+            StdField::PointSourceId => u16_at(point_source_id_offset(f)),
+            StdField::Red | StdField::Green | StdField::Blue => match StdField::rgb_base(f) {
+                Some(b) => u16_at(b + 2 * match self { StdField::Red => 0, StdField::Green => 1, _ => 2 }),
+                None => 0.0,
+            },
+            StdField::Nir => if matches!(f, 8 | 10) { u16_at(36) } else { 0.0 },
+            StdField::ScanDirection => if legacy { bit(pt[14], 6) } else { bit(pt[15], 6) },
+            StdField::EdgeOfFlightLine => if legacy { bit(pt[14], 7) } else { bit(pt[15], 7) },
+            StdField::Synthetic => if legacy { bit(pt[15], 5) } else { bit(pt[15], 0) },
+            StdField::KeyPoint => if legacy { bit(pt[15], 6) } else { bit(pt[15], 1) },
+            StdField::Withheld => if legacy { bit(pt[15], 7) } else { bit(pt[15], 2) },
+            StdField::Overlap => if legacy { 0.0 } else { bit(pt[15], 3) },
+            StdField::ScannerChannel => if legacy { 0.0 } else { ((pt[15] >> 4) & 3) as f64 },
+        }
+    }
+
+    /// Write the value into a raw point record of format `f` — the
+    /// inverse of `read`. Flags OR into their byte, so the return
+    /// packing written before them stays; integers round and saturate.
+    pub fn write(self, rec: &mut [u8], f: u8, v: f64) {
+        let legacy = f <= 5;
+        let u16_to = |rec: &mut [u8], o: usize, v: f64| {
+            let q = if v.is_finite() { v.round().clamp(0.0, 65535.0) as u16 } else { 0 };
+            rec[o..o + 2].copy_from_slice(&q.to_le_bytes());
+        };
+        let set_bit = |rec: &mut [u8], o: usize, k: u32, v: f64| { if v >= 0.5 { rec[o] |= 1 << k; } };
+        match self {
+            StdField::GpsTime => {
+                let o = if legacy { 20 } else { 22 };
+                rec[o..o + 8].copy_from_slice(&(if v.is_finite() { v } else { 0.0 }).to_le_bytes());
+            }
+            StdField::ScanAngle => if legacy {
+                rec[16] = (if v.is_finite() { v.round().clamp(-128.0, 127.0) as i8 } else { 0 }) as u8;
+            } else {
+                let q = if v.is_finite() { (v / 0.006).round().clamp(-30000.0, 30000.0) as i16 } else { 0 };
+                rec[18..20].copy_from_slice(&q.to_le_bytes());
+            },
+            StdField::UserData => rec[17] = if v.is_finite() { v.round().clamp(0.0, 255.0) as u8 } else { 0 },
+            StdField::PointSourceId => u16_to(rec, point_source_id_offset(f), v),
+            StdField::Red | StdField::Green | StdField::Blue => if let Some(b) = StdField::rgb_base(f) {
+                u16_to(rec, b + 2 * match self { StdField::Red => 0, StdField::Green => 1, _ => 2 }, v);
+            },
+            StdField::Nir => if matches!(f, 8 | 10) { u16_to(rec, 36, v); },
+            StdField::ScanDirection => if legacy { set_bit(rec, 14, 6, v) } else { set_bit(rec, 15, 6, v) },
+            StdField::EdgeOfFlightLine => if legacy { set_bit(rec, 14, 7, v) } else { set_bit(rec, 15, 7, v) },
+            StdField::Synthetic => if legacy { set_bit(rec, 15, 5, v) } else { set_bit(rec, 15, 0, v) },
+            StdField::KeyPoint => if legacy { set_bit(rec, 15, 6, v) } else { set_bit(rec, 15, 1, v) },
+            StdField::Withheld => if legacy { set_bit(rec, 15, 7, v) } else { set_bit(rec, 15, 2, v) },
+            StdField::Overlap => if !legacy { set_bit(rec, 15, 3, v) },
+            StdField::ScannerChannel => if !legacy && v.is_finite() { rec[15] |= ((v.round().clamp(0.0, 3.0) as u8) & 3) << 4; },
+        }
+    }
+}
+
+/// Where an imported column's values come from.
+enum ColSource {
+    /// An Extra Bytes dimension of the file.
+    Dim(LasExtraDim),
+    /// A standard field of the point record.
+    Std(StdField),
+    /// A reserved deadwood channel, seeded from an optional dimension.
+    Deadwood(Option<LasExtraDim>),
 }
 
 /// True if `name` matches one of the deadwood reserved columns (case-
@@ -565,6 +747,107 @@ fn write_file_atomic(path: &Path, bytes: &[u8], what: &str) -> Result<(), String
 #[inline]
 fn point_stride(n_extras: usize) -> usize { BASE_POINT_BYTES + 4 * n_extras }
 
+/// What an extra column holds on disk. Every column was a 4-byte f32
+/// until GPS time asked for more: adjusted standard GPS time is about
+/// 1e9 s, and f32 steps by 64 s there — a column that cannot tell two
+/// pulses apart is not the column that was imported. An f64 column is
+/// 8 bytes and loss-less; the stride is the sum of the widths, not
+/// 4 × the count, and every reader asks the layout where a column is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtraKind {
+    F32,
+    F64,
+}
+
+impl ExtraKind {
+    pub fn width(self) -> usize {
+        match self { ExtraKind::F32 => 4, ExtraKind::F64 => 8 }
+    }
+    /// The name metadata.json records (`extras[].type`, `attributes[].type`).
+    pub fn type_name(self) -> &'static str {
+        match self { ExtraKind::F32 => "float32", ExtraKind::F64 => "float64" }
+    }
+    /// From the recorded name; anything unknown, or absent, is the f32
+    /// every column was before the type existed.
+    pub fn from_type_name(name: Option<&str>) -> ExtraKind {
+        match name {
+            Some("float64") | Some("f64") | Some("double") => ExtraKind::F64,
+            _ => ExtraKind::F32,
+        }
+    }
+}
+
+/// One extra column as the dataset's metadata declares it, with its byte
+/// offset inside a point record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtraCol {
+    pub name: String,
+    pub kind: ExtraKind,
+    pub offset: usize,
+}
+
+impl ExtraCol {
+    #[inline]
+    pub fn read(&self, pt: &[u8]) -> f64 {
+        match self.kind {
+            ExtraKind::F32 => f32::from_le_bytes(pt[self.offset..self.offset + 4].try_into().unwrap()) as f64,
+            ExtraKind::F64 => f64::from_le_bytes(pt[self.offset..self.offset + 8].try_into().unwrap()),
+        }
+    }
+    #[inline]
+    pub fn write(&self, pt: &mut [u8], v: f64) {
+        match self.kind {
+            ExtraKind::F32 => pt[self.offset..self.offset + 4].copy_from_slice(&(v as f32).to_le_bytes()),
+            ExtraKind::F64 => pt[self.offset..self.offset + 8].copy_from_slice(&v.to_le_bytes()),
+        }
+    }
+    #[inline]
+    pub fn end(&self) -> usize { self.offset + self.kind.width() }
+    /// This column's index in `cols` (by offset — unique in a layout).
+    #[inline]
+    pub fn offset_index(&self, cols: &[ExtraCol]) -> usize {
+        cols.iter().position(|c| c.offset == self.offset).unwrap_or(0)
+    }
+}
+
+/// The dataset's extra columns in record order, from `metadata.extras`
+/// (name and type) — the one place a column's offset comes from.
+pub fn extra_layout(meta: &serde_json::Value) -> Vec<ExtraCol> {
+    let mut out = Vec::new();
+    let mut offset = BASE_POINT_BYTES;
+    if let Some(arr) = meta.get("extras").and_then(|v| v.as_array()) {
+        for e in arr {
+            let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let kind = ExtraKind::from_type_name(e.get("type").and_then(|t| t.as_str()));
+            out.push(ExtraCol { name, kind, offset });
+            offset += kind.width();
+        }
+    }
+    out
+}
+
+/// The point stride a layout implies.
+pub fn layout_stride(cols: &[ExtraCol]) -> usize {
+    cols.last().map(|c| c.end()).unwrap_or(BASE_POINT_BYTES)
+}
+
+/// The column named `name`, case-insensitively.
+pub fn layout_find<'a>(cols: &'a [ExtraCol], name: &str) -> Option<&'a ExtraCol> {
+    cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// A layout for columns that are all f32 — what every writer that
+/// appends or re-stamps columns produced before types existed.
+fn layout_of_reports(reports: &[ExtraColumnReport]) -> Vec<ExtraCol> {
+    let mut out = Vec::with_capacity(reports.len());
+    let mut offset = BASE_POINT_BYTES;
+    for r in reports {
+        out.push(ExtraCol { name: r.name.clone(), kind: r.kind, offset });
+        offset += r.kind.width();
+    }
+    out
+}
+
 /// Current octree on-disk format version.
 ///  - "1" = 20 bytes/point (no semantic).
 ///  - "2" = 21 bytes/point (semantic byte).
@@ -745,6 +1028,18 @@ fn realign_offset(scale: [f64; 3], offset: [f64; 3], src: &SourceGrid) -> [f64; 
     out
 }
 
+/// Record what the GPS time column means ("standard" — adjusted
+/// standard GPS time — or "week"), from the source header's global
+/// encoding, so the export can write the same bit back.
+fn record_gps_time_type(out_dir: &Path, t: &str) -> Result<(), String> {
+    let path = out_dir.join("metadata.json");
+    let bytes = std::fs::read(&path).map_err(|e| format!("read metadata.json: {e}"))?;
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse metadata.json: {e}"))?;
+    if let Some(obj) = json.as_object_mut() { obj.insert("gpsTimeType".into(), serde_json::json!(t)); }
+    let text = serde_json::to_vec_pretty(&json).map_err(|e| format!("serialise metadata.json: {e}"))?;
+    write_file_atomic(&path, &text, "metadata.json")
+}
+
 /// Record the source file's grid in metadata.json, beside the scale and
 /// offset chosen from it — so a later realignment, or a reader asking
 /// whether the round-trip is exact, does not need the file.
@@ -771,11 +1066,51 @@ pub struct RealignResult {
     pub source_scale: [f64; 3],
 }
 
+/// Whether a LAS file can be THIS dataset's source, judged from the
+/// header bounds alone: the two footprints have to share ground. The
+/// overlap in X and in Y must cover at least half of the smaller
+/// footprint on that axis, with a metre of slack. A file from another
+/// plot fails — it stands somewhere else. A file larger than what was
+/// imported passes (the dataset is a crop or a subset of it), and so
+/// does a header the writer padded by a metre.
+///
+/// Z is not looked at. The dataset's box is the padded cube around the
+/// import (`Aabb::cube_around`), so on a 50 m plot its Z reaches are
+/// made up; and a header's Z extremes are the least trustworthy
+/// numbers in the file — a few noise returns high above the canopy, or
+/// a header nobody rewrote after the points were cleaned. A plot
+/// corrected in an old version was refused for exactly that: the file
+/// said Z up to 77.4 m, the cube stopped at 45.1, and X and Y agreed
+/// to the decimetre. Neither number says anything about the grid,
+/// which is realigned per axis from the file's scale and offset only;
+/// a wrong file could move the points by half a step at most, so this
+/// is a guard against the wrong plot, not a proof of identity.
+fn source_matches_dataset(
+    name: &str,
+    file_lo: [f64; 3],
+    file_hi: [f64; 3],
+    ds_min: [f64; 3],
+    ds_max: [f64; 3],
+) -> Result<(), String> {
+    const SLACK: f64 = 1.0;
+    for a in 0..2 {
+        let overlap = file_hi[a].min(ds_max[a]) - file_lo[a].max(ds_min[a]);
+        let smaller = (file_hi[a] - file_lo[a]).min(ds_max[a] - ds_min[a]);
+        if !(overlap + SLACK >= 0.5 * smaller) {
+            let axis = if a == 0 { "X" } else { "Y" };
+            return Err(format!(
+                "{name} does not look like this dataset's source: its {axis} extent ({:.1}..{:.1}) shares too little ground with the dataset's ({:.1}..{:.1})",
+                file_lo[a], file_hi[a], ds_min[a], ds_max[a]));
+        }
+    }
+    Ok(())
+}
+
 /// Move an existing dataset's coordinates back onto its source file's
 /// grid — see realign_offset. A dataset imported before the offset was
 /// aligned sits up to half a step off the file, systematically; this
 /// is the one-line metadata repair, no re-import and no lost edits.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_realign_to_source(octree_dir: String, las_path: String) -> Result<RealignResult, String> {
     let dir = Path::new(&octree_dir);
     let meta_path = dir.join("metadata.json");
@@ -793,23 +1128,14 @@ pub fn octree_realign_to_source(octree_dir: String, las_path: String) -> Result<
         scale: [tr.x.scale, tr.y.scale, tr.z.scale],
         offset: [tr.x.offset, tr.y.offset, tr.z.offset],
     };
-    // The file has to be THIS dataset's source: its bounds sit inside
-    // the dataset's box. A file from another plot would move every
-    // point to a grid that has nothing to do with it.
+    // The file has to be THIS dataset's source — see
+    // source_matches_dataset for what the header can and cannot tell.
     let b = header.bounds();
     let bb = json.get("boundingBox").ok_or_else(|| "metadata.json has no boundingBox".to_string())?;
     let bmin = json_f64_3(bb, "min")?;
     let bmax = json_f64_3(bb, "max")?;
-    let lo = [b.min.x, b.min.y, b.min.z];
-    let hi = [b.max.x, b.max.y, b.max.z];
-    for a in 0..3 {
-        if lo[a] < bmin[a] - 1.0 || hi[a] > bmax[a] + 1.0 {
-            return Err(format!(
-                "{} does not look like this dataset's source: its bounds ({:.1}..{:.1} on axis {a}) fall outside the dataset's ({:.1}..{:.1})",
-                Path::new(&las_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                lo[a], hi[a], bmin[a], bmax[a]));
-        }
-    }
+    let name = Path::new(&las_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    source_matches_dataset(&name, [b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z], bmin, bmax)?;
     let new_offset = realign_offset(scale, offset, &src);
     let shift_mm = [
         (new_offset[0] - offset[0]) * 1000.0,
@@ -830,12 +1156,6 @@ pub fn octree_realign_to_source(octree_dir: String, las_path: String) -> Result<
 // ---------------------------------------------------------------------
 // Progress
 // ---------------------------------------------------------------------
-
-#[derive(Serialize, Clone, Copy)]
-struct ProgressMsg<'a> {
-    stage: &'a str,
-    pct: f32,
-}
 
 /// Where an export reports progress to.
 ///
@@ -913,8 +1233,8 @@ pub fn lock_dataset(dir: &str) -> Result<DatasetGuard, String> {
     Ok(DatasetGuard(dir.to_string()))
 }
 
-fn emit_progress(window: &Window, stage: &str, pct: f32) {
-    let _ = window.emit("octree-progress", ProgressMsg { stage, pct });
+fn emit_progress(progress: &Progress, stage: &str, pct: f32) {
+    progress.report(stage, pct);
 }
 
 // ---------------------------------------------------------------------
@@ -1181,20 +1501,22 @@ impl ChunkSource {
 // ---------------------------------------------------------------------
 
 #[derive(Clone)]
-struct LasExtraDim {
-    name_lower: String,
-    data_type: u8,
+pub(crate) struct LasExtraDim {
+    /// The name as the descriptor spells it.
+    pub(crate) name: String,
+    pub(crate) name_lower: String,
+    pub(crate) data_type: u8,
     /// Byte offset within each point's extra-bytes region.
-    offset: usize,
+    pub(crate) offset: usize,
     /// Width in bytes (0 ⇒ unsupported).
-    size: usize,
+    pub(crate) size: usize,
     /// LAS EB descriptor scale/offset (options bits 3/4). The stored raw
     /// value decodes as `raw * val_scale + val_offset`. Writers that pack
     /// a wide-range column into a narrow type (e.g. tree ids 5000–8000
     /// quantised into u8/u16) rely on these — ignoring them read the raw
     /// codes instead of the real values. Defaults 1.0 / 0.0 (identity).
-    val_scale: f64,
-    val_offset: f64,
+    pub(crate) val_scale: f64,
+    pub(crate) val_offset: f64,
 }
 
 /// Per-point standard-field byte count for each LAS point format. Extra
@@ -1247,7 +1569,7 @@ fn extra_dim_is_scalar(data_type: u8) -> bool {
     (1..=10).contains(&data_type)
 }
 
-fn parse_extra_dims(vlrs: &[las::Vlr]) -> Vec<LasExtraDim> {
+pub(crate) fn parse_extra_dims(vlrs: &[las::Vlr]) -> Vec<LasExtraDim> {
     let mut dims = Vec::new();
     // The Extra-Bytes region is ONE contiguous block per point; its
     // descriptors may be written into a single LASF_Spec/4 VLR or split
@@ -1295,6 +1617,7 @@ fn parse_extra_dims(vlrs: &[las::Vlr]) -> Vec<LasExtraDim> {
             // because the cumulative offset past an unknown size is no
             // longer trustworthy. Dims recorded before it stay valid.
             dims.push(LasExtraDim {
+                name: name_raw.to_string(),
                 name_lower: name_raw.to_lowercase(),
                 data_type,
                 offset: cum,
@@ -1317,7 +1640,7 @@ fn parse_extra_dims(vlrs: &[las::Vlr]) -> Vec<LasExtraDim> {
 /// typed readers below funnel through this so scale/offset is honoured
 /// uniformly. Returns 0.0 if the slice is short or the type unsupported
 /// (filtered upstream).
-fn read_extra_raw_f64(pbuf: &[u8], dim: &LasExtraDim, point_size: usize, base_size: usize) -> f64 {
+pub(crate) fn read_extra_raw_f64(pbuf: &[u8], dim: &LasExtraDim, point_size: usize, base_size: usize) -> f64 {
     // Extra bytes start after the standard fields. point_size includes
     // them; base_size is the standard-only size.
     let abs_off = base_size + dim.offset;
@@ -1356,15 +1679,6 @@ fn read_extra_as_semantic_u8(pbuf: &[u8], dim: &LasExtraDim, point_size: usize, 
     match v { 1 => 1, 2 => 2, _ => 0 }
 }
 
-/// Read one extra-byte value as f32 (scale/offset applied), the
-/// lossy-but-uniform storage we use for the octree's `extras` payload.
-/// f32 is plenty for the precision a colour ramp can resolve (24-bit
-/// mantissa) while keeping every extra a fixed 4 bytes so per-point
-/// stride stays predictable.
-fn read_extra_as_f32(pbuf: &[u8], dim: &LasExtraDim, point_size: usize, base_size: usize) -> f32 {
-    read_extra_raw_f64(pbuf, dim, point_size, base_size) as f32
-}
-
 // ---------------------------------------------------------------------
 // Phase 1 — bin to chunks
 // ---------------------------------------------------------------------
@@ -1389,8 +1703,28 @@ fn read_extra_as_f32(pbuf: &[u8], dim: &LasExtraDim, point_size: usize, base_siz
 #[derive(Clone, Debug)]
 pub struct ExtraColumnReport {
     pub name: String,
-    pub min: f32,
-    pub max: f32,
+    pub min: f64,
+    pub max: f64,
+    pub kind: ExtraKind,
+}
+
+impl ExtraColumnReport {
+    pub fn f32(name: &str, min: f64, max: f64) -> ExtraColumnReport {
+        ExtraColumnReport { name: name.to_string(), min, max, kind: ExtraKind::F32 }
+    }
+}
+
+/// A (min, max) accumulator for one column: +∞/−∞ until the first
+/// finite sample, and reported as (0, 0) when nothing finite came.
+fn minmax_fold(mm: &mut (f64, f64), v: f64) {
+    if v.is_finite() {
+        if v < mm.0 { mm.0 = v; }
+        if v > mm.1 { mm.1 = v; }
+    }
+}
+
+fn minmax_report(lo: f64, hi: f64) -> (f64, f64) {
+    if lo.is_finite() && hi.is_finite() && hi >= lo { (lo, hi) } else { (0.0, 0.0) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1430,7 +1764,7 @@ fn phase1_parallel_bin(
     // across every point, which feeds metadata.intensityRange so the
     // colour ramp can span the whole cloud instead of renormalising
     // per node (see write_metadata / OctreeView.tsx's colorNode).
-) -> Result<(ChunkSource, Aabb, [f64; 3], [f64; 3], u64, Vec<ExtraColumnReport>, Option<(i32, i32)>, Option<(u16, u16)>, Option<serde_json::Value>, SourceGrid), String> {
+) -> Result<Phase1Output, String> {
     // 1. High-level header → bounds, point format, transforms, VLRs.
     let header_file = File::open(src_path).map_err(|e| format!("open {src_path}: {e}"))?;
     let header = las::Header::new(BufReader::with_capacity(1 << 16, header_file))
@@ -1515,26 +1849,34 @@ fn phase1_parallel_bin(
     // dedicated channels (resolved separately below) so the deadwood UI
     // can always edit them on a new dataset, with or without a source
     // column to seed from.
-    let mut extra_dims: Vec<LasExtraDim> = Vec::with_capacity(extra_names.len());
-    let mut extra_display_names: Vec<String> = Vec::with_capacity(extra_names.len());
-    // `point_source_id` is a standard field, not an Extra-Bytes
-    // dimension, so it is recognised here and read from the record
-    // itself below. A file that also carries an EB dim under that name
-    // loses to the standard field: that is where a writer is supposed
-    // to put the sensor pass, and a merged cloud's scan identity is
-    // what the name means everywhere else.
-    let mut want_psid = false;
+    // The columns the new dataset carries, in order: every requested
+    // name — an Extra Bytes dimension, or a standard field of the
+    // record under its reserved name (see StdField) — then the two
+    // deadwood channels. Each resolves up front, so a name the file does
+    // not have fails the import with a reason instead of a column of
+    // zeros. An Extra Bytes dimension of a 64-bit type (u64, i64, f64)
+    // keeps eight bytes; everything else fits an f32 exactly or near
+    // enough for a colour ramp.
+    let mut plan: Vec<(String, ColSource, ExtraKind)> = Vec::with_capacity(extra_names.len() + 2);
     for raw in extra_names {
         let want = raw.trim();
         if want.is_empty() { continue; }
-        if is_point_source_id_name(want) {
-            want_psid = true;
-            continue;
-        }
         if is_deadwood_name(want) {
             // Silently skip — the import dialog already filters these
             // from the "extra columns" list; this is a belt-and-braces
             // guard so the deadwood channels never ride twice.
+            continue;
+        }
+        if plan.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(want)) { continue; }
+        // A standard field under its reserved name wins over an Extra
+        // Bytes dimension that happens to share it: that is where a
+        // writer is supposed to put the sensor pass or the time, and
+        // what the name means everywhere else.
+        if let Some(sf) = StdField::by_name(want) {
+            if !sf.available(format_id) {
+                return Err(format!("'{want}' is not in this file: point format {format_id} does not carry {}", sf.name()));
+            }
+            plan.push((sf.name().to_string(), ColSource::Std(sf), sf.kind()));
             continue;
         }
         match resolve(want) {
@@ -1542,8 +1884,8 @@ fn phase1_parallel_bin(
             Some(d) if !extra_dim_is_scalar(d.data_type) =>
                 return Err(format!("extra column '{want}' has unsupported LAS type {} (not a numeric scalar)", d.data_type)),
             Some(d) => {
-                extra_dims.push(d);
-                extra_display_names.push(want.to_string());
+                let kind = if matches!(d.data_type, 7 | 8 | 10) { ExtraKind::F64 } else { ExtraKind::F32 };
+                plan.push((want.to_string(), ColSource::Dim(d), kind));
             }
         }
     }
@@ -1570,27 +1912,34 @@ fn phase1_parallel_bin(
             _ => {}
         }
     }
-    // Reserve the two deadwood channels at the tail of the extras region
-    // when the user asked for them. They're identified by their reserved
-    // names; the viewer + reset/export paths look them up by name (not by
-    // index), so a later normalise / subset that appends new extras keeps
-    // them addressable. Skipped channels cost nothing and can be added
+    // The two deadwood channels at the tail when the user asked for
+    // them. They're identified by their reserved names; the viewer +
+    // reset/export paths look them up by name (not by index), so a
+    // later normalise / subset that appends new extras keeps them
+    // addressable. Skipped channels cost nothing and can be added
     // afterwards via octree_add_deadwood_columns.
-    if want_psid {
-        extra_display_names.push(POINT_SOURCE_ID_NAME.to_string());
-    }
     if include_deadwood {
-        extra_display_names.push(STANDING_DEADWOOD_NAME.to_string());
-        extra_display_names.push(LAYING_DEADWOOD_NAME.to_string());
+        plan.push((STANDING_DEADWOOD_NAME.to_string(), ColSource::Deadwood(standing_dw_dim), ExtraKind::F32));
+        plan.push((LAYING_DEADWOOD_NAME.to_string(), ColSource::Deadwood(laying_dw_dim), ExtraKind::F32));
     }
-    let n_extras = extra_display_names.len();
-    let n_user_extras = extra_dims.len();
-    // Where the reserved channels land in the extras region: the
-    // Extra-Bytes columns first, then point_source_id, then the two
-    // deadwood ids. Held as a count so the deadwood offsets below shift
-    // by themselves when the scan-id column is present.
-    let psid_slot = if want_psid { 1 } else { 0 };
-    let psid_record_offset = point_source_id_offset(format_id);
+    // The record layout the plan implies.
+    let cols: Vec<ExtraCol> = {
+        let mut out = Vec::with_capacity(plan.len());
+        let mut off = BASE_POINT_BYTES;
+        for (name, _, kind) in &plan {
+            out.push(ExtraCol { name: name.clone(), kind: *kind, offset: off });
+            off += kind.width();
+        }
+        out
+    };
+    let n_extras = cols.len();
+    // What the GPS time means, when it is carried: adjusted standard
+    // time or seconds of the week — the header's global encoding bit,
+    // which the export writes back so a reader interprets the column
+    // as the source did.
+    let gps_time_type: Option<&'static str> = if plan.iter().any(|(_, src, _)| matches!(src, ColSource::Std(StdField::GpsTime))) {
+        Some(match header.gps_time_type() { las::GpsTimeType::Standard => "standard", _ => "week" })
+    } else { None };
     let base_size = las_standard_record_length(format_id);
 
     // 3. Re-open + parse the raw header so we know exactly where point
@@ -1650,14 +1999,14 @@ fn phase1_parallel_bin(
 
     // Stage chunks in memory or out-of-core depending on the predicted
     // packed size — known exactly up front (header count × stride).
-    let predicted_bytes = total.saturating_mul(point_stride(n_extras) as u64);
+    let predicted_bytes = total.saturating_mul(layout_stride(&cols) as u64);
     let mut sink = ChunkSink::new(spill_dir, predicted_bytes)?;
     let num_threads = rayon::current_num_threads().clamp(1, 32);
     let mut processed: u64 = 0;
     // Whole-file min/max per extra column — seeded with +/- inf so the
     // first finite sample replaces it. Per-thread accumulators get
     // reduced into this between batches (see below).
-    let mut extras_minmax: Vec<(f32, f32)> = vec![(f32::INFINITY, f32::NEG_INFINITY); n_extras];
+    let mut extras_minmax: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); n_extras];
     // Observed tree_id range over the import (only meaningful when the
     // dialog mapped a tree_id source column). Surfaced as a sanity check
     // so a user can see e.g. "tree_id: 5017..8020 — 247 unique ids" and
@@ -1691,12 +2040,12 @@ fn phase1_parallel_bin(
         // thread also tracks the min/max of every extra column it saw,
         // and we reduce them across threads after the batch so the
         // overall extras range matches what landed in the octree.
-        let stride = point_stride(n_extras);
+        let stride = layout_stride(&cols);
         // Each thread returns: per-chunk packed bytes, per-extra min/max,
         // (tree_id min, tree_id max, count-with-nonzero-or-mapped) so
         // we can report what the converter actually saw to the user, and
         // (intensity min, intensity max) over its slice.
-        let per_thread: Vec<(Vec<Vec<u8>>, Vec<(f32, f32)>, (i32, i32, u64), (u16, u16))> = (0..num_threads)
+        let per_thread: Vec<(Vec<Vec<u8>>, Vec<(f64, f64)>, (i32, i32, u64), (u16, u16))> = (0..num_threads)
             .into_par_iter()
             .map(|tid| {
                 let per_thread_count = take / num_threads;
@@ -1706,7 +2055,7 @@ fn phase1_parallel_bin(
                     .map(|_| Vec::with_capacity(1024))
                     .collect();
                 let mut packed = vec![0u8; stride];
-                let mut extra_minmax: Vec<(f32, f32)> = vec![(f32::INFINITY, f32::NEG_INFINITY); n_extras];
+                let mut extra_minmax: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); n_extras];
                 // Per-thread tree_id observed range. Only updated when a
                 // tree_id source column was mapped; the global accumulator
                 // ignores the (MAX, MIN, 0) sentinel from threads that saw
@@ -1787,61 +2136,21 @@ fn phase1_parallel_bin(
                     packed[18] = cls;
                     packed[19] = ret_packed;
                     packed[20] = semantic;
-                    for (k, d) in extra_dims.iter().enumerate() {
-                        let v = read_extra_as_f32(pbuf, d, point_size, base_size);
-                        let eo = BASE_POINT_BYTES + k * 4;
-                        packed[eo..eo + 4].copy_from_slice(&v.to_le_bytes());
+                    // Every extra column, from its source, at its offset
+                    // and width — an Extra Bytes dimension decoded with
+                    // its descriptor's scale and offset, a standard field
+                    // read from the record, a deadwood seed.
+                    for ((_, src, _), col) in plan.iter().zip(cols.iter()) {
+                        let v = match src {
+                            ColSource::Dim(d) => read_extra_raw_f64(pbuf, d, point_size, base_size),
+                            ColSource::Std(sf) => sf.read(pbuf, format_id),
+                            ColSource::Deadwood(Some(d)) => read_extra_as_i32(pbuf, d, point_size, base_size) as f64,
+                            ColSource::Deadwood(None) => 0.0,
+                        };
+                        col.write(&mut packed, v);
                         // NaN-safe min/max: skip non-finite samples so a
                         // bad source value can't poison the metadata range.
-                        if v.is_finite() {
-                            let mm = &mut extra_minmax[k];
-                            if v < mm.0 { mm.0 = v; }
-                            if v > mm.1 { mm.1 = v; }
-                        }
-                    }
-                    // The two deadwood id channels at the tail (when the
-                    // import includes them). Each value is an integer
-                    // instance id (0 = unlabelled), read as i32 from the
-                    // optional source column (or 0 when unmapped) and
-                    // stored as f32 to share the extras stride machinery.
-                    // The scan-position id, straight out of the
-                    // standard record. Stored as f32 like every other
-                    // extra; a u16 is exact in f32.
-                    if want_psid {
-                        let psid = u16::from_le_bytes(
-                            pbuf[psid_record_offset..psid_record_offset + 2].try_into().unwrap(),
-                        ) as f32;
-                        let po = BASE_POINT_BYTES + n_user_extras * 4;
-                        packed[po..po + 4].copy_from_slice(&psid.to_le_bytes());
-                        let mm = &mut extra_minmax[n_user_extras];
-                        if psid < mm.0 { mm.0 = psid; }
-                        if psid > mm.1 { mm.1 = psid; }
-                    }
-                    if include_deadwood {
-                        let sd_id = match &standing_dw_dim {
-                            Some(d) => read_extra_as_i32(pbuf, d, point_size, base_size),
-                            None => 0,
-                        };
-                        let ld_id = match &laying_dw_dim {
-                            Some(d) => read_extra_as_i32(pbuf, d, point_size, base_size),
-                            None => 0,
-                        };
-                        let sd_off = BASE_POINT_BYTES + (n_user_extras + psid_slot) * 4;
-                        let ld_off = sd_off + 4;
-                        let sd_f = sd_id as f32;
-                        let ld_f = ld_id as f32;
-                        packed[sd_off..sd_off + 4].copy_from_slice(&sd_f.to_le_bytes());
-                        packed[ld_off..ld_off + 4].copy_from_slice(&ld_f.to_le_bytes());
-                        if sd_f.is_finite() {
-                            let mm = &mut extra_minmax[n_user_extras + psid_slot];
-                            if sd_f < mm.0 { mm.0 = sd_f; }
-                            if sd_f > mm.1 { mm.1 = sd_f; }
-                        }
-                        if ld_f.is_finite() {
-                            let mm = &mut extra_minmax[n_user_extras + psid_slot + 1];
-                            if ld_f < mm.0 { mm.0 = ld_f; }
-                            if ld_f > mm.1 { mm.1 = ld_f; }
-                        }
+                        minmax_fold(&mut extra_minmax[col.offset_index(&cols)], v);
                     }
                     chunks[idx].extend_from_slice(&packed);
                 }
@@ -1882,12 +2191,12 @@ fn phase1_parallel_bin(
     // Finalise the extras report. Columns that saw no finite samples (an
     // all-NaN column, for instance) get min == max == 0 so the ramp UI
     // doesn't see Infinity bounds.
-    let extras_report: Vec<ExtraColumnReport> = extra_display_names
-        .into_iter()
-        .zip(extras_minmax.into_iter())
-        .map(|(name, (lo, hi))| {
-            let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo { (lo, hi) } else { (0.0, 0.0) };
-            ExtraColumnReport { name, min: lo, max: hi }
+    let extras_report: Vec<ExtraColumnReport> = cols
+        .iter()
+        .zip(extras_minmax)
+        .map(|(c, (lo, hi))| {
+            let (lo, hi) = minmax_report(lo, hi);
+            ExtraColumnReport { name: c.name.clone(), min: lo, max: hi, kind: c.kind }
         })
         .collect();
     let tree_id_range = if tree_id_seen > 0 && tree_id_minmax.0 <= tree_id_minmax.1 {
@@ -1905,8 +2214,14 @@ fn phase1_parallel_bin(
     } else {
         None
     };
-    Ok((sink.into_source()?, bbox, scale, offset, total, extras_report, tree_id_range, intensity_range, declared_crs, src_grid))
+    Ok((sink.into_source()?, bbox, scale, offset, total, extras_report, tree_id_range, intensity_range, declared_crs, src_grid, gps_time_type))
 }
+
+/// What phase 1 hands on: the binned chunks, the cube, the quantisation,
+/// the point count, the extras report, the tree-id and intensity ranges
+/// seen, the file's declared CRS, its grid, and the GPS time type when
+/// the time was carried.
+type Phase1Output = (ChunkSource, Aabb, [f64; 3], [f64; 3], u64, Vec<ExtraColumnReport>, Option<(i32, i32)>, Option<(u16, u16)>, Option<serde_json::Value>, SourceGrid, Option<&'static str>);
 
 // ---------------------------------------------------------------------
 // Phase 2 — per-chunk sub-octree builds (parallel)
@@ -2068,14 +2383,13 @@ fn phase23_build_write(
     offset: [f64; 3],
     root_spacing: f64,
     max_depth: u32,
-    n_extras: usize,
+    stride: usize,
     out_dir: &Path,
     progress: StagedSink,
 ) -> Result<(Vec<TileMeta>, u64), String> {
     // Any sidecar in this directory belongs to whatever dataset used to
     // live here, not to the one about to be written. See the helper.
     clear_stale_sidecars(out_dir);
-    let stride = point_stride(n_extras);
     let tile_root_spacing = root_spacing / (1u64 << TILE_GLOBAL_DEPTH as u64) as f64;
     let tile_max_depth = max_depth.saturating_sub(TILE_GLOBAL_DEPTH);
 
@@ -2242,12 +2556,13 @@ fn write_metadata(
         serde_json::json!({ "name": "semantic", "type": "uint8", "byteSize": 1 }),
     ];
     for e in extras {
-        attrs.push(serde_json::json!({ "name": e.name, "type": "float32", "byteSize": 4 }));
+        attrs.push(serde_json::json!({ "name": e.name, "type": e.kind.type_name(), "byteSize": e.kind.width() }));
     }
     let extras_json: Vec<serde_json::Value> = extras
         .iter()
-        .map(|e| serde_json::json!({ "name": e.name, "min": e.min, "max": e.max }))
+        .map(|e| serde_json::json!({ "name": e.name, "min": e.min, "max": e.max, "type": e.kind.type_name() }))
         .collect();
+    let point_bytes = layout_stride(&layout_of_reports(extras));
     let mut json = serde_json::json!({
         "formatVersion": FORMAT_VERSION,
         "name": name,
@@ -2260,7 +2575,7 @@ fn write_metadata(
         "tileGridSize": GRID_SIZE,
         "tileGlobalDepth": TILE_GLOBAL_DEPTH,
         "scannerType": scanner_type,
-        "pointBytes": point_stride(extras.len()),
+        "pointBytes": point_bytes,
         "attributes": attrs,
         "extras": extras_json,
         "tiles": tiles,
@@ -2350,7 +2665,8 @@ pub struct OctreeImportResult {
     pub tree_id_range: Option<[i32; 2]>,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn cloud_import_octree(
     window: Window,
@@ -2382,7 +2698,12 @@ pub async fn cloud_import_octree(
     // (saves 8 bytes/point); they can be added later in-app via
     // octree_add_deadwood_columns. Missing ⇒ true (legacy behaviour).
     include_deadwood: Option<bool>,
+    // A text, PLY or E57 file: which of its columns fills which field
+    // (see pointfile::PointFileMapping). Missing ⇒ the probe's guess.
+    // Ignored for LAS/LAZ, whose record is read directly.
+    mapping: Option<super::pointfile::PointFileMapping>,
 ) -> Result<OctreeImportResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let depth = max_depth.min(HARD_MAX_DEPTH);
     let spacing = root_spacing.max(0.0);
     let tree_extra = tree_id_extra_name.unwrap_or_default();
@@ -2391,9 +2712,19 @@ pub async fn cloud_import_octree(
     let laying_dw = laying_deadwood_extra_name.unwrap_or_default();
     let extras = extra_names.unwrap_or_default();
     let include_dw = include_deadwood.unwrap_or(true);
-    tauri::async_runtime::spawn_blocking(move || {
+    if super::pointfile::PointFileKind::of_path(&src_path).is_some() {
+        return crate::rt::spawn_blocking(move || {
+            run_import_pointfile(
+                &|stage, p| emit_progress(&progress, stage, p),
+                &src_path, &out_dir, &name, &scanner_type, spacing, depth, mapping.as_ref(), include_dw,
+            )
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?;
+    }
+    crate::rt::spawn_blocking(move || {
         run_convert(
-            &|stage, p| emit_progress(&window, stage, p),
+            &|stage, p| emit_progress(&progress, stage, p),
             &src_path, &out_dir, &name, &scanner_type, spacing, depth,
             &tree_extra, &sem_extra, &standing_dw, &laying_dw, &extras, include_dw,
         )
@@ -2402,8 +2733,37 @@ pub async fn cloud_import_octree(
     .map_err(|e| format!("join error: {e}"))?
 }
 
+/// A text, PLY or E57 file into a dataset — `run_convert` for the files
+/// the importer does not read itself. Staged as a LAS inside the
+/// dataset directory (see `pointfile`); without a mapping, the probe's
+/// guess from the column names.
 #[allow(clippy::too_many_arguments)]
-fn run_convert(
+pub fn run_import_pointfile(
+    progress: StagedSink,
+    src_path: &str,
+    out_dir: &str,
+    name: &str,
+    scanner_type: &str,
+    root_spacing: f64,
+    max_depth: u32,
+    mapping: Option<&super::pointfile::PointFileMapping>,
+    include_deadwood: bool,
+) -> Result<OctreeImportResult, String> {
+    let guessed;
+    let mapping = match mapping {
+        Some(m) => m,
+        None => {
+            guessed = super::pointfile::probe(src_path)?.suggested;
+            &guessed
+        }
+    };
+    super::pointfile::import_pointfile(
+        progress, src_path, out_dir, name, scanner_type, root_spacing, max_depth, mapping, include_deadwood,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert(
     progress: StagedSink,
     src_path: &str,
     out_dir: &str,
@@ -2423,14 +2783,14 @@ fn run_convert(
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
 
     progress("open", 0.0);
-    let (chunk_source, bbox, scale, offset, _total, extras_report, tree_id_range, intensity_range, declared_crs, src_grid) = phase1_parallel_bin(
+    let (chunk_source, bbox, scale, offset, _total, extras_report, tree_id_range, intensity_range, declared_crs, src_grid, gps_time_type) = phase1_parallel_bin(
         src_path,
         tree_id_extra_name, semantic_extra_name,
         standing_deadwood_extra_name, laying_deadwood_extra_name,
         extra_names, include_deadwood,
         out_path.join(".chunks_tmp"), progress,
     )?;
-    let n_extras = extras_report.len();
+    let stride = layout_stride(&layout_of_reports(&extras_report));
 
     // Derive the LOD root spacing from the cloud's cube unless the caller
     // forced a value. The bbox is cube-inflated in phase 1, so every axis
@@ -2443,7 +2803,7 @@ fn run_convert(
     };
 
     let (tiles, _octree_bytes) = phase23_build_write(
-        chunk_source, bbox, scale, offset, root_spacing, max_depth, n_extras, &out_path, progress,
+        chunk_source, bbox, scale, offset, root_spacing, max_depth, stride, &out_path, progress,
     )?;
     let total_stored: u64 = tiles.iter().map(|t| t.point_count).sum();
 
@@ -2458,6 +2818,7 @@ fn run_convert(
     )
     .map_err(|e| format!("write metadata: {e}"))?;
     record_source_grid(&out_path, &src_grid)?;
+    if let Some(t) = gps_time_type { record_gps_time_type(&out_path, t)?; }
 
     progress("done", 1.0);
 
@@ -2503,7 +2864,7 @@ pub struct OctreeListEntry {
 /// Scan `<project>/octrees/*/metadata.json` and return one entry per
 /// valid dataset. Folders without a metadata.json are silently skipped
 /// (= mid-conversion or hand-edited directories).
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_list(project_folder: String) -> Result<Vec<OctreeListEntry>, String> {
     let octrees_dir = Path::new(&project_folder).join("octrees");
     if !octrees_dir.exists() {
@@ -2589,7 +2950,7 @@ pub struct OctreeOpenResult {
 /// Load metadata.json + the full hierarchy.bin (= up to a few hundred
 /// thousand 24-byte records — fits comfortably in memory). The front
 /// end then drives per-tile node block requests via octree_read_block.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_meta(octree_dir: String) -> Result<OctreeOpenResult, String> {
     let dir = Path::new(&octree_dir);
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
@@ -2627,7 +2988,8 @@ pub fn octree_read_meta(octree_dir: String) -> Result<OctreeOpenResult, String> 
 /// octree_read_meta. Returns the data via Tauri's raw binary IPC so
 /// big blocks (a few hundred KB to a few MB) don't pay a JSON-array
 /// round-trip.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_block(
     octree_dir: String,
     byte_offset: u64,
@@ -2660,7 +3022,8 @@ pub fn octree_read_block(
 /// full stride (e.g. 61 B/point with 10 extras) down to the ~25 B the
 /// renderer actually uses, which is most of the streaming-speed gap to
 /// native viewers. `fields` = (offset_in_record, width_bytes) pairs.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_block_columns(
     octree_dir: String,
     byte_offset: u64,
@@ -2753,7 +3116,8 @@ const PATCHES_REC_V2: usize = 32;
 
 /// Read patches.bin if it exists, else return an empty body. The
 /// front end can blindly call this every time it opens an octree.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_patches(octree_dir: String) -> Result<tauri::ipc::Response, String> {
     let path = Path::new(&octree_dir).join("patches.bin");
     if !path.exists() {
@@ -2780,7 +3144,8 @@ pub fn octree_read_patches(octree_dir: String) -> Result<tauri::ipc::Response, S
 /// big (millions of points, corrections piling up with no compaction —
 /// see the begin/chunk/commit trio below, which is what the front end's
 /// save path actually calls now). Kept for small buffers and tests.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_patches(
     request: tauri::ipc::Request<'_>,
 ) -> Result<u64, String> {
@@ -2876,11 +3241,100 @@ fn write_patches_begin_inner(octree_dir: &str) -> Result<(), String> {
 /// Start a chunked patches.bin write: (re)creates patches.bin.tmp and
 /// writes the 8-byte v2 header. Call once before any
 /// `octree_write_patches_chunk` calls.
-#[tauri::command]
+/// Drop one attribute's overrides from `patches.bin`, as the renderer's
+/// `PatchStore.clearAttribute` does after a segmenter has rewritten that
+/// column in octree.bin: an override that re-imposed the OLD tree id or
+/// semantic label on reload would undo the run. Records that carry no
+/// change afterwards are removed; the file is rewritten atomically in
+/// the current (v2) layout, or left alone when nothing in it changes.
+/// Returns how many overrides were cleared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PatchColumns {
+    pub tree_id: bool,
+    pub semantic: bool,
+    pub standing_deadwood: bool,
+    pub laying_deadwood: bool,
+}
+
+impl PatchColumns {
+    pub const TREE_ID: PatchColumns = PatchColumns { tree_id: true, semantic: false, standing_deadwood: false, laying_deadwood: false };
+    pub const SEMANTIC: PatchColumns = PatchColumns { tree_id: false, semantic: true, standing_deadwood: false, laying_deadwood: false };
+    pub const TREE_ID_AND_SEMANTIC: PatchColumns = PatchColumns { tree_id: true, semantic: true, standing_deadwood: false, laying_deadwood: false };
+    pub const LAYING_DEADWOOD: PatchColumns = PatchColumns { tree_id: false, semantic: false, standing_deadwood: false, laying_deadwood: true };
+}
+
+pub fn clear_patch_columns(octree_dir: &str, cols: PatchColumns) -> Result<u64, String> {
+    let path = Path::new(octree_dir).join("patches.bin");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(0),
+    };
+    if bytes.len() < 8 {
+        return Ok(0);
+    }
+    if &bytes[0..4] != PATCHES_MAGIC {
+        return Err("patches.bin missing TROP magic".to_string());
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let rec_size = match version {
+        PATCHES_VERSION_V1 => PATCHES_REC_V1,
+        PATCHES_VERSION_V2 => PATCHES_REC_V2,
+        other => return Err(format!("unsupported patches version {other}")),
+    };
+    let body = &bytes[8..];
+    if body.len() % rec_size != 0 {
+        return Err(format!("patches body length {} is not a multiple of {rec_size}", body.len()));
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(PATCHES_MAGIC);
+    out.extend_from_slice(&PATCHES_VERSION_V2.to_le_bytes());
+    let mut cleared: u64 = 0;
+    for rec in body.chunks_exact(rec_size) {
+        let mut r = [0u8; PATCHES_REC_V2];
+        r[..rec_size].copy_from_slice(rec);
+        if rec_size == PATCHES_REC_V1 {
+            // No deadwood columns in a v1 record: "unchanged" for both.
+            r[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+            r[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        }
+        let tid = i32::from_le_bytes(r[12..16].try_into().unwrap());
+        if cols.tree_id && tid != -1 {
+            r[12..16].copy_from_slice(&(-1i32).to_le_bytes());
+            cleared += 1;
+        }
+        if cols.semantic && r[16] != 0 {
+            r[16] = 0;
+            cleared += 1;
+        }
+        if cols.standing_deadwood && i32::from_le_bytes(r[20..24].try_into().unwrap()) != -1 {
+            r[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+            cleared += 1;
+        }
+        if cols.laying_deadwood && i32::from_le_bytes(r[24..28].try_into().unwrap()) != -1 {
+            r[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+            cleared += 1;
+        }
+        let tid = i32::from_le_bytes(r[12..16].try_into().unwrap());
+        let sd = i32::from_le_bytes(r[20..24].try_into().unwrap());
+        let ld = i32::from_le_bytes(r[24..28].try_into().unwrap());
+        let no_change = tid == -1 && r[16] == 0 && r[17] == 0 && sd == -1 && ld == -1;
+        if !no_change {
+            out.extend_from_slice(&r);
+        }
+    }
+    if cleared == 0 && version == PATCHES_VERSION_V2 {
+        return Ok(0);
+    }
+    write_patches_inner(octree_dir, &out)?;
+    Ok(cleared)
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_patches_begin(octree_dir: String) -> Result<(), String> {
     write_patches_begin_inner(&octree_dir)
 }
 
+#[cfg(feature = "gui")]
 fn write_patches_chunk_inner(octree_dir: &str, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() % PATCHES_REC_V2 != 0 {
         return Err(format!(
@@ -2905,7 +3359,8 @@ fn write_patches_chunk_inner(octree_dir: &str, bytes: &[u8]) -> Result<(), Strin
 /// one-shot command — the body is a run of 32-byte records with no
 /// header; the front end only ever flushes on a record boundary, so a
 /// chunk never splits one.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_patches_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let octree_dir = request
         .headers()
@@ -2955,7 +3410,7 @@ fn write_patches_commit_inner(octree_dir: &str) -> Result<u64, String> {
 /// whole header + records, fsync it, atomically rename it over
 /// patches.bin, then fsync the parent directory. Returns the total byte
 /// count written (header + records).
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_patches_commit(octree_dir: String) -> Result<u64, String> {
     write_patches_commit_inner(&octree_dir)
 }
@@ -3101,7 +3556,7 @@ pub struct BakeResult {
 /// it, so there's nothing to gain here from the chunked begin/chunk/
 /// commit trio the front end uses to avoid ever materialising the full
 /// cumulative patch set at once.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_bake_patches(octree_dir: String) -> Result<BakeResult, String> {
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
@@ -3620,7 +4075,7 @@ mod bake_patches_tests {
 /// belt-and-braces sanity check on the path (must contain a
 /// `metadata.json` so a stray dir typo can't wipe arbitrary directories)
 /// before the recursive remove.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_remove_dataset(octree_dir: String) -> Result<(), String> {
     let dir = Path::new(&octree_dir);
     if !dir.is_dir() {
@@ -3668,7 +4123,7 @@ pub fn octree_remove_dataset(octree_dir: String) -> Result<(), String> {
 /// for every write a filesystem can make. Two different writes landing
 /// in the same mtime tick with the same length is the theoretical hole;
 /// mtime has nanosecond resolution on every platform this ships to.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_dataset_fingerprint(octree_dir: String) -> Result<String, String> {
     let dir = Path::new(&octree_dir);
     let mut parts: Vec<String> = Vec::with_capacity(5);
@@ -3797,7 +4252,7 @@ mod fingerprint_tests {
 
 /// Read treemap.json (tree-id merge overlay). Missing file ⇒ "{}" so the
 /// front end always gets valid JSON to parse.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_treemap(octree_dir: String) -> Result<String, String> {
     let path = Path::new(&octree_dir).join("treemap.json");
     match std::fs::read_to_string(&path) {
@@ -3809,7 +4264,7 @@ pub fn octree_read_treemap(octree_dir: String) -> Result<String, String> {
 /// Overwrite treemap.json with the front end's merge map. Validated as a
 /// flat object of stringified-int → int, written atomically via temp
 /// rename so a crash never leaves a half-written overlay.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_treemap(octree_dir: String, json: String) -> Result<(), String> {
     serde_json::from_str::<std::collections::BTreeMap<String, i64>>(&json)
         .map_err(|e| format!("invalid treemap json: {e}"))?;
@@ -3822,7 +4277,7 @@ pub fn octree_write_treemap(octree_dir: String, json: String) -> Result<(), Stri
 /// file ⇒ "{}" so the front end always gets valid JSON. Never touches
 /// the point data; it's pure review bookkeeping that lives next to the
 /// dataset so a forester's pass-through survives a session.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_review(octree_dir: String) -> Result<String, String> {
     let path = Path::new(&octree_dir).join("review.json");
     match std::fs::read_to_string(&path) {
@@ -3834,7 +4289,7 @@ pub fn octree_read_review(octree_dir: String) -> Result<String, String> {
 /// Overwrite review.json. Validated as a flat object of stringified-int
 /// → string (status), written atomically via temp rename so a crash
 /// never leaves a half-written overlay — same durability as the treemap.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_review(octree_dir: String, json: String) -> Result<(), String> {
     serde_json::from_str::<std::collections::BTreeMap<String, String>>(&json)
         .map_err(|e| format!("invalid review json: {e}"))?;
@@ -3849,7 +4304,7 @@ pub fn octree_write_review(octree_dir: String, json: String) -> Result<(), Strin
 /// touches the point data; it's pure bookkeeping that lives next to the
 /// dataset so a forester's species pass survives a session — same
 /// contract as review.json.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_species(octree_dir: String) -> Result<String, String> {
     let path = Path::new(&octree_dir).join("species.json");
     match std::fs::read_to_string(&path) {
@@ -3862,7 +4317,7 @@ pub fn octree_read_species(octree_dir: String) -> Result<String, String> {
 /// → string (species key), written atomically via temp rename so a
 /// crash never leaves a half-written overlay — same durability as
 /// review.json.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_species(octree_dir: String, json: String) -> Result<(), String> {
     serde_json::from_str::<std::collections::BTreeMap<String, String>>(&json)
         .map_err(|e| format!("invalid species json: {e}"))?;
@@ -3879,7 +4334,7 @@ pub fn octree_write_species(octree_dir: String, json: String) -> Result<(), Stri
 /// "{}" means "no boundary set" to the frontend's PlotBoundary union
 /// type. Never touches point data — pure bookkeeping, same contract as
 /// species.json.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_plot(octree_dir: String) -> Result<String, String> {
     let path = Path::new(&octree_dir).join("plot.json");
     match std::fs::read_to_string(&path) {
@@ -3893,7 +4348,7 @@ pub fn octree_read_plot(octree_dir: String) -> Result<String, String> {
 /// per-tree map, and the frontend owns the PlotBoundary schema (circular
 /// vs rectangular) — written atomically via temp rename so a crash never
 /// leaves a half-written file, same durability as species.json.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_write_plot(octree_dir: String, json: String) -> Result<(), String> {
     let parsed: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("invalid plot json: {e}"))?;
@@ -3972,13 +4427,13 @@ fn write_fixed_ascii(dst: &mut [u8], text: &str, pad: u8) {
 fn build_export_vlr(
     include_tree_id: bool,
     include_semantic: bool,
-    extra_f32_names: &[String],
+    extra_cols: &[(String, ExtraKind)],
     include_standing_deadwood: bool,
     include_laying_deadwood: bool,
 ) -> Vec<u8> {
     let n = (include_tree_id as usize)
         + (include_semantic as usize)
-        + extra_f32_names.len()
+        + extra_cols.len()
         + (include_standing_deadwood as usize)
         + (include_laying_deadwood as usize);
     if n == 0 { return Vec::new(); }
@@ -4003,11 +4458,13 @@ fn build_export_vlr(
             "PointCloudLabeler per-point semantic class: 0 unlabelled, 1 stem, 2 branch");
         base += 192;
     }
-    for name in extra_f32_names {
-        // data_type 9 = float32. Description echoes the column name so a
-        // reader without PointCloudLabeler context still gets a clue.
-        let desc = format!("PointCloudLabeler numeric extra '{name}' (f32)");
-        write_export_descriptor(&mut v, base, 9, name, &desc);
+    for (name, kind) in extra_cols {
+        // data_type 9 = float32, 10 = float64. Description echoes the
+        // column name so a reader without PointCloudLabeler context
+        // still gets a clue.
+        let (code, label) = match kind { ExtraKind::F32 => (9, "f32"), ExtraKind::F64 => (10, "f64") };
+        let desc = format!("PointCloudLabeler numeric extra '{name}' ({label})");
+        write_export_descriptor(&mut v, base, code, name, &desc);
         base += 192;
     }
     if include_standing_deadwood {
@@ -4131,8 +4588,8 @@ fn build_crs_vlr(epsg: u32, vertical_epsg: Option<u32>) -> Vec<u8> {
 /// Same bytes as `build_crs_vlr`, minus the 54-byte VLR header the las
 /// crate writes itself. Sharing the builder is the point: a scan whose
 /// source knew its coordinate system now carries it into the LAS, and
-/// `crs_from_las_vlrs` reads it straight back on import — so a RIEGL or
-/// E57 project's CRS reaches the octree without the user retyping it.
+/// `crs_from_las_vlrs` reads it straight back on import — so a scanner
+/// project's CRS reaches the octree without the user retyping it.
 pub fn crs_vlr_for_las_crate(epsg: u32) -> Option<las::Vlr> {
     let bytes = build_crs_vlr(epsg, None);
     if bytes.len() <= 54 {
@@ -5029,13 +5486,13 @@ fn median_ground_z(g: &DtmGrid, within: Option<[f64; 4]>) -> Option<(f64, u64)> 
     Some((zs[zs.len() / 2] as f64, zs.len() as u64))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_ground_reference(
     octree_dir: String,
     within: Option<[f64; 4]>,
     cell: Option<f64>,
 ) -> Result<GroundReference, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let dir = Path::new(&octree_dir);
         // The renderer's terrain grid, from its cache: the one pass over
         // octree.bin that builds it is shared with the height display.
@@ -5218,9 +5675,10 @@ fn dtm_grid_from_terrain_bytes(b: &[u8]) -> Result<(DtmGrid, f64), String> {
 /// MAX_TERRAIN_CELLS), as terrain_bytes, from the on-disk cache when it
 /// is fresh. Errors when the cloud has no ground classification — the
 /// renderer then says so and shows the stored heights.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_dtm_grid(octree_dir: String, cell: Option<f64>) -> Result<tauri::ipc::Response, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let dir = Path::new(&octree_dir);
         let cell = terrain_cell_for(dir, cell)?;
         Ok(tauri::ipc::Response::new(cached_terrain_bytes(dir, cell)?))
@@ -5397,43 +5855,43 @@ pub struct ExportReport {
 /// Options for an octree → LAS/LAZ export. All fields are optional on the
 /// wire (the frontend sends only what the export dialog changed) and fall
 /// back to the loss-less, everything-included defaults.
-#[derive(Clone)]
-struct ExportOpts {
+#[derive(Clone, Default)]
+pub struct ExportOpts {
     /// Write Z as height above ground (point Z − bilinear DTM) with a zero
     /// Z-offset. X/Y stay loss-less.
-    normalize: bool,
+    pub normalize: bool,
     /// DTM cell size (m) for the normalise pass.
-    cell: f64,
+    pub cell: f64,
     /// Emit the tree_id (instance id) extra-byte column.
-    include_tree_id: bool,
+    pub include_tree_id: bool,
     /// Emit the semantic_class extra-byte column.
-    include_semantic: bool,
+    pub include_semantic: bool,
     /// Emit the standing_deadwood id column (i32 Extra-Bytes, name
     /// "standing_deadwood"). Reads the patched value from the reserved
     /// f32 extras slot.
-    include_standing_deadwood: bool,
+    pub include_standing_deadwood: bool,
     /// Same for laying-deadwood ids ("laying_deadwood").
-    include_laying_deadwood: bool,
+    pub include_laying_deadwood: bool,
     /// Keep the ASPRS classification byte (false → write 0).
-    keep_classification: bool,
+    pub keep_classification: bool,
     /// Keep the intensity field (false → write 0).
-    keep_intensity: bool,
+    pub keep_intensity: bool,
     /// Output coordinate scale (m per integer step) for X/Y/Z. None keeps
     /// the octree's native quantisation (loss-less round-trip).
-    out_scale: Option<f64>,
+    pub out_scale: Option<f64>,
     /// Names of numeric (f32) extra columns to carry into the LAS/LAZ
     /// output as Extra-Bytes (data_type 9). Each must exist in the
     /// dataset's metadata.extras; unknown names error before any bytes
     /// are written. Empty = no extra f32 columns (back-compat default).
     /// The two deadwood channels are NEVER listed here — they have their
     /// own includes above and are emitted as i32 instead of f32.
-    extras_to_export: Vec<String>,
+    pub extras_to_export: Vec<String>,
     /// "Export what the filters show" — when set, a point additionally has
     /// to pass `subset_keeps` (the same predicate the Subset/extract
     /// command uses) to be written, on top of the existing deleted-point
     /// skip. None = every non-deleted point is exported — the behaviour
     /// before this option existed.
-    filter: Option<SubsetFilter>,
+    pub filter: Option<SubsetFilter>,
     /// Reproject every point into this CRS while streaming — "epsg:XXXX"
     /// or a raw proj4 string, same spec syntax `crs_transform` accepts.
     /// None (the default) exports exactly as before this option existed:
@@ -5441,7 +5899,7 @@ struct ExportOpts {
     /// a recorded source CRS (metadata.json's "crs" key) — see
     /// `source_crs_spec` — and is mutually exclusive with `normalize`
     /// — see `check_normalize_target_conflict`.
-    target_crs: Option<String>,
+    pub target_crs: Option<String>,
     /// Convert Z from ellipsoidal to orthometric height (H = h - N),
     /// applied LAST — after any `target_crs` reprojection — using this
     /// geoid grid file name (e.g. "egm96_15.gtx", resolved the same way
@@ -5453,7 +5911,13 @@ struct ExportOpts {
     /// exclusive with `normalize` — see `check_normalize_geoid_conflict`.
     /// See run_export_octree_las's "2.6 — geoid" section for why the
     /// ordering against `target_crs` is not arbitrary.
-    geoid: Option<String>,
+    pub geoid: Option<String>,
+    /// Write the standard fields the dataset carries as columns (GPS
+    /// time, scan angle, user data, point source id, colour, NIR, the
+    /// flags, the scanner channel) back into the LAS record, choosing
+    /// a point format with room for them. False writes zeros there and
+    /// the stock format, as before the columns existed.
+    pub standard_fields: bool,
     /// Write LAS 1.4 with point data record format 6 instead of LAS 1.2
     /// / format 0.
     ///
@@ -5469,7 +5933,12 @@ struct ExportOpts {
     /// existing workflow because one point carried an unusual class
     /// would be its own surprise. The dialog offers it and says what it
     /// costs.
-    las_14: bool,
+    pub las_14: bool,
+    /// A text export's layout (`.txt`, `.xyz`, `.csv`, …): the
+    /// delimiter, the header line, the coordinate decimals.
+    pub text: super::pointfile::TextOptions,
+    /// A `.ply` export as ascii rather than binary little-endian.
+    pub ply_ascii: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -5479,12 +5948,12 @@ struct ExportOpts {
 // the result is a first-class dataset that shows up in the project list.
 // ---------------------------------------------------------------------
 
-#[derive(serde::Deserialize, Clone)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SubsetExtraRange {
-    name: String,
-    min: f64,
-    max: f64,
+pub struct SubsetExtraRange {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
 }
 
 /// The predicate shared by the Subset/extract command (`octree_subset`)
@@ -5493,7 +5962,7 @@ struct SubsetExtraRange {
 /// sends only what it actually constrains) and an absent field never
 /// restricts the result.
 /// A plane and a thickness, in world coordinates.
-#[derive(serde::Deserialize, Clone, Copy)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaneSlab {
     pub anchor: [f64; 3],
@@ -5503,7 +5972,7 @@ pub struct PlaneSlab {
     pub half_height: f64,
 }
 
-#[derive(serde::Deserialize, Default, Clone)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SubsetFilter {
     /// Arbitrary-orientation cross-section: keep only points whose signed
@@ -5875,7 +6344,8 @@ mod subset_keeps_tests {
     }
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_subset(
     window: Window,
     src_dir: String,
@@ -5884,15 +6354,16 @@ pub async fn octree_subset(
     scanner_type: String,
     filter: SubsetFilter,
 ) -> Result<OctreeImportResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_subset(&window, &src_dir, &out_dir, &name, &scanner_type, &filter)
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_subset(&progress, &src_dir, &out_dir, &name, &scanner_type, &filter)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_subset(
-    window: &Window,
+pub fn run_subset(
+    progress: &Progress,
     src_dir: &str,
     out_dir: &str,
     name: &str,
@@ -5905,7 +6376,7 @@ fn run_subset(
     let dir = Path::new(src_dir);
     let out_path = PathBuf::from(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
-    emit_progress(window, "subset", 0.0);
+    emit_progress(progress, "subset", 0.0);
 
     // ---- Source metadata: quantisation, bbox, stride, extras, LOD params.
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
@@ -5921,16 +6392,13 @@ fn run_subset(
     let bbox = Aabb { min: bmin, max: bmax };
     let root_spacing = meta.get("rootSpacing").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1e-6);
     let max_depth = meta.get("maxDepth").and_then(|v| v.as_u64()).unwrap_or(14) as u32;
-    // Extra column names in record order (v3 datasets). Their f32 values
-    // sit at BASE_POINT_BYTES + 4*k. Used both for filtering by name and
-    // for re-stamping the new dataset's extras min/max.
-    let extra_names: Vec<String> = meta.get("extras")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-    let n_extras = extra_names.len();
-    if point_stride(n_extras) != point_bytes {
-        return Err(format!("metadata.pointBytes {point_bytes} disagrees with {n_extras} extras"));
+    // The extra columns in record order, each with its type and offset
+    // (see extra_layout). Used both for filtering by name and for
+    // re-stamping the new dataset's extras min/max.
+    let cols = extra_layout(&meta);
+    let n_extras = cols.len();
+    if layout_stride(&cols) != point_bytes {
+        return Err(format!("metadata.pointBytes {point_bytes} disagrees with the {n_extras} extras declared"));
     }
     // Validate every requested extra-range name exists in this dataset
     // BEFORE the per-point pass starts — `subset_keeps` resolves each name
@@ -5938,7 +6406,7 @@ fn run_subset(
     // surface as "silently never filters" instead of a clear error up front.
     if let Some(rs) = &filter.extra_ranges {
         for r in rs {
-            if !extra_names.iter().any(|n| n.eq_ignore_ascii_case(&r.name)) {
+            if layout_find(&cols, &r.name).is_none() {
                 return Err(format!("extra column '{}' not found in this dataset", r.name));
             }
         }
@@ -5946,10 +6414,8 @@ fn run_subset(
     // Byte offsets of the two deadwood id channels within a point, so the
     // manual deadwood labels (which live in patches.bin) get baked into the
     // subset's stored f32 — same as tree_id / semantic are applied below.
-    let standing_dw_off = extra_names.iter().position(|n| n.eq_ignore_ascii_case(STANDING_DEADWOOD_NAME))
-        .map(|k| BASE_POINT_BYTES + k * 4);
-    let laying_dw_off = extra_names.iter().position(|n| n.eq_ignore_ascii_case(LAYING_DEADWOOD_NAME))
-        .map(|k| BASE_POINT_BYTES + k * 4);
+    let standing_dw_off = extra_byte_offset(&meta, STANDING_DEADWOOD_NAME);
+    let laying_dw_off = extra_byte_offset(&meta, LAYING_DEADWOOD_NAME);
 
     // ---- Hierarchy + edit overlays.
     let hier = std::fs::read(dir.join("hierarchy.bin"))
@@ -5966,9 +6432,9 @@ fn run_subset(
         GRID_SIZE as f64 / (bbox.max[1] - bbox.min[1]).max(1e-9),
         GRID_SIZE as f64 / (bbox.max[2] - bbox.min[2]).max(1e-9),
     ];
-    let stride = point_stride(n_extras);
+    let stride = point_bytes;
     let mut chunks: Vec<Vec<u8>> = (0..GRID_CUBED).map(|_| Vec::new()).collect();
-    let mut extras_minmax: Vec<(f32, f32)> = vec![(f32::INFINITY, f32::NEG_INFINITY); n_extras];
+    let mut extras_minmax: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); n_extras];
     // Observed intensity range of the points this subset actually keeps —
     // a filter can carve out a narrower slice than the source's own range,
     // so it's tracked fresh here rather than copied from metadata.json
@@ -6044,10 +6510,7 @@ fn run_subset(
             // filtered export of the same view can never disagree (see
             // `subset_keeps`).
             let extra_at = |name: &str| -> Option<f64> {
-                extra_names.iter().position(|n| n.eq_ignore_ascii_case(name)).map(|k| {
-                    let eo = o + BASE_POINT_BYTES + k * 4;
-                    f32::from_le_bytes(block[eo..eo + 4].try_into().unwrap()) as f64
-                })
+                layout_find(&cols, name).map(|c| c.read(&block[o..o + point_bytes]))
             };
             let view = SubsetPointView {
                 x: wx, y: wy, z: wz,
@@ -6072,10 +6535,8 @@ fn run_subset(
                 if sd >= 0 { if let Some(off) = standing_dw_off { packed[off..off + 4].copy_from_slice(&(sd as f32).to_le_bytes()); } }
                 if ld >= 0 { if let Some(off) = laying_dw_off { packed[off..off + 4].copy_from_slice(&(ld as f32).to_le_bytes()); } }
             }
-            for (k, mm) in extras_minmax.iter_mut().enumerate() {
-                let eo = BASE_POINT_BYTES + k * 4;
-                let v = f32::from_le_bytes(packed[eo..eo + 4].try_into().unwrap());
-                if v.is_finite() { if v < mm.0 { mm.0 = v; } if v > mm.1 { mm.1 = v; } }
+            for (c, mm) in cols.iter().zip(extras_minmax.iter_mut()) {
+                minmax_fold(mm, c.read(&packed));
             }
             // Same survivors-only reasoning as extras_minmax above: this
             // point already passed the filter, so its intensity counts
@@ -6091,22 +6552,22 @@ fn run_subset(
         }
         if n_records > 0 && rec_idx % 256 == 0 {
             if crate::commands::cancel::stopped(&cancel) { let _ = std::fs::remove_dir_all(&out_path); return Err("Stopped — the partial dataset was removed.".to_string()); }
-            emit_progress(window, "subset", 0.5 * (rec_idx as f32 / n_records as f32));
+            emit_progress(progress, "subset", 0.5 * (rec_idx as f32 / n_records as f32));
         }
     }
-    emit_progress(window, "subset", 0.5);
+    emit_progress(progress, "subset", 0.5);
 
     if kept == 0 {
         return Err("no points pass the filter — widen the ranges".into());
     }
 
     // ---- Build the new octree (phase 2 + 3) from the binned survivors. ----
-    let extras_report: Vec<ExtraColumnReport> = extra_names
+    let extras_report: Vec<ExtraColumnReport> = cols
         .iter()
-        .zip(extras_minmax.into_iter())
-        .map(|(name, (lo, hi))| {
-            let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo { (lo, hi) } else { (0.0, 0.0) };
-            ExtraColumnReport { name: name.clone(), min: lo, max: hi }
+        .zip(extras_minmax)
+        .map(|(c, (lo, hi))| {
+            let (lo, hi) = minmax_report(lo, hi);
+            ExtraColumnReport { name: c.name.clone(), min: lo, max: hi, kind: c.kind }
         })
         .collect();
     // A degenerate spread (every surviving point the same intensity, or —
@@ -6120,8 +6581,8 @@ fn run_subset(
     };
 
     let outputs = phase23_build_write(
-        ChunkSource::Mem(chunks), bbox, scale, offset, root_spacing, max_depth, n_extras, &out_path,
-        &|stage, p| emit_progress(window, stage, p),
+        ChunkSource::Mem(chunks), bbox, scale, offset, root_spacing, max_depth, stride, &out_path,
+        &|stage, p| emit_progress(progress, stage, p),
     )?;
     let (tiles, _bytes) = outputs;
     let total_stored: u64 = tiles.iter().map(|t| t.point_count).sum();
@@ -6136,7 +6597,7 @@ fn run_subset(
         // over: cutting points out does not move the ones that remain.
         Some(&meta),
     ).map_err(|e| format!("write metadata: {e}"))?;
-    emit_progress(window, "subset", 1.0);
+    emit_progress(progress, "subset", 1.0);
 
     Ok(OctreeImportResult {
         out_dir: out_path.to_string_lossy().into_owned(),
@@ -6219,7 +6680,7 @@ fn stream_into_merge_chunks(
     intensity_minmax: &mut (u16, u16),
     source_tag: f32,
     new_stride: usize,
-    window: &Window,
+    progress: &Progress,
     stage: &str,
     pct_start: f32,
     pct_end: f32,
@@ -6321,14 +6782,15 @@ fn stream_into_merge_chunks(
         }
         if n_records > 0 && rec_idx % 256 == 0 {
             let frac = rec_idx as f32 / n_records as f32;
-            emit_progress(window, stage, pct_start + (pct_end - pct_start) * frac);
+            emit_progress(progress, stage, pct_start + (pct_end - pct_start) * frac);
         }
     }
-    emit_progress(window, stage, pct_end);
+    emit_progress(progress, stage, pct_end);
     Ok(kept)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_merge_clouds(
     window: Window,
@@ -6338,15 +6800,16 @@ pub async fn octree_merge_clouds(
     name: String,
     scanner_type: String,
 ) -> Result<OctreeImportResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_merge_clouds(&window, &src_a_dir, &src_b_dir, &out_dir, &name, &scanner_type)
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_merge_clouds(&progress, &src_a_dir, &src_b_dir, &out_dir, &name, &scanner_type)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_merge_clouds(
-    window: &Window,
+pub fn run_merge_clouds(
+    progress: &Progress,
     src_a_dir: &str,
     src_b_dir: &str,
     out_dir: &str,
@@ -6358,7 +6821,7 @@ fn run_merge_clouds(
     let dir_b = Path::new(src_b_dir);
     let out_path = PathBuf::from(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
-    emit_progress(window, "merge", 0.0);
+    emit_progress(progress, "merge", 0.0);
 
     // Combined bbox = union, picked along with sensible LOD params.
     let (meta_a, _sca, _oa, bbox_a, _pba, _nea) = open_octree_meta(dir_a)?;
@@ -6394,11 +6857,11 @@ fn run_merge_clouds(
 
     let kept_a = stream_into_merge_chunks(
         dir_a, scale, offset, cube, &mut chunks, &mut intensity_minmax,
-        0.0, new_stride, window, "merge", 0.02, 0.45,
+        0.0, new_stride, progress, "merge", 0.02, 0.45,
     )?;
     let kept_b = stream_into_merge_chunks(
         dir_b, scale, offset, cube, &mut chunks, &mut intensity_minmax,
-        1.0, new_stride, window, "merge", 0.45, 0.85,
+        1.0, new_stride, progress, "merge", 0.45, 0.85,
     )?;
     let kept = kept_a + kept_b;
     if kept == 0 {
@@ -6408,19 +6871,17 @@ fn run_merge_clouds(
     // Phase 2 + 3 build the merged octree exactly like a fresh import.
     let outputs = phase23_build_write(
         ChunkSource::Mem(chunks), cube, scale, offset, root_spacing, max_depth,
-        n_extras_new, &out_path,
-        &|stage, p| emit_progress(window, stage, p),
+        new_stride, &out_path,
+        &|stage, p| emit_progress(progress, stage, p),
     )?;
     let (tiles, _bytes) = outputs;
     let total_stored: u64 = tiles.iter().map(|t| t.point_count).sum();
 
-    let extras_report = vec![ExtraColumnReport {
-        name: "source".to_string(),
-        // 0 = primary, 1 = secondary. The exact min/max gets recomputed
-        // here so the Display panel's per-extra range stays meaningful.
-        min: if kept_a > 0 { 0.0 } else { 1.0 },
-        max: if kept_b > 0 { 1.0 } else { 0.0 },
-    }];
+    // 0 = primary, 1 = secondary. The exact min/max gets recomputed
+    // here so the Display panel's per-extra range stays meaningful.
+    let extras_report = vec![ExtraColumnReport::f32(
+        "source", if kept_a > 0 { 0.0 } else { 1.0 }, if kept_b > 0 { 1.0 } else { 0.0 },
+    )];
     // A degenerate spread (every written point the same intensity) can't
     // drive a colour ramp, so it's reported as unknown rather than a fake
     // flat range (see the same check in phase1_parallel_bin).
@@ -6448,7 +6909,7 @@ fn run_merge_clouds(
         // source supports.
         merged_georeferencing.as_ref(),
     ).map_err(|e| format!("write metadata: {e}"))?;
-    emit_progress(window, "merge", 1.0);
+    emit_progress(progress, "merge", 1.0);
 
     Ok(OctreeImportResult {
         out_dir: out_path.to_string_lossy().into_owned(),
@@ -6465,7 +6926,8 @@ fn run_merge_clouds(
     })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn cloud_export_octree_las(
     state: State<'_, AppState>,
@@ -6517,7 +6979,17 @@ pub async fn cloud_export_octree_las(
     // Write LAS 1.4 / point format 6 instead of LAS 1.2 / format 0. See
     // ExportOpts::las_14 for what that buys and why it is not automatic.
     las_14: Option<bool>,
+    // The standard fields the dataset carries as columns back into the
+    // record (default true) — see ExportOpts::standard_fields.
+    standard_fields: Option<bool>,
+    // A text export's layout: "space", "tab", "comma" or "semicolon",
+    // and whether the first line names the columns (default true).
+    delimiter: Option<String>,
+    header: Option<bool>,
+    // A PLY export as ascii rather than binary little-endian.
+    ply_ascii: Option<bool>,
 ) -> Result<ExportReport, String> {
+    let progress = Progress::window(window, "octree-progress");
     // The renderer names this file; it is only allowed to name one the
     // user chose in a save dialog, or one inside the open project. See
     // fsgrant.rs — every write out of this application goes through it.
@@ -6528,44 +7000,112 @@ pub async fn cloud_export_octree_las(
         .into_owned();
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
-    let _dataset_guard = lock_dataset(&octree_dir)?;
-    let normalize = normalize.unwrap_or(false);
-    // Fail fast, before spawning the blocking export thread: these checks
-    // need no file I/O at all, so there's no reason to wait for one.
-    check_normalize_target_conflict(normalize, &target_crs)?;
-    check_normalize_geoid_conflict(normalize, &geoid)?;
-    // Strip the two reserved deadwood names from the f32 extras list if
-    // the caller passed them — those channels have their own i32 includes.
-    let extras_to_export = extras_to_export.unwrap_or_default()
+    let req = ExportRequest {
+        normalize, cell_size, include_tree_id, include_semantic, include_standing_deadwood,
+        include_laying_deadwood, keep_classification, keep_intensity, decimals, extras_to_export,
+        filter, target_crs, geoid, las_14, standard_fields, delimiter, header, ply_ascii,
+    };
+    crate::rt::spawn_blocking(move || {
+        let emit = |pct: f32| emit_progress(&progress, "export", pct);
+        run_export_request(&emit, &octree_dir, &out_path, req)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+
+/// An export as the dialog and the catalogue request it: every option
+/// optional, the defaults being the loss-less, everything-in export the
+/// command made before any of them existed.
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    /// Write Z as height above ground (point Z minus the DTM) with a zero Z offset.
+    #[serde(default)]
+    pub normalize: Option<bool>,
+    /// DTM cell size for `normalize`, metres (default 0.5).
+    #[serde(default)]
+    pub cell_size: Option<f64>,
+    #[serde(default)]
+    pub include_tree_id: Option<bool>,
+    #[serde(default)]
+    pub include_semantic: Option<bool>,
+    #[serde(default)]
+    pub include_standing_deadwood: Option<bool>,
+    #[serde(default)]
+    pub include_laying_deadwood: Option<bool>,
+    #[serde(default)]
+    pub keep_classification: Option<bool>,
+    #[serde(default)]
+    pub keep_intensity: Option<bool>,
+    /// Decimal places for X/Y/Z. None keeps the dataset's own grid.
+    #[serde(default)]
+    pub decimals: Option<u32>,
+    /// Numeric extra columns (by name) to write as Extra Bytes.
+    #[serde(default)]
+    pub extras_to_export: Option<Vec<String>>,
+    /// Export only the points this filter keeps — the Subset filter's shape.
+    #[serde(default)]
+    pub filter: Option<SubsetFilter>,
+    /// Reproject into this CRS ("epsg:3067" or a proj string).
+    #[serde(default)]
+    pub target_crs: Option<String>,
+    /// Convert Z to orthometric height with this geoid grid file name.
+    #[serde(default)]
+    pub geoid: Option<String>,
+    /// LAS 1.4 / point format 6 instead of LAS 1.2 / format 0.
+    #[serde(default)]
+    pub las_14: Option<bool>,
+    /// The standard fields carried as columns (GPS time, colour, scan angle, …) back into the record (default true).
+    #[serde(default)]
+    pub standard_fields: Option<bool>,
+    /// A text export (`.txt`, `.xyz`, `.csv`, `.asc`, `.pts`): "space" (the default), "tab", "comma" or "semicolon".
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// A text export: whether the first line names the columns (default true).
+    #[serde(default)]
+    pub header: Option<bool>,
+    /// A `.ply` export as ascii rather than binary little-endian (default false).
+    #[serde(default)]
+    pub ply_ascii: Option<bool>,
+}
+
+/// Export a dataset to `out_path` (LAS, or LAZ by extension) as `req`
+/// asks — the export command minus the renderer's path authorisation,
+/// shared with the catalogue. Takes the dataset lock for the duration.
+pub fn run_export_request(progress: ProgressSink, octree_dir: &str, out_path: &str, req: ExportRequest) -> Result<ExportReport, String> {
+    let _dataset_guard = lock_dataset(octree_dir)?;
+    let normalize = req.normalize.unwrap_or(false);
+    check_normalize_target_conflict(normalize, &req.target_crs)?;
+    check_normalize_geoid_conflict(normalize, &req.geoid)?;
+    let extras_to_export = req.extras_to_export.unwrap_or_default()
         .into_iter()
         .filter(|n| !is_deadwood_name(n))
         .collect();
     let opts = ExportOpts {
         normalize,
-        cell: cell_size.unwrap_or(0.5),
-        include_tree_id: include_tree_id.unwrap_or(true),
-        include_semantic: include_semantic.unwrap_or(true),
-        include_standing_deadwood: include_standing_deadwood.unwrap_or(true),
-        include_laying_deadwood: include_laying_deadwood.unwrap_or(true),
-        keep_classification: keep_classification.unwrap_or(true),
-        keep_intensity: keep_intensity.unwrap_or(true),
-        out_scale: decimals.map(|d| 10f64.powi(-(d.min(9) as i32))),
+        cell: req.cell_size.unwrap_or(0.5),
+        include_tree_id: req.include_tree_id.unwrap_or(true),
+        include_semantic: req.include_semantic.unwrap_or(true),
+        include_standing_deadwood: req.include_standing_deadwood.unwrap_or(true),
+        include_laying_deadwood: req.include_laying_deadwood.unwrap_or(true),
+        keep_classification: req.keep_classification.unwrap_or(true),
+        keep_intensity: req.keep_intensity.unwrap_or(true),
+        out_scale: req.decimals.map(|d| 10f64.powi(-(d.min(9) as i32))),
         extras_to_export,
-        filter,
-        target_crs,
-        geoid,
-        las_14: las_14.unwrap_or(false),
+        filter: req.filter,
+        target_crs: req.target_crs,
+        geoid: req.geoid,
+        las_14: req.las_14.unwrap_or(false),
+        standard_fields: req.standard_fields.unwrap_or(true),
+        text: super::pointfile::TextOptions {
+            delimiter: super::pointfile::delimiter_from_name(req.delimiter.as_deref().unwrap_or("space")),
+            header: req.header.unwrap_or(true),
+            decimals: req.decimals.map(|d| d.min(9)),
+        },
+        ply_ascii: req.ply_ascii.unwrap_or(false),
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        // The export core takes a progress sink rather than a Window, so
-        // every byte it writes can be driven from a test — see
-        // export_pipeline_tests. This closure is the only place the two
-        // meet.
-        let emit = |pct: f32| emit_progress(&window, "export", pct);
-        run_export_octree(&emit, &octree_dir, &out_path, &opts)
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
+    run_export_octree(progress, octree_dir, out_path, &opts)
 }
 
 /// LAS / LAZ dispatch. LAS is written directly by the custom writer
@@ -6575,7 +7115,50 @@ pub async fn cloud_export_octree_las(
 /// LAZ writer (which uses the same `laz` decoder PointCloudLabeler imports through),
 /// and remove the temp. Doubles disk I/O but reuses the well-tested
 /// uncompressed writer rather than threading LAZ chunking into it.
-fn run_export_octree(progress: ProgressSink, octree_dir: &str, out_path: &str, opts: &ExportOpts) -> Result<ExportReport, String> {
+pub fn run_export_octree(progress: ProgressSink, octree_dir: &str, out_path: &str, opts: &ExportOpts) -> Result<ExportReport, String> {
+    // Text, PLY and E57 are transcoded from the LAS this export would
+    // have written — every option of it honoured — in a temporary file
+    // beside the destination. The LAS is 1.4 with the standard fields
+    // in the record, whatever the LAS options say: those formats have no
+    // point format to choose, and the time belongs in the time column.
+    if let Some(kind) = super::pointfile::PointFileKind::of_path(out_path) {
+        let out_pb = PathBuf::from(out_path);
+        let temp_las = match out_pb.parent() {
+            Some(dir) => dir.join(format!(".{}.las.tmp", out_pb.file_name().and_then(|s| s.to_str()).unwrap_or("octree"))),
+            None => PathBuf::from(format!("{out_path}.las.tmp")),
+        };
+        let temp_s = temp_las.to_string_lossy().into_owned();
+        let staged_opts = ExportOpts { las_14: true, standard_fields: true, ..opts.clone() };
+        let mut report = match run_export_octree_las(progress, octree_dir, &temp_s, &staged_opts) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_las);
+                return Err(e);
+            }
+        };
+        progress(0.9);
+        // Which standard fields the dataset carries as columns — the
+        // ones worth a column in the output; the exporter wrote zeros
+        // in the others.
+        let carried: Vec<String> = std::fs::read(Path::new(octree_dir).join("metadata.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .map(|m| extra_layout(&m).into_iter().map(|c| c.name).collect())
+            .unwrap_or_default();
+        let written = super::pointfile::write_from_las(progress, kind, &temp_s, out_path, &carried, &opts.text, opts.ply_ascii);
+        let _ = std::fs::remove_file(&temp_las);
+        match written {
+            Ok(n) => {
+                report.written = n;
+                progress(1.0);
+                return Ok(report);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(out_path);
+                return Err(e);
+            }
+        }
+    }
     let want_laz = Path::new(out_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -7012,22 +7595,30 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     // dataset's extras (declared order = on-disk record order). Each
     // entry's `byte_off_in_pt` is the f32's offset inside one octree
     // point's bytes; we read it directly per point in the loop below.
-    let src_extras: Vec<String> = meta.get("extras").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-    let mut extra_emit: Vec<(String, usize)> = Vec::with_capacity(opts.extras_to_export.len());
+    let cols = extra_layout(&meta);
+    let src_extras: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+    // The standard fields the dataset carries as columns go back into
+    // the record itself — GPS time where GPS time goes, the colour where
+    // the colour goes — never as Extra Bytes under the same name; the
+    // point format is chosen below so the record has room for them.
+    let std_cols: Vec<(StdField, ExtraCol)> = if opts.standard_fields {
+        cols.iter().filter_map(|c| StdField::by_name(&c.name).map(|sf| (sf, c.clone()))).collect()
+    } else { Vec::new() };
+    let has_gps = std_cols.iter().any(|(sf, _)| *sf == StdField::GpsTime);
+    let has_rgb = std_cols.iter().any(|(sf, _)| matches!(sf, StdField::Red | StdField::Green | StdField::Blue));
+    let has_nir = std_cols.iter().any(|(sf, _)| *sf == StdField::Nir);
+    let mut extra_emit: Vec<ExtraCol> = Vec::with_capacity(opts.extras_to_export.len());
     for want in &opts.extras_to_export {
         if is_deadwood_name(want) { continue; } // ride as i32 instead
-        let want_l = want.to_lowercase();
-        let k = src_extras.iter().position(|n| n.to_lowercase() == want_l)
+        if opts.standard_fields && StdField::by_name(want).is_some() { continue; } // in the record itself
+        let col = layout_find(&cols, want)
             .ok_or_else(|| format!("extra column '{want}' is not in this dataset"))?;
-        let off = BASE_POINT_BYTES + k * 4;
-        if off + 4 > point_bytes {
-            return Err(format!("extra column '{want}' (slot {k}) overflows pointBytes {point_bytes}"));
+        if col.end() > point_bytes {
+            return Err(format!("extra column '{want}' overflows pointBytes {point_bytes}"));
         }
         // Use the source's exact spelling in the VLR descriptor so a
         // round-trip import recognises the column.
-        extra_emit.push((src_extras[k].clone(), off));
+        extra_emit.push(col.clone());
     }
 
     // Same validate-up-front treatment for the optional view filter's
@@ -7052,9 +7643,7 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     // (writes 0) so an export from a legacy dataset still produces clean
     // zero-filled columns rather than failing.
     let resolve_dw_off = |name: &str| -> Option<usize> {
-        src_extras.iter().position(|n| n.eq_ignore_ascii_case(name))
-            .map(|k| BASE_POINT_BYTES + k * 4)
-            .filter(|&off| off + 4 <= point_bytes)
+        extra_byte_offset(&meta, name).filter(|&off| off + 4 <= point_bytes)
     };
     let standing_dw_src_off = resolve_dw_off(STANDING_DEADWOOD_NAME);
     let laying_dw_src_off = resolve_dw_off(LAYING_DEADWOOD_NAME);
@@ -7130,9 +7719,9 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     // the 64-bit point count, the 15-entry return histogram and the EVLR
     // fields the newer version adds.
     let header_bytes: usize = if opts.las_14 { 375 } else { 227 };
-    let extra_f32_names: Vec<String> = extra_emit.iter().map(|(n, _)| n.clone()).collect();
+    let extra_cols_out: Vec<(String, ExtraKind)> = extra_emit.iter().map(|c| (c.name.clone(), c.kind)).collect();
     let vlr = build_export_vlr(
-        opts.include_tree_id, opts.include_semantic, &extra_f32_names,
+        opts.include_tree_id, opts.include_semantic, &extra_cols_out,
         emit_standing_dw, emit_laying_dw,
     );
     // CRS VLR — tells a reader what the coordinates below actually mean.
@@ -7162,14 +7751,25 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     //   extras is a stock LAS point-format-0 record.
     let extra_len_bytes = (if opts.include_tree_id { 4 } else { 0 })
         + (if opts.include_semantic { 1 } else { 0 })
-        + 4 * extra_emit.len()
+        + extra_emit.iter().map(|c| c.kind.width()).sum::<usize>()
         + (if emit_standing_dw { 4 } else { 0 })
         + (if emit_laying_dw { 4 } else { 0 });
-    // Base record: 20 bytes for format 0, 30 for format 6 (classification
-    // gets its own byte, the return field widens, and GPS time is part
-    // of the record rather than optional).
-    let base_record: usize = if opts.las_14 { 30 } else { 20 };
+    // The point format: the smallest that has room for what the
+    // dataset carries. LAS 1.2: 0, 1 with GPS time, 2 with colour, 3
+    // with both. LAS 1.4: 6 (GPS time is part of the record), 7 with
+    // colour, 8 with colour and near-infrared. A dataset with none of
+    // them writes the stock record exactly as before.
+    let out_format: u8 = if opts.las_14 {
+        if has_nir { 8 } else if has_rgb { 7 } else { 6 }
+    } else {
+        (if has_gps { 1 } else { 0 }) + (if has_rgb { 2 } else { 0 })
+    };
+    let base_record: usize = las_standard_record_length(out_format);
     let record_len: u16 = (base_record + extra_len_bytes) as u16;
+    // The global encoding: bit 0 says the GPS time is adjusted standard
+    // time rather than seconds of the week — what the source said, when
+    // the column was imported with it.
+    let gps_standard = meta.get("gpsTimeType").and_then(|v| v.as_str()) == Some("standard");
     // Output quantisation. Two entirely different regimes:
     //   - target_crs set: scale/offset are DERIVED from the transformed
     //     extent (transformed_extent + scale_offset_for_extent) — the
@@ -7230,7 +7830,8 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     header[94..96].copy_from_slice(&(header_bytes as u16).to_le_bytes()); // header size
     header[96..100].copy_from_slice(&offset_to_points.to_le_bytes());     // offset to points
     header[100..104].copy_from_slice(&num_vlrs.to_le_bytes());            // number of VLRs
-    header[104] = if opts.las_14 { 6 } else { 0 };                        // point data record format
+    header[104] = out_format;                                             // point data record format
+    if has_gps && gps_standard { header[6] |= 1; }                        // global encoding: GPS time type
     header[105..107].copy_from_slice(&record_len.to_le_bytes());          // record length
     // 107-110 point count — placeholder 0.
     header[131..139].copy_from_slice(&out_scale[0].to_le_bytes());
@@ -7452,14 +8053,22 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
             let psid = if opts.include_tree_id { tree_id.clamp(0, 65535) as u16 } else { 0 };
             if opts.las_14 {
                 rec_out[20..22].copy_from_slice(&psid.to_le_bytes());
-                // GPS time. The octree carries no per-point timestamp —
-                // the field is part of the format 6 record, so it is
-                // written as zero rather than invented. The export dialog
-                // says so; a field silently holding 0.0 while looking
-                // meaningful is the failure this notes to avoid.
+                // GPS time: the column's value when the dataset carries
+                // one (written below with the other standard fields),
+                // zero otherwise — the field is part of the format 6
+                // record, so it is written as zero rather than invented.
                 rec_out[22..30].copy_from_slice(&0f64.to_le_bytes());
             } else {
                 rec_out[18..20].copy_from_slice(&psid.to_le_bytes());
+            }
+            // The standard fields the dataset carries as columns, back
+            // where the record keeps them: GPS time, scan angle, user
+            // data, the scan-position id (over the legacy tree-id copy),
+            // the colour and near-infrared, the flags and the channel.
+            // Zeroed above, so a flag OR-ed in here is the column's.
+            for (sf, col) in &std_cols {
+                let v = col.read(&block[o..o + point_bytes]);
+                sf.write(&mut rec_out[..base_record], out_format, v);
             }
             // Extra Bytes in record order: tree_id (i32),
             // semantic_class (u8), then one f32 per requested numeric extra
@@ -7478,10 +8087,11 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
                 rec_out[eo] = sem_out;
                 eo += 1;
             }
-            for (_name, src_off) in &extra_emit {
-                let pt_o = p * point_bytes + *src_off;
-                rec_out[eo..eo + 4].copy_from_slice(&block[pt_o..pt_o + 4]);
-                eo += 4;
+            for col in &extra_emit {
+                let pt_o = p * point_bytes + col.offset;
+                let w = col.kind.width();
+                rec_out[eo..eo + w].copy_from_slice(&block[pt_o..pt_o + w]);
+                eo += w;
             }
             // Deadwood channels at the tail — written as i32 in the LAS
             // file. standing_id / laying_id (computed above, patch-applied)
@@ -8806,12 +9416,14 @@ pub struct TreeSummaryEntry {
     pub records: Vec<u32>,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_tree_summary(
     window: Window,
     octree_dir: String,
 ) -> Result<Vec<TreeSummaryEntry>, String> {
-    tauri::async_runtime::spawn_blocking(move || run_tree_summary(&window, &octree_dir))
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || run_tree_summary(&progress, &octree_dir))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
@@ -8821,10 +9433,10 @@ pub async fn octree_tree_summary(
 /// O(points): the caller treats this as an explicit "scan trees" action,
 /// not something to run every frame. The caller should flush its
 /// in-memory patches first so the tally reflects unsaved edits.
-fn run_tree_summary(window: &Window, octree_dir: &str) -> Result<Vec<TreeSummaryEntry>, String> {
+pub fn run_tree_summary(progress: &Progress, octree_dir: &str) -> Result<Vec<TreeSummaryEntry>, String> {
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "tree_summary", 0.0);
+    emit_progress(progress, "tree_summary", 0.0);
 
     // Quantisation + on-disk stride, same as the exporter reads them.
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
@@ -8922,7 +9534,7 @@ fn run_tree_summary(window: &Window, octree_dir: &str) -> Result<Vec<TreeSummary
             e.4[2] += wz * wz;
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, "tree_summary", rec_idx as f32 / n_records as f32);
+            emit_progress(progress, "tree_summary", rec_idx as f32 / n_records as f32);
         }
     }
 
@@ -8950,7 +9562,7 @@ fn run_tree_summary(window: &Window, octree_dir: &str) -> Result<Vec<TreeSummary
         })
         .collect();
     out.sort_by(|a, b| a.tree_id.cmp(&b.tree_id));
-    emit_progress(window, "tree_summary", 1.0);
+    emit_progress(progress, "tree_summary", 1.0);
     Ok(out)
 }
 
@@ -8962,9 +9574,11 @@ fn run_tree_summary(window: &Window, octree_dir: &str) -> Result<Vec<TreeSummary
 /// range" button is the only caller — never triggered automatically on
 /// open or on a colour-mode switch, since this is an O(points) pass over
 /// the whole file.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_intensity_range(window: Window, octree_dir: String) -> Result<[u32; 2], String> {
-    tauri::async_runtime::spawn_blocking(move || run_intensity_range(&window, &octree_dir))
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || run_intensity_range(&progress, &octree_dir))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
@@ -8978,10 +9592,10 @@ pub async fn octree_intensity_range(window: Window, octree_dir: String) -> Resul
 /// skipping it would buy nothing but a range that silently shifts every
 /// time the user edits. The ramp describes what's honestly stored in
 /// octree.bin, patches or not.
-fn run_intensity_range(window: &Window, octree_dir: &str) -> Result<[u32; 2], String> {
+pub fn run_intensity_range(progress: &Progress, octree_dir: &str) -> Result<[u32; 2], String> {
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "intensity_range", 0.0);
+    emit_progress(progress, "intensity_range", 0.0);
 
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
@@ -9029,7 +9643,7 @@ fn run_intensity_range(window: &Window, octree_dir: &str) -> Result<[u32; 2], St
             if iv > hi { hi = iv; }
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, "intensity_range", rec_idx as f32 / n_records as f32);
+            emit_progress(progress, "intensity_range", rec_idx as f32 / n_records as f32);
         }
     }
 
@@ -9043,7 +9657,7 @@ fn run_intensity_range(window: &Window, octree_dir: &str) -> Result<[u32; 2], St
     // to hand back, not a guess.
     let range: [u32; 2] = if lo <= hi { [lo, hi] } else { [0, 0] };
     update_metadata_intensity_range(dir, range)?;
-    emit_progress(window, "intensity_range", 1.0);
+    emit_progress(progress, "intensity_range", 1.0);
     Ok(range)
 }
 
@@ -9079,7 +9693,7 @@ fn update_metadata_intensity_range(octree_dir: &Path, range: [u32; 2]) -> Result
 /// coordinates is crs_transform's job (commands/crs.rs), which this
 /// command only ever feeds the recorded "from" CRS into, on request,
 /// never automatically.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_set_crs(octree_dir: String, crs_json: String) -> Result<(), String> {
     let crs_value: serde_json::Value = serde_json::from_str(&crs_json)
         .map_err(|e| format!("invalid crs json: {e}"))?;
@@ -9214,7 +9828,7 @@ pub fn check_geoid_applicable(meta: &serde_json::Value) -> Result<(), String> {
 /// bookkeeping-only guarantee: it records what the dataset's Z values
 /// ALREADY are, in the caller's judgement, and never moves a point.
 /// Converting heights is the exporter's job, and only on request.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_set_vertical_crs(octree_dir: String, vertical_json: String) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_str(&vertical_json)
         .map_err(|e| format!("invalid vertical json: {e}"))?;
@@ -9648,7 +10262,8 @@ fn csf_relax(surface: &mut [f32], cols: usize, rows: usize, cell: f64, rigidity:
     }
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_classify_ground(
     window: Window,
@@ -9667,14 +10282,15 @@ pub async fn octree_classify_ground(
     // Ignored by PMF.
     rigidity: Option<f64>,
 ) -> Result<u64, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
     let method = method.unwrap_or_else(|| "pmf".to_string());
     let rigidity = rigidity.unwrap_or(2.0);
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_classify_ground(
-            &|p| emit_progress(&window, "classify_ground", p),
+            &|p| emit_progress(&progress, "classify_ground", p),
             &octree_dir, cell_size, tolerance, slope,
             initial_threshold, max_threshold, max_window_m, &method, rigidity,
         )
@@ -9689,7 +10305,7 @@ pub async fn octree_classify_ground(
 /// from a test. Every height in PointCloudLabeler is measured from what this
 /// function decides is the ground.
 #[allow(clippy::too_many_arguments)]
-fn run_classify_ground(
+pub fn run_classify_ground(
     progress: ProgressSink, octree_dir: &str,
     cell_size: f64, tolerance: f64, slope: f64,
     initial_threshold: f64, max_threshold: f64, max_window_m: f64,
@@ -9907,18 +10523,20 @@ fn run_classify_ground(
 /// the number of points changed. Like the classifier, this only rewrites
 /// the single classification byte per point — positions / tree ids are
 /// untouched.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_reset_classification(
     window: Window,
     octree_dir: String,
     from_class: i32,
     to_class: u8,
 ) -> Result<u64, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_reset_classification(&window, &octree_dir, from_class, to_class)
+    crate::rt::spawn_blocking(move || {
+        run_reset_classification(&progress, &octree_dir, from_class, to_class)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -9934,17 +10552,19 @@ pub async fn octree_reset_classification(
 /// the targeted bytes. The caller (frontend) clears the matching column
 /// from the in-memory patch overlay so overrides don't re-impose the old
 /// values on reload. Returns the number of points changed.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_reset_attribute(
     window: Window,
     octree_dir: String,
     attr: String,
 ) -> Result<u64, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_reset_attribute(&window, &octree_dir, &attr)
+    crate::rt::spawn_blocking(move || {
+        run_reset_attribute(&progress, &octree_dir, &attr)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -9953,15 +10573,18 @@ pub async fn octree_reset_attribute(
 /// Where in each octree point's bytes the named extra-column's f32 lives.
 /// Returns None when the dataset doesn't carry the column (legacy v3 file).
 fn extra_byte_offset(meta: &serde_json::Value, name: &str) -> Option<usize> {
-    let extras = meta.get("extras")?.as_array()?;
-    let k = extras.iter().position(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.eq_ignore_ascii_case(name)).unwrap_or(false))?;
-    Some(BASE_POINT_BYTES + k * 4)
+    let cols = extra_layout(meta);
+    let c = layout_find(&cols, name)?;
+    // The callers write an f32 into the slot; an f64 column of that name
+    // is not theirs to overwrite.
+    if c.kind != ExtraKind::F32 { return None; }
+    Some(c.offset)
 }
 
-fn run_reset_attribute(window: &Window, octree_dir: &str, attr: &str) -> Result<u64, String> {
+pub fn run_reset_attribute(progress: &Progress, octree_dir: &str, attr: &str) -> Result<u64, String> {
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "reset_attr", 0.0);
+    emit_progress(progress, "reset_attr", 0.0);
 
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
@@ -9977,7 +10600,7 @@ fn run_reset_attribute(window: &Window, octree_dir: &str, attr: &str) -> Result<
         Target::Tree
     } else if attr.eq_ignore_ascii_case("semantic") {
         if point_bytes < 21 {
-            emit_progress(window, "reset_attr", 1.0);
+            emit_progress(progress, "reset_attr", 1.0);
             return Ok(0);
         }
         Target::Sem
@@ -9988,7 +10611,7 @@ fn run_reset_attribute(window: &Window, octree_dir: &str, attr: &str) -> Result<
                 // Legacy dataset doesn't carry the deadwood channel —
                 // nothing to reset on disk; the patches overlay clear in
                 // JS still runs unconditionally.
-                emit_progress(window, "reset_attr", 1.0);
+                emit_progress(progress, "reset_attr", 1.0);
                 return Ok(0);
             }
         }
@@ -10055,20 +10678,20 @@ fn run_reset_attribute(window: &Window, octree_dir: &str, attr: &str) -> Result<
             file.write_all(&block).map_err(|e| format!("write octree.bin block: {e}"))?;
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, "reset_attr", rec_idx as f32 / n_records as f32);
+            emit_progress(progress, "reset_attr", rec_idx as f32 / n_records as f32);
         }
     }
     file.flush().map_err(|e| format!("flush octree.bin: {e}"))?;
-    emit_progress(window, "reset_attr", 1.0);
+    emit_progress(progress, "reset_attr", 1.0);
     Ok(changed)
 }
 
-fn run_reset_classification(
-    window: &Window, octree_dir: &str, from_class: i32, to_class: u8,
+pub fn run_reset_classification(
+    progress: &Progress, octree_dir: &str, from_class: i32, to_class: u8,
 ) -> Result<u64, String> {
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "reset_class", 0.0);
+    emit_progress(progress, "reset_class", 0.0);
 
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
@@ -10116,11 +10739,11 @@ fn run_reset_classification(
             file.write_all(&block).map_err(|e| format!("write octree.bin block: {e}"))?;
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, "reset_class", rec_idx as f32 / n_records as f32);
+            emit_progress(progress, "reset_class", rec_idx as f32 / n_records as f32);
         }
     }
     file.flush().map_err(|e| format!("flush octree.bin: {e}"))?;
-    emit_progress(window, "reset_class", 1.0);
+    emit_progress(progress, "reset_class", 1.0);
     Ok(changed)
 }
 
@@ -10249,14 +10872,17 @@ fn update_metadata_extras(
         attrs.retain(|a| a.get("name").and_then(|n| n.as_str()).map(|s| s.to_lowercase()) != Some(lc.clone()));
     }
     if let Some((name, lo, hi)) = add {
-        extras.push(serde_json::json!({ "name": name, "min": lo, "max": hi }));
+        extras.push(serde_json::json!({ "name": name, "min": lo, "max": hi, "type": "float32" }));
         attrs.push(serde_json::json!({ "name": name, "type": "float32", "byteSize": 4 }));
     }
 
     let n_extras = extras.len();
+    // The stride is the sum of the columns' widths — an f64 column among
+    // them is 8, not 4.
+    let point_bytes = layout_stride(&extra_layout(&serde_json::json!({ "extras": extras })));
     obj.insert("extras".into(), serde_json::Value::Array(extras));
     obj.insert("attributes".into(), serde_json::Value::Array(attrs));
-    obj.insert("pointBytes".into(), serde_json::json!(point_stride(n_extras)));
+    obj.insert("pointBytes".into(), serde_json::json!(point_bytes));
     // Ensure the format version is at least 3 once extras are present.
     if n_extras > 0 {
         obj.insert("formatVersion".into(), serde_json::json!(FORMAT_VERSION));
@@ -10277,22 +10903,24 @@ fn update_metadata_extras(
 /// this is how they opt back in without re-importing). Idempotent: no-op
 /// if both columns are already present; errors if only one is, because
 /// that would mean a corrupted dataset.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_add_deadwood_columns(
     window: Window,
     octree_dir: String,
 ) -> Result<u64, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || run_add_deadwood_columns(&window, &octree_dir))
+    crate::rt::spawn_blocking(move || run_add_deadwood_columns(&progress, &octree_dir))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_add_deadwood_columns(window: &Window, octree_dir: &str) -> Result<u64, String> {
+pub fn run_add_deadwood_columns(progress: &Progress, octree_dir: &str) -> Result<u64, String> {
     let dir = Path::new(octree_dir);
-    emit_progress(window, "add_deadwood", 0.0);
+    emit_progress(progress, "add_deadwood", 0.0);
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
     let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
@@ -10304,7 +10932,7 @@ fn run_add_deadwood_columns(window: &Window, octree_dir: &str) -> Result<u64, St
     let has_standing = extras.iter().any(|n| n.eq_ignore_ascii_case(STANDING_DEADWOOD_NAME));
     let has_laying = extras.iter().any(|n| n.eq_ignore_ascii_case(LAYING_DEADWOOD_NAME));
     if has_standing && has_laying {
-        emit_progress(window, "add_deadwood", 1.0);
+        emit_progress(progress, "add_deadwood", 1.0);
         return Ok(0);
     }
     if has_standing != has_laying {
@@ -10318,7 +10946,7 @@ fn run_add_deadwood_columns(window: &Window, octree_dir: &str) -> Result<u64, St
     // new bytes so every existing point starts unlabelled.
     let new_stride = old_stride + 8;
     let zero8 = [0u8; 8];
-    rewrite_octree_with_stride(&|p| emit_progress(window, "add_deadwood", p), dir, old_stride, new_stride, |pt, out| {
+    rewrite_octree_with_stride(&|p| emit_progress(progress, "add_deadwood", p), dir, old_stride, new_stride, |pt, out| {
         out.extend_from_slice(pt);
         out.extend_from_slice(&zero8);
     })?;
@@ -10326,7 +10954,7 @@ fn run_add_deadwood_columns(window: &Window, octree_dir: &str) -> Result<u64, St
     // helper stays simple (single-add today).
     update_metadata_extras(dir, Some((STANDING_DEADWOOD_NAME, 0.0, 0.0)), None)?;
     update_metadata_extras(dir, Some((LAYING_DEADWOOD_NAME, 0.0, 0.0)), None)?;
-    emit_progress(window, "add_deadwood", 1.0);
+    emit_progress(progress, "add_deadwood", 1.0);
     Ok(1)
 }
 
@@ -10346,20 +10974,22 @@ pub struct NormalizeResult {
 /// Add a `height_above_ground` extra column computed from the class-2 DTM
 /// (hag = Z − bilinear ground). Z geometry is untouched. Errors if the
 /// column already exists — the caller must remove it first.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_normalize(
     window: Window,
     octree_dir: String,
     cell_size: f64,
 ) -> Result<NormalizeResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         normalize_core(
             Path::new(&octree_dir),
             cell_size,
-            &|p| emit_progress(&window, "normalize", p),
+            &|p| emit_progress(&progress, "normalize", p),
         )
     })
         .await
@@ -10369,7 +10999,7 @@ pub async fn octree_normalize(
 /// The normalise core, taking a progress sink rather than a Window so
 /// every byte it writes can be driven from a test — the same shape, and
 /// for the same reason, as the export core.
-fn normalize_core(dir: &Path, cell_size: f64, progress: ProgressSink) -> Result<NormalizeResult, String> {
+pub fn normalize_core(dir: &Path, cell_size: f64, progress: ProgressSink) -> Result<NormalizeResult, String> {
     progress(0.0);
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
@@ -10443,6 +11073,23 @@ const POINT_QUALITY_NAME: &str = "point_quality";
 const SCAN_COLUMN_CANDIDATES: [&str; 4] =
     ["point_source_id", "pointcloud_id", "scan_id", "pointsourceid"];
 
+/// Column names that have held a per-point reflectance in files seen
+/// so far (a scanner's dB reflectance and the spellings exporters give
+/// it). Only reflectance: an amplitude or an intensity column is a
+/// different quantity — the raw return strength, not corrected for
+/// range — and the band is a reflectance band. Probed in order when
+/// the caller names none, and the summary reports which one was used
+/// — so a dataset that carries a reflectance column is tested against
+/// it without the name having to be typed, and a dataset without one
+/// is tested against intensity and says so.
+const REFL_COLUMN_CANDIDATES: [&str; 5] = [
+    "reflectance",
+    "reflectance_db",
+    "refl",
+    "reflectivity",
+    "scalar_reflectance",
+];
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeQcRow {
@@ -10489,20 +11136,29 @@ pub struct PointQcSummary {
     /// Which column fed the wind stage, or why it did not run.
     pub scan_source: Option<String>,
     pub wind_note: Option<String>,
+    /// What the run evaluated: the segmented trees, or — when the
+    /// dataset has no tree ids at all — the whole cloud as one tree.
+    pub scope: String,
+    /// Where the height above ground came from: the class-2 DTM, or
+    /// each tree's lowest point when the dataset has no ground
+    /// classification to measure from.
+    pub height_note: Option<String>,
     pub column_written: Option<String>,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_point_qc(
     window: Window,
     octree_dir: String,
     params: crate::commands::pointqc::PointQcParams,
 ) -> Result<PointQcSummary, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive: this reads every point and may rewrite the file.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_point_qc(
-            &|p| emit_progress(&window, "pointqc", p),
+            &|p| emit_progress(&progress, "pointqc", p),
             Path::new(&octree_dir),
             &params,
         )
@@ -10518,7 +11174,7 @@ pub async fn octree_point_qc(
 /// and a tree's points are scattered across octree blocks. That is
 /// about 40 bytes per segmented point — fine for a plot, and the
 /// `treeIds` parameter is how a very large dataset is done in parts.
-fn run_point_qc(
+pub fn run_point_qc(
     progress: ProgressSink,
     dir: &Path,
     params: &crate::commands::pointqc::PointQcParams,
@@ -10548,29 +11204,24 @@ fn run_point_qc(
     let scale = json_f64_3(&meta, "scale")?;
     let offset = json_f64_3(&meta, "offset")?;
     let point_bytes = point_bytes_of(&meta)?;
-    let extras: Vec<String> = meta
-        .get("extras")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let cols = extra_layout(&meta);
+    let extras: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+    // The offset of an f32 column — what the in-place write of
+    // point_quality expects.
     let extra_offset = |name: &str| -> Option<usize> {
-        extras
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(name))
-            .map(|k| BASE_POINT_BYTES + 4 * k)
+        layout_find(&cols, name).filter(|c| c.kind == ExtraKind::F32).map(|c| c.offset)
     };
+    // A column of either width, read through the layout.
+    let column = |name: &str| -> Option<ExtraCol> { layout_find(&cols, name).cloned() };
 
-    // Reflectance source: a named column, or the base record's u16
-    // intensity. Reported either way — a dB band applied to 0…65535
-    // keeps every point, and that must be visible.
+    // Reflectance source: a named column, else a column by one of the
+    // usual names, else the base record's u16 intensity. Reported
+    // either way — a dB band applied to 0…65535 keeps every point,
+    // and that must be visible.
     let refl_name = params.refl_column.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let (refl_off, reflectance_source) = match refl_name {
-        Some(name) => match extra_offset(name) {
-            Some(off) => (Some(off), format!("column '{name}'")),
+    let (refl_col, reflectance_source) = match refl_name {
+        Some(name) => match column(name) {
+            Some(c) => (Some(c.clone()), format!("column '{}'", c.name)),
             None => {
                 return Err(format!(
                     "reflectance column '{name}' is not in this dataset (extras: {})",
@@ -10578,12 +11229,16 @@ fn run_point_qc(
                 ))
             }
         },
-        None => (None, "intensity (u16, 0…65535)".to_string()),
+        None => match REFL_COLUMN_CANDIDATES.iter().find_map(|c| column(c)) {
+            Some(c) => (Some(c.clone()), format!("column '{}' (auto-detected)", c.name)),
+            None => (None, "intensity (u16, 0…65535)".to_string()),
+        },
     };
+    let refl_col = refl_col.as_ref();
     // The MATLAB's band is in dB and this dataset's may not be. A
     // negative bound against a u16 column keeps only the very darkest
     // returns, which looks exactly like a filter that works.
-    let reflectance_note = if refl_off.is_none() && params.refl_min < 0.0 {
+    let reflectance_note = if refl_col.is_none() && params.refl_min < 0.0 {
         Some(format!(
             "The band {} … {} looks like dB, but this dataset has no reflectance column and the \
              test ran on u16 intensity (0…65535). Almost everything falls outside such a band. \
@@ -10596,13 +11251,13 @@ fn run_point_qc(
 
     // Scan source: named, else probed, else the wind stage stands down.
     let scan_name = params.scan_column.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let (scan_off, scan_source, wind_note) = match scan_name {
-        Some(name) => match extra_offset(name) {
-            Some(off) => (Some(off), Some(format!("column '{name}'")), None),
+    let (scan_col, scan_source, wind_note) = match scan_name {
+        Some(name) => match column(name) {
+            Some(c) => (Some(c.clone()), Some(format!("column '{}'", c.name)), None),
             None => return Err(format!("scan-id column '{name}' is not in this dataset")),
         },
-        None => match SCAN_COLUMN_CANDIDATES.iter().find_map(|c| extra_offset(c).map(|o| (o, *c))) {
-            Some((off, found)) => (Some(off), Some(format!("column '{found}' (auto-detected)")), None),
+        None => match SCAN_COLUMN_CANDIDATES.iter().find_map(|c| column(c)) {
+            Some(c) => (Some(c.clone()), Some(format!("column '{}' (auto-detected)", c.name)), None),
             None => (
                 None,
                 None,
@@ -10633,16 +11288,40 @@ fn run_point_qc(
     };
 
     // Height above ground, from the class-2 DTM — the same surface
-    // every other per-tree tool here measures against.
-    let dtm = build_dtm_grid(dir, params.dtm_cell)?;
+    // every other per-tree tool here measures against. A cloud with
+    // no ground classification (a single-tree scan, a crown cut out
+    // of a plot) is still worth filtering: then each tree is measured
+    // from its own lowest point, as the MATLAB does, and the summary
+    // says so.
+    let (dtm, height_note) = match build_dtm_grid(dir, params.dtm_cell) {
+        Ok(g) => (Some(g), None),
+        Err(e) if e.starts_with("no ground points found") => (
+            None,
+            Some(
+                "No class-2 ground points: heights were measured from each tree's lowest \
+                 point instead of a DTM. Run the ground classification first for the \
+                 height-adaptive radii to follow the real ground."
+                    .to_string(),
+            ),
+        ),
+        Err(e) => return Err(e),
+    };
     progress(0.15);
 
     // Pass 1: collect per-tree points, and remember each one's slot in
     // the label vector so the write pass can find it again. Both passes
     // walk records in hierarchy order and points within a block, so a
     // flat counter lines them up exactly.
+    //
+    // A dataset with no tree ids at all — one scanned tree, a cloud
+    // that was never segmented — is taken as one tree: its unsegmented
+    // points are gathered under id 0 until the first segmented point
+    // shows that the dataset is segmented after all, at which moment
+    // they are dropped and only the trees count. So the gathering
+    // costs memory only up to that first tree point.
     let mut labels: Vec<u8> = Vec::new();
     let mut per_tree: FxHashMap<i32, (Vec<QcPoint>, Vec<u32>)> = FxHashMap::default();
+    let mut segmented = !params.tree_ids.is_empty();
     {
         let mut bin = BufReader::with_capacity(
             4 * 1024 * 1024,
@@ -10691,7 +11370,13 @@ fn run_point_qc(
                     tree_id = to;
                 }
                 if tree_id <= 0 {
-                    continue;
+                    if segmented {
+                        continue;
+                    }
+                    tree_id = 0;
+                } else if !segmented {
+                    segmented = true;
+                    per_tree.remove(&0);
                 }
                 if let Some(w) = &wanted {
                     if !w.contains(&tree_id) {
@@ -10699,29 +11384,31 @@ fn run_point_qc(
                     }
                 }
 
-                let xi = i32::from_le_bytes(block[o..o + 4].try_into().unwrap());
-                let yi = i32::from_le_bytes(block[o + 4..o + 8].try_into().unwrap());
-                let zi = i32::from_le_bytes(block[o + 8..o + 12].try_into().unwrap());
+                let pt = &block[o..o + point_bytes];
+                let xi = i32::from_le_bytes(pt[0..4].try_into().unwrap());
+                let yi = i32::from_le_bytes(pt[4..8].try_into().unwrap());
+                let zi = i32::from_le_bytes(pt[8..12].try_into().unwrap());
                 let wx = xi as f64 * scale[0] + offset[0];
                 let wy = yi as f64 * scale[1] + offset[1];
                 let wz = zi as f64 * scale[2] + offset[2];
                 // No ground beneath the point means no normalised
                 // height, so it is left unevaluated rather than
-                // normalised against a guess.
-                let Some(gz) = dtm.sample(wx, wy) else { continue };
-                let hag = wz - gz as f64;
-
-                let refl = match refl_off {
-                    Some(off) => f32::from_le_bytes(
-                        block[o + off..o + off + 4].try_into().unwrap(),
-                    ) as f64,
-                    None => u16::from_le_bytes(block[o + 16..o + 18].try_into().unwrap()) as f64,
+                // normalised against a guess. Without a DTM at all the
+                // tree's lowest point is the datum (subtracted below).
+                let hag = match &dtm {
+                    Some(dtm) => {
+                        let Some(gz) = dtm.sample(wx, wy) else { continue };
+                        wz - gz as f64
+                    }
+                    None => wz,
                 };
-                let scan = match scan_off {
-                    Some(off) => f32::from_le_bytes(
-                        block[o + off..o + off + 4].try_into().unwrap(),
-                    )
-                    .round() as i32,
+
+                let refl = match refl_col {
+                    Some(c) => c.read(pt),
+                    None => u16::from_le_bytes(pt[16..18].try_into().unwrap()) as f64,
+                };
+                let scan = match &scan_col {
+                    Some(c) => c.read(pt).round() as i32,
                     None => -1,
                 };
 
@@ -10732,6 +11419,21 @@ fn run_point_qc(
         }
     }
     progress(0.55);
+    if dtm.is_none() {
+        for (pts, _) in per_tree.values_mut() {
+            let z0 = pts.iter().map(|p| p.hag).fold(f64::INFINITY, f64::min);
+            if z0.is_finite() {
+                for p in pts.iter_mut() {
+                    p.hag -= z0;
+                }
+            }
+        }
+    }
+    let scope = if segmented {
+        "segmented trees".to_string()
+    } else {
+        "the whole cloud as one tree (this dataset has no tree ids)".to_string()
+    };
 
     // Pass 2: classify each tree and fill in its labels.
     let mut rows: Vec<TreeQcRow> = Vec::with_capacity(per_tree.len());
@@ -10825,6 +11527,8 @@ fn run_point_qc(
         reflectance_note,
         scan_source,
         wind_note,
+        scope,
+        height_note,
         column_written: None,
     };
     summary.n_unevaluated = n_points.saturating_sub(summary.n_evaluated);
@@ -10898,11 +11602,11 @@ mod point_source_id_tests {
     /// The name is recognised however it is spelled in a dialog.
     #[test]
     fn the_reserved_name_is_recognised() {
-        assert!(is_point_source_id_name("point_source_id"));
-        assert!(is_point_source_id_name("POINT_SOURCE_ID"));
-        assert!(is_point_source_id_name("PointSourceId"));
-        assert!(!is_point_source_id_name("point_source"));
-        assert!(!is_point_source_id_name("scan_id"));
+        assert_eq!(StdField::by_name("point_source_id"), Some(StdField::PointSourceId));
+        assert_eq!(StdField::by_name("POINT_SOURCE_ID"), Some(StdField::PointSourceId));
+        assert_eq!(StdField::by_name("PointSourceId"), Some(StdField::PointSourceId));
+        assert_eq!(StdField::by_name("point_source"), None);
+        assert_eq!(StdField::by_name("scan_id"), None);
     }
 
     /// End to end: a LAS whose points carry three different scan ids,
@@ -11009,9 +11713,21 @@ mod point_qc_tests {
     /// A dataset with tree ids, classifications and intensities — the
     /// three things this tool reads besides geometry.
     fn write_dataset(dir: &Path, pts: &[[f64; 3]], tree: &[i32], class: &[u8], inten: &[u16]) {
+        write_dataset_with(dir, pts, tree, class, inten, None);
+    }
+
+    /// The same, with one f32 extra column appended to every record.
+    fn write_dataset_with(
+        dir: &Path,
+        pts: &[[f64; 3]],
+        tree: &[i32],
+        class: &[u8],
+        inten: &[u16],
+        extra: Option<(&str, &[f32])>,
+    ) {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
-        let pb = 21usize;
+        let pb = 21usize + if extra.is_some() { 4 } else { 0 };
         let mut bin = vec![0u8; pts.len() * pb];
         for (i, p) in pts.iter().enumerate() {
             for a in 0..3 {
@@ -11022,16 +11738,29 @@ mod point_qc_tests {
             bin[i * pb + 16..i * pb + 18].copy_from_slice(&inten[i].to_le_bytes());
             bin[i * pb + 18] = class[i];
             bin[i * pb + 19] = 1;
+            if let Some((_, vals)) = extra {
+                bin[i * pb + 21..i * pb + 25].copy_from_slice(&vals[i].to_le_bytes());
+            }
         }
         std::fs::write(dir.join("octree.bin"), &bin).unwrap();
         let mut hier = vec![0u8; 24];
         hier[4..8].copy_from_slice(&(pts.len() as u32).to_le_bytes());
         hier[16..24].copy_from_slice(&((pts.len() * pb) as u64).to_le_bytes());
         std::fs::write(dir.join("hierarchy.bin"), &hier).unwrap();
+        let extras = match extra {
+            Some((name, vals)) => {
+                let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                format!(r#","extras":[{{"name":"{name}","min":{lo},"max":{hi},"type":"float32"}}]"#)
+            }
+            None => String::new(),
+        };
         std::fs::write(
             dir.join("metadata.json"),
-            br#"{"scale":[0.001,0.001,0.001],"offset":[0,0,0],"pointBytes":21,
-                "boundingBox":{"min":[-1,-1,0],"max":[6,6,4]}}"#,
+            format!(
+                r#"{{"scale":[0.001,0.001,0.001],"offset":[0,0,0],"pointBytes":{pb},
+                "boundingBox":{{"min":[-1,-1,0],"max":[6,6,4]}}{extras}}}"#
+            ),
         )
         .unwrap();
     }
@@ -11197,6 +11926,112 @@ mod point_qc_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A dataset that carries a reflectance column is tested against
+    /// it without the name having to be typed — the dB band then means
+    /// what it says, and the summary names the column it found.
+    #[test]
+    fn a_reflectance_column_is_found_by_name() {
+        let dir = std::env::temp_dir().join(format!("pointcloudlabeler-qc5-{}", std::process::id()));
+        // The fixture's geometry, with a dB reflectance column where
+        // the glint is the only point outside -20 … 5 dB.
+        let mut pts: Vec<[f64; 3]> = Vec::new();
+        let mut tree: Vec<i32> = Vec::new();
+        let mut class: Vec<u8> = Vec::new();
+        let mut inten: Vec<u16> = Vec::new();
+        let mut refl: Vec<f32> = Vec::new();
+        for ix in 0..6 {
+            for iy in 0..6 {
+                pts.push([ix as f64, iy as f64, 0.0]);
+                tree.push(0);
+                class.push(2);
+                inten.push(500);
+                refl.push(-8.0);
+            }
+        }
+        for i in 0..60 {
+            let t = i as f64;
+            pts.push([2.0 + (t * 0.001), 2.0, 1.0 + t * 0.01]);
+            tree.push(1);
+            class.push(5);
+            inten.push(500);
+            refl.push(-5.0 - (i % 7) as f32);
+        }
+        pts.push([2.0, 2.0, 1.3]);
+        tree.push(1);
+        class.push(5);
+        inten.push(500);
+        refl.push(12.0); // a glint, in dB
+        write_dataset_with(&dir, &pts, &tree, &class, &inten, Some(("Reflectance", &refl)));
+
+        // The MATLAB band, no column named.
+        let p = PointQcParams { min_tree_points: 10, dtm_cell: 1.0, ..Default::default() };
+        let sum = run_point_qc(&|_| {}, &dir, &p).expect("qc");
+        assert_eq!(sum.reflectance_source, "column 'Reflectance' (auto-detected)");
+        assert!(sum.reflectance_note.is_none(), "{:?}", sum.reflectance_note);
+        assert_eq!(sum.n_removed_reflectance, 1, "only the 12 dB glint is outside the band");
+        assert_eq!(sum.n_evaluated, 61);
+
+        // A name typed in still wins, and is matched however it is spelled.
+        let p2 = PointQcParams { refl_column: Some("reflectance".to_string()), ..p.clone() };
+        let sum2 = run_point_qc(&|_| {}, &dir, &p2).expect("qc");
+        assert_eq!(sum2.reflectance_source, "column 'Reflectance'");
+        assert_eq!(sum2.n_removed_reflectance, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One scanned tree, never segmented and never ground-classified:
+    /// every point has tree id 0 and nothing is class 2. That used to
+    /// come back as "0 trees · 0 points evaluated"; now the cloud is
+    /// one tree, measured from its lowest point, and the summary says
+    /// both.
+    #[test]
+    fn an_unsegmented_cloud_is_one_tree() {
+        let dir = std::env::temp_dir().join(format!("pointcloudlabeler-qc6-{}", std::process::id()));
+        let mut pts: Vec<[f64; 3]> = Vec::new();
+        for i in 0..80 {
+            let t = i as f64;
+            pts.push([2.0 + (t * 0.001), 2.0, 1.0 + t * 0.01]);
+        }
+        pts.push([5.0, 5.0, 2.0]); // a stray
+        let n = pts.len();
+        write_dataset(&dir, &pts, &vec![0; n], &vec![0; n], &vec![500; n]);
+        let p = params();
+        let sum = run_point_qc(&|_| {}, &dir, &p).expect("qc");
+        assert_eq!(sum.trees.len(), 1);
+        assert_eq!(sum.trees[0].tree_id, 0);
+        assert_eq!(sum.n_evaluated, n as u64);
+        assert_eq!(sum.n_removed_outlier, 1, "the stray");
+        assert!(sum.scope.contains("whole cloud"), "{}", sum.scope);
+        let hn = sum.height_note.as_deref().unwrap_or("");
+        assert!(hn.contains("lowest"), "{hn}");
+        // Heights are from the tree's lowest point, so the range starts at 0.
+        assert!(sum.trees[0].hag_min.abs() < 1e-3, "{}", sum.trees[0].hag_min);
+        assert!((sum.trees[0].hag_max - 1.0).abs() < 0.05, "{}", sum.trees[0].hag_max);
+
+        // The labels are written like any other run's.
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(point_bytes_of(&meta).unwrap(), 25);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segmented plot is not changed by the fallback: its ground and
+    /// unsegmented points stay unevaluated, whatever order the records
+    /// come in.
+    #[test]
+    fn a_segmented_plot_still_skips_its_unsegmented_points() {
+        let dir = std::env::temp_dir().join(format!("pointcloudlabeler-qc7-{}", std::process::id()));
+        let (n_ground, n_tree, n_all) = fixture(&dir);
+        let sum = run_point_qc(&|_| {}, &dir, &params()).expect("qc");
+        assert_eq!(sum.scope, "segmented trees");
+        assert!(sum.height_note.is_none());
+        assert_eq!(sum.trees.len(), 1);
+        assert_eq!(sum.n_evaluated as usize, n_all - n_ground);
+        assert_eq!(sum.n_unevaluated as usize, n_ground);
+        assert!(n_tree > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A named column that is not there is a mistake worth reporting
     /// before anything is rewritten, not a silent fallback to
     /// intensity.
@@ -11226,43 +12061,43 @@ mod point_qc_tests {
 /// Remove a numeric extra column by name (rewrites octree.bin narrower).
 /// Used to reset a height-above-ground column — whether one we created or
 /// one that rode in from the source file — so it can be recomputed.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_remove_extra(
     window: Window,
     octree_dir: String,
     name: String,
 ) -> Result<u64, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || run_remove_extra(&window, &octree_dir, &name))
+    crate::rt::spawn_blocking(move || run_remove_extra(&progress, &octree_dir, &name))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_remove_extra(window: &Window, octree_dir: &str, name: &str) -> Result<u64, String> {
+pub fn run_remove_extra(progress: &Progress, octree_dir: &str, name: &str) -> Result<u64, String> {
     let dir = Path::new(octree_dir);
-    emit_progress(window, "remove_extra", 0.0);
+    emit_progress(progress, "remove_extra", 0.0);
     let meta_bytes = std::fs::read(dir.join("metadata.json"))
         .map_err(|e| format!("read metadata.json: {e}"))?;
     let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
         .map_err(|e| format!("parse metadata.json: {e}"))?;
     let old_stride = point_bytes_of(&meta)?;
-    let extras: Vec<String> = meta.get("extras").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-    let k = extras.iter().position(|n| n.eq_ignore_ascii_case(name))
+    let cols = extra_layout(&meta);
+    let col = layout_find(&cols, name).cloned()
         .ok_or_else(|| format!("extra column '{name}' not found"))?;
-    // Byte span of the removed f32 within each point (extras start after
-    // the 21-byte base prefix, in declared order).
-    let rm_off = BASE_POINT_BYTES + k * 4;
-    let new_stride = old_stride - 4;
-    rewrite_octree_with_stride(&|p| emit_progress(window, "remove_extra", p), dir, old_stride, new_stride, |pt, out| {
+    // Byte span of the removed column within each point, from the layout.
+    let rm_off = col.offset;
+    let width = col.kind.width();
+    let new_stride = old_stride - width;
+    rewrite_octree_with_stride(&|p| emit_progress(progress, "remove_extra", p), dir, old_stride, new_stride, |pt, out| {
         out.extend_from_slice(&pt[..rm_off]);
-        out.extend_from_slice(&pt[rm_off + 4..]);
+        out.extend_from_slice(&pt[rm_off + width..]);
     })?;
     update_metadata_extras(dir, None, Some(name))?;
-    emit_progress(window, "remove_extra", 1.0);
+    emit_progress(progress, "remove_extra", 1.0);
     Ok(1)
 }
 
@@ -13376,7 +14211,7 @@ pub struct CleanResult {
 /// Tag for the streaming helper so progress events report a useful
 /// stage name to the frontend.
 fn build_mask_for_cleaning<F>(
-    window: &Window,
+    progress: &Progress,
     src_dir: &str,
     stage: &str,
     build_mask: F,
@@ -13386,7 +14221,7 @@ where
 {
     use std::io::Read;
     let dir = Path::new(src_dir);
-    emit_progress(window, stage, 0.0);
+    emit_progress(progress, stage, 0.0);
 
     let (_meta, src_scale, src_offset, _src_bbox, src_point_bytes, _n_extras) =
         open_octree_meta(dir)?;
@@ -13445,10 +14280,10 @@ where
             positions.push([wx as f32, wy as f32, wz as f32]);
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, stage, 0.25 * (rec_idx as f32 / n_records as f32));
+            emit_progress(progress, stage, 0.25 * (rec_idx as f32 / n_records as f32));
         }
     }
-    emit_progress(window, stage, 0.30);
+    emit_progress(progress, stage, 0.30);
 
     let n_live = positions.len() as u64;
     let mask = build_mask(&positions);
@@ -13456,7 +14291,7 @@ where
         return Err(format!("mask len {} != positions len {}", mask.len(), positions.len()));
     }
     drop(positions); // free the f32 array before pass 2
-    emit_progress(window, stage, 0.60);
+    emit_progress(progress, stage, 0.60);
     Ok((mask, n_live, bbox))
 }
 
@@ -13465,7 +14300,7 @@ where
 /// then running phase 2/3 to emit the octree + metadata.
 #[allow(clippy::too_many_arguments)]
 fn write_filtered_dataset(
-    window: &Window,
+    progress: &Progress,
     src_dir: &str, out_dir: &str, name: &str, scanner_type: &str,
     mask: &[bool], bbox: Aabb, stage: &str, started: std::time::Instant,
 ) -> Result<CleanResult, String> {
@@ -13474,11 +14309,12 @@ fn write_filtered_dataset(
     let out_path = PathBuf::from(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
 
-    let (_meta, src_scale, src_offset, src_bbox, src_point_bytes, n_extras) =
+    let (src_meta, src_scale, src_offset, src_bbox, src_point_bytes, n_extras) =
         open_octree_meta(dir)?;
-    let stride = point_stride(n_extras);
+    let cols = extra_layout(&src_meta);
+    let stride = layout_stride(&cols);
     if src_point_bytes != stride {
-        return Err(format!("source pointBytes {src_point_bytes} disagrees with {n_extras} extras"));
+        return Err(format!("source pointBytes {src_point_bytes} disagrees with the {n_extras} extras declared"));
     }
     // Choose new scale/offset so quantisation is matched to the kept
     // points' extent (a denoised cloud often has a tighter bbox).
@@ -13497,29 +14333,9 @@ fn write_filtered_dataset(
     let ExportPatches { main: patches, deadwood: dw_patches } =
         parse_export_patches_full(&dir.join("patches.bin"))?;
     let remap = parse_remap(&dir.join("treemap.json"))?;
-    let standing_dw_off = {
-        // Resolve the deadwood channel offsets within an extras column block.
-        let meta = serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(dir.join("metadata.json")).unwrap_or_default(),
-        ).unwrap_or(serde_json::json!({}));
-        let names: Vec<String> = meta.get("extras")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-            .unwrap_or_default();
-        names.iter().position(|n| n.eq_ignore_ascii_case(STANDING_DEADWOOD_NAME))
-            .map(|k| BASE_POINT_BYTES + k * 4)
-    };
-    let laying_dw_off = {
-        let meta = serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(dir.join("metadata.json")).unwrap_or_default(),
-        ).unwrap_or(serde_json::json!({}));
-        let names: Vec<String> = meta.get("extras")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-            .unwrap_or_default();
-        names.iter().position(|n| n.eq_ignore_ascii_case(LAYING_DEADWOOD_NAME))
-            .map(|k| BASE_POINT_BYTES + k * 4)
-    };
+    // The deadwood channel offsets within the record, from the layout.
+    let standing_dw_off = extra_byte_offset(&src_meta, STANDING_DEADWOOD_NAME);
+    let laying_dw_off = extra_byte_offset(&src_meta, LAYING_DEADWOOD_NAME);
 
     let mut chunks: Vec<Vec<u8>> = (0..GRID_CUBED).map(|_| Vec::new()).collect();
     let mut bin = BufReader::with_capacity(
@@ -13529,7 +14345,7 @@ fn write_filtered_dataset(
     let mut block: Vec<u8> = Vec::new();
     let mut cur_pos: u64 = 0;
     let mut packed = vec![0u8; stride];
-    let mut extras_minmax: Vec<(f32, f32)> = vec![(f32::INFINITY, f32::NEG_INFINITY); n_extras];
+    let mut extras_minmax: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); n_extras];
     // Observed intensity range of the points surviving cleaning /
     // downsampling — narrower than the source's range whenever points get
     // dropped, so it's tracked fresh (see intensity_minmax in
@@ -13593,10 +14409,8 @@ fn write_filtered_dataset(
                 if sd >= 0 { if let Some(off) = standing_dw_off { packed[off..off + 4].copy_from_slice(&(sd as f32).to_le_bytes()); } }
                 if ld >= 0 { if let Some(off) = laying_dw_off { packed[off..off + 4].copy_from_slice(&(ld as f32).to_le_bytes()); } }
             }
-            for (k, mm) in extras_minmax.iter_mut().enumerate() {
-                let eo = BASE_POINT_BYTES + k * 4;
-                let v = f32::from_le_bytes(packed[eo..eo + 4].try_into().unwrap());
-                if v.is_finite() { if v < mm.0 { mm.0 = v; } if v > mm.1 { mm.1 = v; } }
+            for (c, mm) in cols.iter().zip(extras_minmax.iter_mut()) {
+                minmax_fold(mm, c.read(&packed));
             }
             // Intensity rides through the initial block copy untouched —
             // same survivors-only reasoning as extras_minmax above.
@@ -13611,25 +14425,15 @@ fn write_filtered_dataset(
             kept += 1;
         }
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, stage, 0.60 + 0.30 * (rec_idx as f32 / n_records as f32));
+            emit_progress(progress, stage, 0.60 + 0.30 * (rec_idx as f32 / n_records as f32));
         }
     }
     if kept == 0 { return Err("filter dropped every point — relax the parameters".into()); }
 
-    // Resolve extras meta-list for the new metadata.
-    let src_meta = serde_json::from_slice::<serde_json::Value>(
-        &std::fs::read(dir.join("metadata.json")).unwrap_or_default(),
-    ).unwrap_or(serde_json::json!({}));
-    let extras_names: Vec<String> = {
-        let meta = &src_meta;
-        meta.get("extras").and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
-            .unwrap_or_default()
-    };
-    let extras_report: Vec<ExtraColumnReport> = extras_names.iter().zip(extras_minmax)
-        .map(|(name, (lo, hi))| {
-            let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo { (lo, hi) } else { (0.0, 0.0) };
-            ExtraColumnReport { name: name.clone(), min: lo, max: hi }
+    let extras_report: Vec<ExtraColumnReport> = cols.iter().zip(extras_minmax)
+        .map(|(c, (lo, hi))| {
+            let (lo, hi) = minmax_report(lo, hi);
+            ExtraColumnReport { name: c.name.clone(), min: lo, max: hi, kind: c.kind }
         }).collect();
     // A degenerate spread (every surviving point the same intensity) can't
     // drive a colour ramp, so it's reported as unknown rather than a fake
@@ -13644,8 +14448,8 @@ fn write_filtered_dataset(
     let max_depth: u32 = 14;
     let outputs = phase23_build_write(
         ChunkSource::Mem(chunks), cube, new_scale, new_offset, root_spacing, max_depth,
-        n_extras, &out_path,
-        &|stage, p| emit_progress(window, stage, p),
+        stride, &out_path,
+        &|stage, p| emit_progress(progress, stage, p),
     )?;
     let (tiles, _bytes) = outputs;
     let total_stored: u64 = tiles.iter().map(|t| t.point_count).sum();
@@ -13661,7 +14465,7 @@ fn write_filtered_dataset(
         // surviving points, so the georeferencing is unchanged.
         Some(&src_meta),
     ).map_err(|e| format!("write metadata: {e}"))?;
-    emit_progress(window, stage, 1.0);
+    emit_progress(progress, stage, 1.0);
 
     Ok(CleanResult {
         out_dir: out_path.to_string_lossy().into_owned(),
@@ -13673,7 +14477,8 @@ fn write_filtered_dataset(
     })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_filter_outliers(
     window: Window,
@@ -13687,66 +14492,95 @@ pub async fn octree_filter_outliers(
     radius: Option<f64>,
     min_neighbours: Option<u32>,
 ) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let k_val = k.unwrap_or(8).max(1) as usize;
-        let mult = std_mult.unwrap_or(1.0) as f32;
-        let r_val = radius.unwrap_or(0.05) as f32;
-        let min_n = min_neighbours.unwrap_or(2);
-
-        let build = move |positions: &[[f32; 3]]| -> Vec<bool> {
-            // Auto-pick a cell size that's wide enough to contain at
-            // least k neighbours on average — pull average spacing from
-            // bbox + count, then use 4× that as the grid cell.
-            let cell = if positions.len() >= 2 {
-                let mut bmin = [f32::INFINITY; 3];
-                let mut bmax = [f32::NEG_INFINITY; 3];
-                for p in positions {
-                    for a in 0..3 {
-                        if p[a] < bmin[a] { bmin[a] = p[a]; }
-                        if p[a] > bmax[a] { bmax[a] = p[a]; }
-                    }
-                }
-                let vol = ((bmax[0] - bmin[0]).max(1e-3)
-                        * (bmax[1] - bmin[1]).max(1e-3)
-                        * (bmax[2] - bmin[2]).max(1e-3)) as f64;
-                let mean_spacing = (vol / positions.len() as f64).cbrt() as f32;
-                (mean_spacing * 4.0).max(r_val * 1.2).max(0.001)
-            } else { 0.05 };
-            match method.as_str() {
-                "sor" => compute_sor_mask(positions, k_val, mult, cell),
-                "radius" => compute_radius_mask(positions, r_val, min_n, cell),
-                other => panic!("unknown clean method {other}"),
-            }
-        };
-        let (mask, _n_live, bbox) = build_mask_for_cleaning(&window, &src_dir, "clean", build)?;
-        write_filtered_dataset(&window, &src_dir, &out_dir, &name, &scanner_type, &mask, bbox, "clean", started)
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_filter_outliers(&progress, &src_dir, &out_dir, &name, &scanner_type, &method, k, std_mult, radius, min_neighbours)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-#[tauri::command]
+/// Statistical ("sor") or radius outlier removal into a new dataset —
+/// the Clean section's pass, shared with the catalogue. `k` and
+/// `std_mult` drive "sor" (defaults 8 and 1.0), `radius` and
+/// `min_neighbours` drive "radius" (defaults 0.05 m and 2).
+#[allow(clippy::too_many_arguments)]
+pub fn run_filter_outliers(
+    progress: &Progress,
+    src_dir: &str, out_dir: &str, name: &str, scanner_type: &str,
+    method: &str,
+    k: Option<u32>,
+    std_mult: Option<f64>,
+    radius: Option<f64>,
+    min_neighbours: Option<u32>,
+) -> Result<CleanResult, String> {
+    let started = std::time::Instant::now();
+    let k_val = k.unwrap_or(8).max(1) as usize;
+    let mult = std_mult.unwrap_or(1.0) as f32;
+    let r_val = radius.unwrap_or(0.05) as f32;
+    let min_n = min_neighbours.unwrap_or(2);
+    if method != "sor" && method != "radius" {
+        return Err(format!("unknown clean method '{method}': use sor or radius"));
+    }
+    let method = method.to_string();
+
+    let build = move |positions: &[[f32; 3]]| -> Vec<bool> {
+        let cell = if positions.len() >= 2 {
+            let mut bmin = [f32::INFINITY; 3];
+            let mut bmax = [f32::NEG_INFINITY; 3];
+            for p in positions {
+                for a in 0..3 {
+                    if p[a] < bmin[a] { bmin[a] = p[a]; }
+                    if p[a] > bmax[a] { bmax[a] = p[a]; }
+                }
+            }
+            let vol = ((bmax[0] - bmin[0]).max(1e-3)
+                    * (bmax[1] - bmin[1]).max(1e-3)
+                    * (bmax[2] - bmin[2]).max(1e-3)) as f64;
+            let mean_spacing = (vol / positions.len() as f64).cbrt() as f32;
+            (mean_spacing * 4.0).max(r_val * 1.2).max(0.001)
+        } else { 0.05 };
+        match method.as_str() {
+            "sor" => compute_sor_mask(positions, k_val, mult, cell),
+            _ => compute_radius_mask(positions, r_val, min_n, cell),
+        }
+    };
+    let (mask, _n_live, bbox) = build_mask_for_cleaning(progress, src_dir, "clean", build)?;
+    write_filtered_dataset(progress, src_dir, out_dir, name, scanner_type, &mask, bbox, "clean", started)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_voxel_downsample(
     window: Window,
     src_dir: String, out_dir: String, name: String, scanner_type: String,
     voxel_size: f64,
 ) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let v = voxel_size.max(1e-4) as f32;
-        let build = move |positions: &[[f32; 3]]| -> Vec<bool> {
-            compute_voxel_mask(positions, v)
-        };
-        let (mask, _n_live, bbox) = build_mask_for_cleaning(&window, &src_dir, "downsample", build)?;
-        write_filtered_dataset(&window, &src_dir, &out_dir, &name, &scanner_type, &mask, bbox, "downsample", started)
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_voxel_downsample(&progress, &src_dir, &out_dir, &name, &scanner_type, voxel_size)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-#[tauri::command]
+/// Voxel downsampling into a new dataset: one point kept per voxel of
+/// `voxel_size` metres. Shared with the catalogue.
+pub fn run_voxel_downsample(
+    progress: &Progress, src_dir: &str, out_dir: &str, name: &str, scanner_type: &str, voxel_size: f64,
+) -> Result<CleanResult, String> {
+    let started = std::time::Instant::now();
+    let v = voxel_size.max(1e-4) as f32;
+    let build = move |positions: &[[f32; 3]]| -> Vec<bool> {
+        compute_voxel_mask(positions, v)
+    };
+    let (mask, _n_live, bbox) = build_mask_for_cleaning(progress, src_dir, "downsample", build)?;
+    write_filtered_dataset(progress, src_dir, out_dir, name, scanner_type, &mask, bbox, "downsample", started)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_terrain(
     window: Window,
@@ -13786,14 +14620,15 @@ pub async fn octree_terrain(
     // ArcGIS default.
     hillshade_azimuth_deg: Option<f64>,
 ) -> Result<TerrainResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let method = dsm_method.unwrap_or_else(|| "p2r".to_string());
     let layers = dsm_layers.unwrap_or_default();
     let lat = hli_latitude_deg.unwrap_or(60.0);
     let stream_frac = stream_fraction.unwrap_or(0.01).clamp(0.001, 0.5);
     let hs_alt = hillshade_altitude_deg.unwrap_or(45.0).clamp(0.0, 90.0);
     let hs_az = hillshade_azimuth_deg.unwrap_or(315.0).rem_euclid(360.0);
-    tauri::async_runtime::spawn_blocking(move || run_terrain(
-        &|p| emit_progress(&window, "terrain", p),
+    crate::rt::spawn_blocking(move || run_terrain(
+        &|p| emit_progress(&progress, "terrain", p),
         &octree_dir, cell_size, &method, &layers, epsg, lat, stream_frac, hs_alt, hs_az))
         .await
         .map_err(|e| format!("join error: {e}"))?
@@ -14026,7 +14861,7 @@ fn plot_latitude_deg(meta: &serde_json::Value) -> Option<f64> {
 /// of them a product a forester opens in a GIS, and every one of them
 /// sharing a single georeference — which nothing checked.
 #[allow(clippy::too_many_arguments)]
-fn run_terrain(
+pub fn run_terrain(
     progress: ProgressSink, octree_dir: &str, cell_size: f64,
     dsm_method: &str, dsm_layers: &[f64], epsg: Option<u32>,
     hli_latitude_deg: f64, stream_fraction: f64,
@@ -14537,7 +15372,8 @@ pub struct SegmentResult {
     pub assigned_points: u64,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_segment_chm(
     window: Window,
@@ -14554,12 +15390,13 @@ pub async fn octree_segment_chm(
     crown_radius_per_m: f64,
     crown_max_radius: f64,
 ) -> Result<SegmentResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_segment_chm(
-            &|p| emit_progress(&window, "segment", p),
+            &|p| emit_progress(&progress, "segment", p),
             &octree_dir, cell_size, smooth, min_height,
             crown_base_radius, crown_radius_per_m, crown_max_radius,
         )
@@ -14623,7 +15460,7 @@ mod crown_window_tests {
             (0.5, 0.05, 1.0, 100.0, "cell far larger than the plot's crowns"),
         ] {
             let r = crown_window_cells(20.0, base, per_m, max, cell, 10_000);
-            assert!(r >= 1, "{what}: window {r} cells");
+            assert!(r >= 1, "{what}: progress {r} cells");
         }
     }
 
@@ -14648,7 +15485,7 @@ mod crown_window_tests {
         for (h, want_m) in [(0.0_f32, 1.5_f64), (5.0, 2.0), (20.0, 3.5), (35.0, 5.0)] {
             let want = (want_m / cell).round() as i64;
             assert_eq!(crown_window_cells(h, base, per_m, max, cell, 10_000), want,
-                "at {h} m the window should be {want_m} m = {want} cells");
+                "at {h} m the progress should be {want_m} m = {want} cells");
         }
         // Past the cap it stops growing, however tall the tree.
         let capped = (max / cell).round() as i64;
@@ -14693,7 +15530,7 @@ mod crown_window_tests {
                                     (f64::MAX, 0.5, 64), (5.0, 0.5, 3)] {
             let r = crown_window_cells(40.0, 1.5, 0.5, max_m, cell, grid);
             assert!((1..=grid).contains(&r),
-                "cap {max_m} m on a {cell} m / {grid} cell grid gave a {r} cell window");
+                "cap {max_m} m on a {cell} m / {grid} cell grid gave a {r} cell progress");
         }
         // The cap is the grid, not a magic number: a grid big enough
         // still gets the radius that was asked for.
@@ -14738,7 +15575,7 @@ mod crown_window_tests {
 /// from a test. What this returns is the stem count, and stems per
 /// hectare is a headline inventory number.
 #[allow(clippy::too_many_arguments)]
-fn run_segment_chm(
+pub fn run_segment_chm(
     progress: ProgressSink, octree_dir: &str,
     cell_size: f64, smooth: f64, min_height: f64,
     crown_base_radius: f64, crown_radius_per_m: f64, crown_max_radius: f64,
@@ -15168,7 +16005,8 @@ fn jacobi_eigen_3x3(a_in: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
 // octree.bin exactly like the watershed does. Needs ground classified.
 // ---------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_tree_isolation(
     window: Window,
@@ -15179,11 +16017,12 @@ pub async fn octree_tree_isolation(
     voxel_size: f64,
     params: TreeIsoRequest,
 ) -> Result<SegmentResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_tree_isolation(&window, &octree_dir, voxel_size, &params)
+    crate::rt::spawn_blocking(move || {
+        run_tree_isolation(&progress, &octree_dir, voxel_size, &params)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -15193,7 +16032,7 @@ pub async fn octree_tree_isolation(
 /// than ten positional arguments: the reference has ten knobs and a
 /// transposed pair of them (λ1 for λ2, K2 for K3) is not a compile error
 /// on either side of the bridge.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeIsoRequest {
     pub k1: u32,
@@ -15214,14 +16053,14 @@ pub struct TreeIsoRequest {
 /// three of them saying the same thing.
 type VoxelSums = FxHashMap<(i32, i32, i32), (f64, f64, f64, u32)>;
 
-fn run_tree_isolation(
-    window: &Window, octree_dir: &str, voxel_size: f64, req: &TreeIsoRequest,
+pub fn run_tree_isolation(
+    progress: &Progress, octree_dir: &str, voxel_size: f64, req: &TreeIsoRequest,
 ) -> Result<SegmentResult, String> {
     // A Stop from the panel is honoured at every progress point of the analysis passes; once labels are being written the run finishes, so a stopped run never leaves a half-written dataset.
     let cancel = crate::commands::cancel::token("treeiso");
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "treeiso", 0.0);
+    emit_progress(progress, "treeiso", 0.0);
 
     let (_m, scale, offset, _b, point_bytes, _e) = open_octree_meta(dir)?;
     let hier = std::fs::read(dir.join("hierarchy.bin")).map_err(|e| format!("read hierarchy.bin: {e}"))?;
@@ -15271,14 +16110,14 @@ fn run_tree_isolation(
             }
             if n_records > 0 && rec_idx % 256 == 0 {
                 if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
-                emit_progress(window, "treeiso", 0.05 + 0.35 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "treeiso", 0.05 + 0.35 * (rec_idx as f32 / n_records as f32));
             }
         }
     }
     if vox.is_empty() {
         return Err("no non-ground points — classify ground first, or this cloud is empty".into());
     }
-    emit_progress(window, "treeiso", 0.4);
+    emit_progress(progress, "treeiso", 0.4);
 
     // ---- Working set: one centroid per voxel (relative to offset for f32
     //      precision) + voxel→index map for the write-back. ----
@@ -15289,7 +16128,7 @@ fn run_tree_isolation(
         voxel_index.insert(key, centroids.len() as u32);
         centroids.push([(sx / cc - offset[0]) as f32, (sy / cc - offset[1]) as f32, (sz / cc - offset[2]) as f32]);
     }
-    emit_progress(window, "treeiso", 0.5);
+    emit_progress(progress, "treeiso", 0.5);
 
     // ---- Isolate. cut-pursuit's max-flow can recurse deep, so run it on a
     //      dedicated large-stack thread rather than the blocking pool's. ----
@@ -15308,7 +16147,7 @@ fn run_tree_isolation(
         .spawn(move || super::treeiso::isolate_trees(&centroids, &params))
         .map_err(|e| format!("spawn treeiso thread: {e}"))?;
     let tree_of_voxel: Vec<u32> = handle.join().map_err(|_| "treeiso worker thread panicked".to_string())?;
-    emit_progress(window, "treeiso", 0.9);
+    emit_progress(progress, "treeiso", 0.9);
 
     // ---- Pass 2: write tree_id back (voxel key → tree id). ----
     let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
@@ -15359,12 +16198,12 @@ fn run_tree_isolation(
                 file.write_all(&block).map_err(|e| format!("write octree.bin: {e}"))?;
             }
             if n_records > 0 && rec_idx % 256 == 0 {
-                emit_progress(window, "treeiso", 0.9 + 0.1 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "treeiso", 0.9 + 0.1 * (rec_idx as f32 / n_records as f32));
             }
         }
         file.flush().map_err(|e| format!("flush octree.bin: {e}"))?;
     }
-    emit_progress(window, "treeiso", 1.0);
+    emit_progress(progress, "treeiso", 1.0);
     Ok(SegmentResult { tree_count: seen.len() as u32, assigned_points: assigned })
 }
 
@@ -15384,7 +16223,8 @@ fn run_tree_isolation(
 // accuracies to be compared, which needs more than one answer.
 // ---------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_segment_li2012(
     window: Window,
     octree_dir: String,
@@ -15398,9 +16238,10 @@ pub async fn octree_segment_li2012(
     dtm_cell: f64,
     params: Li2012Request,
 ) -> Result<SegmentResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_segment_li2012(&window, &octree_dir, voxel_size, dtm_cell, &params)
+    crate::rt::spawn_blocking(move || {
+        run_segment_li2012(&progress, &octree_dir, voxel_size, dtm_cell, &params)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -15411,7 +16252,7 @@ pub async fn octree_segment_li2012(
 /// `dt2` differ by half a metre and mean opposite ends of the canopy, and
 /// swapping them is not a compile error on either side of the bridge —
 /// which is exactly the mistake this code shipped with.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Li2012Request {
     pub dt1: f64,
@@ -15422,14 +16263,14 @@ pub struct Li2012Request {
     pub min_tree_pts: u32,
 }
 
-fn run_segment_li2012(
-    window: &Window, octree_dir: &str, voxel_size: f64, dtm_cell: f64, req: &Li2012Request,
+pub fn run_segment_li2012(
+    progress: &Progress, octree_dir: &str, voxel_size: f64, dtm_cell: f64, req: &Li2012Request,
 ) -> Result<SegmentResult, String> {
     // A Stop from the panel is honoured at every progress point of the analysis passes; once labels are being written the run finishes, so a stopped run never leaves a half-written dataset.
     let cancel = crate::commands::cancel::token("li2012");
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "li2012", 0.0);
+    emit_progress(progress, "li2012", 0.0);
 
     let (_m, scale, offset, _b, point_bytes, _e) = open_octree_meta(dir)?;
     let hier = std::fs::read(dir.join("hierarchy.bin")).map_err(|e| format!("read hierarchy.bin: {e}"))?;
@@ -15483,14 +16324,14 @@ fn run_segment_li2012(
             }
             if n_records > 0 && rec_idx % 256 == 0 {
                 if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
-                emit_progress(window, "li2012", 0.05 + 0.4 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "li2012", 0.05 + 0.4 * (rec_idx as f32 / n_records as f32));
             }
         }
     }
     if vox.is_empty() {
         return Err("no non-ground points — classify ground first, or this cloud is empty".into());
     }
-    emit_progress(window, "li2012", 0.5);
+    emit_progress(progress, "li2012", 0.5);
 
     // ---- Working set: [x, y, height above ground] per voxel. ----
     // A voxel with no ground beneath it is dropped rather than given a
@@ -15509,7 +16350,7 @@ fn run_segment_li2012(
     if pts.is_empty() {
         return Err("no non-ground points had ground beneath them — check the terrain pass".into());
     }
-    emit_progress(window, "li2012", 0.55);
+    emit_progress(progress, "li2012", 0.55);
 
     let params = super::li2012::Li2012Params {
         dt1: req.dt1 as f32,
@@ -15520,7 +16361,7 @@ fn run_segment_li2012(
         min_tree_pts: req.min_tree_pts.max(1) as usize,
     };
     let tree_of_voxel = super::li2012::segment_trees(&pts, &params);
-    emit_progress(window, "li2012", 0.9);
+    emit_progress(progress, "li2012", 0.9);
 
     // ---- Pass 2: write tree_id back. ----
     let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
@@ -15571,14 +16412,14 @@ fn run_segment_li2012(
                 file.write_all(&block).map_err(|e| format!("write octree.bin: {e}"))?;
             }
             if n_records > 0 && rec_idx % 256 == 0 {
-                emit_progress(window, "li2012", 0.9 + 0.1 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "li2012", 0.9 + 0.1 * (rec_idx as f32 / n_records as f32));
             }
         }
     }
     if no_ground > 0 {
         eprintln!("li2012: {no_ground} voxels had no ground beneath them and were skipped");
     }
-    emit_progress(window, "li2012", 1.0);
+    emit_progress(progress, "li2012", 1.0);
     Ok(SegmentResult { tree_count: seen.len() as u32, assigned_points: assigned })
 }
 
@@ -15669,7 +16510,8 @@ fn m3c2_load_decimated(
     }).collect())
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_m3c2(
     window: Window,
@@ -15688,24 +16530,25 @@ pub async fn octree_m3c2(
     // the same answer. None = the decimation voxel, as it always was.
     core_spacing: Option<f64>,
 ) -> Result<M3C2Result, String> {
+    let progress = Progress::window(window, "octree-progress");
     let run = crate::commands::cancel::try_begin("m3c2").ok_or_else(|| {
         "an M3C2 comparison is already running — stop it first, or wait for it to finish".to_string()
     })?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let _run = run;
-        run_m3c2(&window, &octree_dir, &reference_dir, voxel_size, normal_scale, projection_scale, max_depth, reg_error, core_spacing)
+        run_m3c2(&progress, &octree_dir, &reference_dir, voxel_size, normal_scale, projection_scale, max_depth, reg_error, core_spacing)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_m3c2(
-    window: &Window, octree_dir: &str, reference_dir: &str,
+pub fn run_m3c2(
+    progress: &Progress, octree_dir: &str, reference_dir: &str,
     voxel_size: f64, normal_scale: f64, projection_scale: f64, max_depth: f64, reg_error: f64,
     core_spacing: Option<f64>,
 ) -> Result<M3C2Result, String> {
-    emit_progress(window, "m3c2", 0.0);
+    emit_progress(progress, "m3c2", 0.0);
     if octree_dir == reference_dir {
         return Err("reference and compared datasets are the same — pick a different epoch".into());
     }
@@ -15718,11 +16561,11 @@ fn run_m3c2(
     // pass is a read of the whole cloud, so each reports as it goes and
     // can be stopped; a stop here has nothing to keep.
     let ref_pts = m3c2_load_decimated(Path::new(reference_dir), voxel, cmp_off, &cancel,
-        &|p| emit_progress(window, "m3c2", 0.35 * p))?;
-    emit_progress(window, "m3c2", 0.35);
+        &|p| emit_progress(progress, "m3c2", 0.35 * p))?;
+    emit_progress(progress, "m3c2", 0.35);
     let cmp_pts = m3c2_load_decimated(Path::new(octree_dir), voxel, cmp_off, &cancel,
-        &|p| emit_progress(window, "m3c2", 0.35 + 0.25 * p))?;
-    emit_progress(window, "m3c2", 0.6);
+        &|p| emit_progress(progress, "m3c2", 0.35 + 0.25 * p))?;
+    emit_progress(progress, "m3c2", 0.6);
     if ref_pts.is_empty() || cmp_pts.is_empty() {
         return Err("one of the datasets has no points".into());
     }
@@ -15745,11 +16588,11 @@ fn run_m3c2(
     // with no word until the end. Now in parallel, reported after every
     // chunk, and stoppable between them — the chunks done are kept.
     let res = super::m3c2::m3c2_with(&ref_pts, &cmp_pts, &core, &params, &|done, total| {
-        emit_progress(window, "m3c2", 0.6 + 0.3 * done as f32 / total.max(1) as f32);
+        emit_progress(progress, "m3c2", 0.6 + 0.3 * done as f32 / total.max(1) as f32);
         !crate::commands::cancel::stopped(&cancel)
     });
     let stopped = res.len() < core.len();
-    emit_progress(window, "m3c2", 0.9);
+    emit_progress(progress, "m3c2", 0.9);
 
     let mut xyz: Vec<f32> = Vec::with_capacity(res.len() * 3);
     let mut distance: Vec<f32> = Vec::with_capacity(res.len());
@@ -15775,7 +16618,7 @@ fn run_m3c2(
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         (mean, sorted[sorted.len() / 2], var.sqrt())
     };
-    emit_progress(window, "m3c2", 1.0);
+    emit_progress(progress, "m3c2", 1.0);
     Ok(M3C2Result {
         core_count: res.len() as u64,
         defined_count: defined.len() as u64,
@@ -15829,7 +16672,8 @@ fn lw_is_wood(l0: f64, l1: f64, l2: f64, linearity_min: f64, planarity_min: f64,
     (linearity >= linearity_min || planarity >= planarity_min) && scatter <= scatter_max
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_leaf_wood(
     window: Window,
@@ -15847,11 +16691,12 @@ pub async fn octree_leaf_wood(
     // Majority-vote smoothing passes over the neighbourhood. e.g. 2.
     smooth_passes: u32,
 ) -> Result<LeafWoodResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_leaf_wood(&window, &octree_dir, search_radius, min_neighbors,
+    crate::rt::spawn_blocking(move || {
+        run_leaf_wood(&progress, &octree_dir, search_radius, min_neighbors,
             linearity_min, planarity_min, scatter_max, smooth_passes)
     })
     .await
@@ -15859,8 +16704,8 @@ pub async fn octree_leaf_wood(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_leaf_wood(
-    window: &Window, octree_dir: &str,
+pub fn run_leaf_wood(
+    progress: &Progress, octree_dir: &str,
     search_radius: f64, min_neighbors: u32,
     linearity_min: f64, planarity_min: f64, scatter_max: f64, smooth_passes: u32,
 ) -> Result<LeafWoodResult, String> {
@@ -15868,7 +16713,7 @@ fn run_leaf_wood(
     let cancel = crate::commands::cancel::token("leafwood");
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "leafwood", 0.0);
+    emit_progress(progress, "leafwood", 0.0);
 
     let (_m, scale, _offset, _b, point_bytes, _e) = open_octree_meta(dir)?;
     if point_bytes < 21 {
@@ -15911,11 +16756,11 @@ fn run_leaf_wood(
             }
             if n_records > 0 && rec_idx % 256 == 0 {
                 if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
-                emit_progress(window, "leafwood", 0.05 + 0.25 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "leafwood", 0.05 + 0.25 * (rec_idx as f32 / n_records as f32));
             }
         }
     }
-    emit_progress(window, "leafwood", 0.3);
+    emit_progress(progress, "leafwood", 0.3);
     if pts.is_empty() {
         return Err("no non-ground points found — classify ground first, or this cloud has none".into());
     }
@@ -15930,7 +16775,7 @@ fn run_leaf_wood(
     for (i, c) in pts.iter().enumerate() {
         grid.entry(pkey(c.x, c.y, c.z)).or_default().push(i as u32);
     }
-    emit_progress(window, "leafwood", 0.4);
+    emit_progress(progress, "leafwood", 0.4);
 
     // ---- 3. Per-point PCA eigen-features → wood(1)/leaf(2) (parallel). ----
     let r2 = (r * r) as f32;
@@ -15971,7 +16816,7 @@ fn run_leaf_wood(
         let (vals, _vecs) = jacobi_eigen_3x3(cov);
         if lw_is_wood(vals[0], vals[1], vals[2], linearity_min, planarity_min, scatter_max) { 1u8 } else { 2u8 }
     }).collect();
-    emit_progress(window, "leafwood", 0.7);
+    emit_progress(progress, "leafwood", 0.7);
 
     // ---- 4. Majority-vote smoothing (ties → wood, so thin branches
     //         don't erode). Each pass reads the previous labels. ----
@@ -15995,7 +16840,7 @@ fn run_leaf_wood(
             if wood >= leaf { 1u8 } else { 2u8 }
         }).collect();
     }
-    emit_progress(window, "leafwood", 0.85);
+    emit_progress(progress, "leafwood", 0.85);
 
     // ---- 5. Write semantic back — same octree order + filter as the
     //         gather, so label[idx] lines up without an address map. ----
@@ -16034,16 +16879,17 @@ fn run_leaf_wood(
                 file.write_all(&block).map_err(|e| format!("write octree.bin: {e}"))?;
             }
             if n_records > 0 && rec_idx % 256 == 0 {
-                emit_progress(window, "leafwood", 0.85 + 0.15 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "leafwood", 0.85 + 0.15 * (rec_idx as f32 / n_records as f32));
             }
         }
         file.flush().map_err(|e| format!("flush octree.bin: {e}"))?;
     }
-    emit_progress(window, "leafwood", 1.0);
+    emit_progress(progress, "leafwood", 1.0);
     Ok(LeafWoodResult { wood_points, leaf_points })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_segment_deadwood(
     window: Window,
@@ -16070,12 +16916,13 @@ pub async fn octree_segment_deadwood(
     // Minimum log length (m) — PCA-axis projected extent. e.g. 0.6.
     min_log_length: f64,
 ) -> Result<DeadwoodResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other.
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_segment_deadwood(
-            &window, &octree_dir, cell_size, hag_min, hag_max,
+            &progress, &octree_dir, cell_size, hag_min, hag_max,
             neighbor_radius, min_linearity, max_axis_verticality,
             cluster_eps, min_cluster_points, min_log_length,
         )
@@ -16094,7 +16941,7 @@ struct DwCand { x: f32, y: f32, z: f32, rec: u32, p: u32 }
 /// every point gets `assign[(rec, p)]` or 0. One streaming rw pass over
 /// octree.bin. Returns the number of points that got a non-zero id.
 fn write_laying_deadwood(
-    window: &Window, dir: &Path, hier: &[u8], n_records: usize,
+    progress: &Progress, dir: &Path, hier: &[u8], n_records: usize,
     point_bytes: usize, ld_off: usize, assign: &FxHashMap<(u32, u32), i32>,
 ) -> Result<u64, String> {
     use std::io::Read;
@@ -16121,7 +16968,7 @@ fn write_laying_deadwood(
         file.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("seek back octree.bin: {e}"))?;
         file.write_all(&block).map_err(|e| format!("write octree.bin block: {e}"))?;
         if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(window, "deadwood", 0.85 + 0.15 * (rec_idx as f32 / n_records as f32));
+            emit_progress(progress, "deadwood", 0.85 + 0.15 * (rec_idx as f32 / n_records as f32));
         }
     }
     file.flush().map_err(|e| format!("flush octree.bin: {e}"))?;
@@ -16356,8 +17203,8 @@ fn segment_logs(pts: &[[f32; 3]], prm: &LogParams, progress: ProgressSink) -> Ve
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_segment_deadwood(
-    window: &Window, octree_dir: &str,
+pub fn run_segment_deadwood(
+    progress: &Progress, octree_dir: &str,
     cell_size: f64, hag_min: f64, hag_max: f64,
     neighbor_radius: f64, min_linearity: f64, max_axis_verticality: f64,
     cluster_eps: f64, min_cluster_points: u32, min_log_length: f64,
@@ -16366,7 +17213,7 @@ fn run_segment_deadwood(
     let cancel = crate::commands::cancel::token("deadwood");
     use std::io::Read;
     let dir = Path::new(octree_dir);
-    emit_progress(window, "deadwood", 0.0);
+    emit_progress(progress, "deadwood", 0.0);
 
     let meta_bytes = std::fs::read(dir.join("metadata.json")).map_err(|e| format!("read metadata.json: {e}"))?;
     let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).map_err(|e| format!("parse metadata.json: {e}"))?;
@@ -16387,7 +17234,7 @@ fn run_segment_deadwood(
     // Bare-earth surface — the height band is relative to it (errors clearly
     // if the cloud isn't classified yet).
     let dtm = build_dtm_grid(dir, cell_size.max(0.05))?;
-    emit_progress(window, "deadwood", 0.15);
+    emit_progress(progress, "deadwood", 0.15);
 
     // ---- 1. Gather candidate points in the HAG band (exclude ground). ----
     let (lo_hag, hi_hag) = if hag_min <= hag_max { (hag_min, hag_max) } else { (hag_max, hag_min) };
@@ -16433,14 +17280,14 @@ fn run_segment_deadwood(
             }
             if n_records > 0 && rec_idx % 256 == 0 {
                 if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
-                emit_progress(window, "deadwood", 0.15 + 0.2 * (rec_idx as f32 / n_records as f32));
+                emit_progress(progress, "deadwood", 0.15 + 0.2 * (rec_idx as f32 / n_records as f32));
             }
         }
     }
-    emit_progress(window, "deadwood", 0.4);
+    emit_progress(progress, "deadwood", 0.4);
     if cands.is_empty() {
-        let assigned = write_laying_deadwood(window, dir, &hier, n_records, point_bytes, ld_off, &FxHashMap::default())?;
-        emit_progress(window, "deadwood", 1.0);
+        let assigned = write_laying_deadwood(progress, dir, &hier, n_records, point_bytes, ld_off, &FxHashMap::default())?;
+        emit_progress(progress, "deadwood", 1.0);
         return Ok(DeadwoodResult { log_count: 0, assigned_points: assigned });
     }
 
@@ -16451,7 +17298,7 @@ fn run_segment_deadwood(
             neighbor_radius, min_linearity, max_axis_verticality,
             cluster_eps, min_cluster_points, min_log_length,
         },
-        &|f| emit_progress(window, "deadwood", 0.4 + 0.35 * f),
+        &|f| emit_progress(progress, "deadwood", 0.4 + 0.35 * f),
     );
     let mut assign: FxHashMap<(u32, u32), i32> = FxHashMap::default();
     let mut final_id = 0i32;
@@ -16463,8 +17310,8 @@ fn run_segment_deadwood(
     }
 
     // ---- 6. Write the laying_deadwood column (overwrite). ----
-    let assigned = write_laying_deadwood(window, dir, &hier, n_records, point_bytes, ld_off, &assign)?;
-    emit_progress(window, "deadwood", 1.0);
+    let assigned = write_laying_deadwood(progress, dir, &hier, n_records, point_bytes, ld_off, &assign)?;
+    emit_progress(progress, "deadwood", 1.0);
     Ok(DeadwoodResult { log_count: final_id as u32, assigned_points: assigned })
 }
 
@@ -16484,7 +17331,7 @@ fn run_segment_deadwood(
 // classified (the DTM gives each point its height above ground).
 // ---------------------------------------------------------------------
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeMetric {
     pub tree_id: i32,
@@ -16526,7 +17373,8 @@ impl TreeAcc {
     }
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_tree_metrics(
     window: Window,
     octree_dir: String,
@@ -16538,8 +17386,9 @@ pub async fn octree_tree_metrics(
     // DTM cell size (m) for the ground surface.
     dtm_cell: f64,
 ) -> Result<Vec<TreeMetric>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_tree_metrics(&|p| emit_progress(&window, "metrics", p),
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_tree_metrics(&|p| emit_progress(&progress, "metrics", p),
             &octree_dir, crown_cell, bh_low, bh_high, dtm_cell)
     })
     .await
@@ -19160,8 +20009,8 @@ mod segmentation_end_to_end {
         let narrow = run_segment_chm(&|_| {}, st.0.to_str().unwrap(), CELL, SMOOTH, MIN_H,
             0.05, 0.0, 0.05).unwrap();
         assert!(narrow.tree_count > 1,
-            "a one-cell window found {} stem(s) — the fixture has no secondary maxima \
-             for the window to resolve, so it is not testing the window",
+            "a one-cell progress found {} stem(s) — the fixture has no secondary maxima \
+             for the progress to resolve, so it is not testing the progress",
             narrow.tree_count);
 
         // …and specifically that the window has to GROW with height. At
@@ -19170,7 +20019,7 @@ mod segmentation_end_to_end {
         let flat = run_segment_chm(&|_| {}, st.0.to_str().unwrap(), CELL, SMOOTH, MIN_H,
             BASE_R, 0.0, MAX_R).unwrap();
         assert!(flat.tree_count > 1,
-            "a window that does not grow with height still found {} stem — then the \
+            "a progress that does not grow with height still found {} stem — then the \
              bosses are inside the base radius and crownRadiusPerM is untested here",
             flat.tree_count);
     }
@@ -20337,7 +21186,7 @@ mod band_tests {
 /// be run from a test — the numbers it produces are the ones a forester
 /// exports, and until this change nothing exercised them end to end.
 /// Same reason `run_export_octree` and `normalize_core` take one.
-fn run_tree_metrics(
+pub fn run_tree_metrics(
     progress: ProgressSink, octree_dir: &str,
     crown_cell: f64, bh_low: f64, bh_high: f64, dtm_cell: f64,
 ) -> Result<Vec<TreeMetric>, String> {
@@ -20597,7 +21446,8 @@ pub struct StemFit {
     pub written_stem_points: u64,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_fit_stems(
     window: Window,
@@ -20616,8 +21466,9 @@ pub async fn octree_fit_stems(
     write_semantic: bool,
     dtm_cell: f64,
 ) -> Result<Vec<StemFit>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_fit_stems(&|p| emit_progress(&window, "stemfit", p),
+    let progress = Progress::window(window, "octree-progress");
+    crate::rt::spawn_blocking(move || {
+        run_fit_stems(&|p| emit_progress(&progress, "stemfit", p),
                       &octree_dir, band_low, band_high, inlier_tol,
                       iterations, min_inliers, write_semantic, dtm_cell)
     })
@@ -20629,7 +21480,7 @@ pub async fn octree_fit_stems(
 /// from a test. This is the diameter that replaces the one the metrics
 /// pass fits, and diameter is squared on its way to basal area.
 #[allow(clippy::too_many_arguments)]
-fn run_fit_stems(
+pub fn run_fit_stems(
     progress: ProgressSink, octree_dir: &str,
     band_low: f64, band_high: f64, inlier_tol: f64,
     iterations: u32, min_inliers: u32, write_semantic: bool,
@@ -20890,7 +21741,7 @@ fn run_fit_stems(
 
 /// Read the persisted stem fits, or None when the fit has never been run
 /// on this dataset. Mirrors `octree_read_qsm`.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_stems(octree_dir: String) -> Result<Option<Vec<StemFit>>, String> {
     let path = Path::new(&octree_dir).join("stems.json");
     if !path.is_file() { return Ok(None); }
@@ -21321,7 +22172,8 @@ pub struct QsmResult {
     pub min_points_per_slice: u32,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_tree_qsm(
     window: Window,
@@ -21353,11 +22205,12 @@ pub async fn octree_tree_qsm(
     // (try 0.05) when the data supports it.
     branch_voxel: Option<f64>,
 ) -> Result<QsmResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let enable = enable_branches.unwrap_or(false);
     let method = branch_method.unwrap_or_else(|| "simple".to_string());
     let voxel = branch_voxel.unwrap_or(0.10).max(0.02);
-    tauri::async_runtime::spawn_blocking(move || {
-        run_tree_qsm(&|p| emit_progress(&window, "qsm", p), &octree_dir,
+    crate::rt::spawn_blocking(move || {
+        run_tree_qsm(&|p| emit_progress(&progress, "qsm", p), &octree_dir,
             slice_height, min_points_per_slice, min_tree_height, dtm_cell, enable, &method, voxel)
     })
     .await
@@ -21370,7 +22223,7 @@ pub async fn octree_tree_qsm(
 /// against a stem whose volume is known — only `integrate_stem_volume`
 /// in isolation, on slices handed to it directly.
 #[allow(clippy::too_many_arguments)]
-fn run_tree_qsm(
+pub fn run_tree_qsm(
     progress: ProgressSink, octree_dir: &str,
     slice_height: f64, min_points_per_slice: u32,
     min_tree_height: f64, dtm_cell: f64,
@@ -22482,7 +23335,7 @@ mod qsm_tests {
 
 /// Load a previously-computed QSM from disk so the Metrics module can
 /// re-list it without re-running. Returns null when no qsm.json exists.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_qsm(octree_dir: String) -> Result<Option<QsmResult>, String> {
     let path = Path::new(&octree_dir).join("qsm.json");
     if !path.is_file() { return Ok(None); }
@@ -22650,7 +23503,8 @@ fn moments_skew_kurt(vals: &[f32]) -> (f64, f64, f64, f64) {
     (mean, sd, g1, g2)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_density_metrics(
     window: Window,
@@ -22665,10 +23519,11 @@ pub async fn octree_density_metrics(
     // octree_terrain's epsg.
     epsg: Option<u32>,
 ) -> Result<DensityMetricsResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let min_h = min_height.unwrap_or(0.2);
     let canopy_h = canopy_threshold.unwrap_or(2.0);
-    tauri::async_runtime::spawn_blocking(move || {
-        run_density_metrics(&|p| emit_progress(&window, "density", p),
+    crate::rt::spawn_blocking(move || {
+        run_density_metrics(&|p| emit_progress(&progress, "density", p),
             &octree_dir, cell_size, min_h, canopy_h, epsg)
     })
     .await
@@ -22678,7 +23533,7 @@ pub async fn octree_density_metrics(
 /// Takes a progress sink rather than a `Window`, so the pass can be run
 /// from a test. It writes twelve rasters and a plot summary the report
 /// prints; both are numbers a forester quotes.
-fn run_density_metrics(
+pub fn run_density_metrics(
     progress: ProgressSink, octree_dir: &str, cell_size: f64,
     min_height: f64, canopy_threshold: f64, epsg: Option<u32>,
 ) -> Result<DensityMetricsResult, String> {
@@ -23027,7 +23882,7 @@ pub struct CaliperMeasurement {
     pub slab_z_max: f64,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_virtual_caliper(
     octree_dir: String,
@@ -23048,7 +23903,7 @@ pub async fn octree_virtual_caliper(
 ) -> Result<CaliperMeasurement, String> {
     let slab_half = slab_half_height.unwrap_or(0.05);
     let search_r = search_radius.unwrap_or(0.50);
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_virtual_caliper(&octree_dir, click_x, click_y, click_z, slab_half, search_r)
     })
     .await
@@ -23252,7 +24107,7 @@ pub struct TreeMeasureResult {
     pub centerline: Vec<CenterlineSample>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_click_to_measure_tree(
     octree_dir: String,
@@ -23277,7 +24132,7 @@ pub async fn octree_click_to_measure_tree(
     let slab_half = slab_half_height.unwrap_or(0.05).clamp(0.01, 0.50);
     let slice = slice_height.unwrap_or(0.50).clamp(0.05, 5.0);
     let dtm_c = dtm_cell.unwrap_or(0.50).clamp(0.05, 5.0);
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_click_to_measure_tree(
             &octree_dir, click_x, click_y, click_z,
             cyl_r, slab_half, slice, dtm_c,
@@ -23697,7 +24552,7 @@ pub struct StemTaperResult {
     pub point_count: u32,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_stem_taper(
     octree_dir: String,
@@ -23724,7 +24579,7 @@ pub async fn octree_stem_taper(
     let slab_half = slab_half_height.unwrap_or(0.05).clamp(0.01, 0.50);
     let stump = stump_height.unwrap_or(0.10).clamp(0.0, 2.0);
     let dtm_c = dtm_cell.unwrap_or(0.50).clamp(0.05, 5.0);
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_stem_taper(
             &octree_dir, click_x, click_y, click_z,
             cyl_r, section, slab_half, stump, dtm_c,
@@ -24134,7 +24989,8 @@ pub struct StemCenterlineResult {
     pub stopped: bool,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_stem_centerlines(
     window: Window,
     octree_dir: String,
@@ -24154,6 +25010,7 @@ pub async fn octree_stem_centerlines(
     // bump instead of the tree base). Default 0.50 m.
     dtm_cell: Option<f64>,
 ) -> Result<StemCenterlineResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // create_input.m's PatchDiam1 = [0.08 0.12]; the eight-model sweep
     // is scaled from the first of those, so 0.08 IS its default set.
     // This was 0.04 — half the reference's cover on every tree.
@@ -24176,16 +25033,16 @@ pub async fn octree_stem_centerlines(
         "a centreline extraction is already running — stop it first, or wait for it to finish"
             .to_string()
     })?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let _run = run;
-        run_stem_centerlines(&window, &octree_dir, r_cov, only_tree_id, min_n, dtm_c)
+        run_stem_centerlines(&progress, &octree_dir, r_cov, only_tree_id, min_n, dtm_c)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_stem_centerlines(
-    window: &Window,
+pub fn run_stem_centerlines(
+    progress: &Progress,
     octree_dir: &str,
     r_cover: f64,
     only_tree_id: Option<i32>,
@@ -24195,7 +25052,7 @@ fn run_stem_centerlines(
     use std::io::Read;
     let dir = Path::new(octree_dir);
     let cancel = crate::commands::cancel::token("centerlines");
-    emit_progress(window, "centerlines", 0.0);
+    emit_progress(progress, "centerlines", 0.0);
     let (_meta, scale, offset, _bbox, point_bytes, _n_extras) = open_octree_meta(dir)?;
     let dtm = build_dtm_grid(dir, dtm_cell)?;
     let hier = std::fs::read(dir.join("hierarchy.bin"))
@@ -24225,7 +25082,7 @@ fn run_stem_centerlines(
             if crate::commands::cancel::stopped(&cancel) {
                 return Err("stopped before any tree was fitted".to_string());
             }
-            emit_progress(window, "centerlines", 0.35 * rec_idx as f32 / n_records.max(1) as f32);
+            emit_progress(progress, "centerlines", 0.35 * rec_idx as f32 / n_records.max(1) as f32);
         }
         let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
         let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
@@ -24275,7 +25132,7 @@ fn run_stem_centerlines(
         // Between trees is where a stop leaves something whole: the
         // trees already fitted are returned, the rest are not attempted.
         if crate::commands::cancel::stopped(&cancel) { stopped = true; break; }
-        emit_progress(window, "centerlines", 0.35 + 0.65 * i as f32 / n_trees as f32);
+        emit_progress(progress, "centerlines", 0.35 + 0.65 * i as f32 / n_trees as f32);
         if (pts.len() as u32) < min_tree_points { continue; }
 
         // TreeQSM's own filter, before anything else touches the
@@ -24324,7 +25181,7 @@ fn run_stem_centerlines(
         });
     }
     out.sort_by_key(|t| t.tree_id);
-    emit_progress(window, "centerlines", 1.0);
+    emit_progress(progress, "centerlines", 1.0);
     Ok(StemCenterlineResult { trees: out, stopped })
 }
 
@@ -24443,7 +25300,8 @@ mod height_frame_tests {
     }
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_skeleton_transfer(
     window: Window,
@@ -24520,6 +25378,7 @@ pub async fn octree_skeleton_transfer(
     // skeleton origin's frame. None matches them where they are.
     alignment: Option<crate::commands::skelalign::AlignmentParam>,
 ) -> Result<SkeletonTransferResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Exclusive for the duration — see lock_dataset for what two
     // concurrent passes over one dataset do to each other. Only the
     // TARGET is written; the baseline is read-only here.
@@ -24547,10 +25406,10 @@ pub async fn octree_skeleton_transfer(
         "a skeleton build or transfer is already running — stop it first, or wait for it to finish"
             .to_string()
     })?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let _run = run;
         run_skeleton_transfer(
-            &window, &baseline_dir, &target_dir,
+            &progress, &baseline_dir, &target_dir,
             dist, spacing, ground, r_cov, min_n, max_n, dtm_c, beyond, base_ground, models, skip_added, drop_fragments,
             baseline_frame, target_frame, alignment,
         )
@@ -24560,8 +25419,8 @@ pub async fn octree_skeleton_transfer(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_skeleton_transfer(
-    window: &Window,
+pub fn run_skeleton_transfer(
+    progress: &Progress,
     baseline_dir: &str, target_dir: &str,
     distance_threshold: f64,
     skeleton_spacing: f64,
@@ -24580,7 +25439,7 @@ fn run_skeleton_transfer(
     alignment: Option<crate::commands::skelalign::AlignmentParam>,
 ) -> Result<SkeletonTransferResult, String> {
     use std::io::Read;
-    emit_progress(window, "tst", 0.0);
+    emit_progress(progress, "tst", 0.0);
 
     // ---- Baseline skeleton: load from cache (skeletons.bin) when
     // present so the same baseline can transfer to many targets
@@ -24598,11 +25457,11 @@ fn run_skeleton_transfer(
                  build the skeletons again to finish it, then transfer",
                 cache.tree_count));
         }
-        emit_progress(window, "tst", 0.65);
+        emit_progress(progress, "tst", 0.65);
         (cache.xyz, cache.tree_id, cache.order, cache.tree_count, cache.origin)
     } else {
         let (built, account) = build_skeleton_from_baseline(
-            window, baseline_dir, skeleton_spacing, r_cover, min_tree_points,
+            progress, baseline_dir, skeleton_spacing, r_cover, min_tree_points,
             max_tree_points, dtm_cell, baseline_ground_threshold, qsm_models, skip_added, drop_fragments, 0.0, 0.70,
         )?;
         if !built.complete {
@@ -24617,7 +25476,7 @@ fn run_skeleton_transfer(
     if skel_xyz.is_empty() {
         return Err("no skeleton points available — build skeletons on the baseline first (Skeleton Transfer panel → Build skeletons), or check baseline segmentation".into());
     }
-    emit_progress(window, "tst", 0.70);
+    emit_progress(progress, "tst", 0.70);
 
     // THE HEIGHT FRAME. A normalised baseline (z = height above ground)
     // against an absolute target (z = elevation) matches nothing: every
@@ -24803,12 +25662,12 @@ fn run_skeleton_transfer(
             }
             tally.lock().unwrap().accumulate(&node);
             if t_n_records > 0 && rec_idx % 256 == 0 {
-                emit_progress(window, "tst", 0.70 + 0.30 * (rec_idx as f32 / t_n_records as f32));
+                emit_progress(progress, "tst", 0.70 + 0.30 * (rec_idx as f32 / t_n_records as f32));
             }
         }
         file.flush().map_err(|e| format!("flush target octree.bin: {e}"))?;
     }
-    emit_progress(window, "tst", 1.0);
+    emit_progress(progress, "tst", 1.0);
     let tally = tally.into_inner().unwrap();
 
     Ok(SkeletonTransferResult {
@@ -24885,7 +25744,8 @@ const MAX_ALIGN_CELLS: usize = 40_000_000;
 /// views can take the skeletons through the transform instead, which
 /// labels the same. The target must have a ground classification; the
 /// baseline's skeletons must be built.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_skeleton_align(
     window: Window,
@@ -24898,6 +25758,7 @@ pub async fn octree_skeleton_align(
     // Also look for a small rotation (±3°). Default on.
     allow_rotation: Option<bool>,
 ) -> Result<StoredAlignment, String> {
+    let progress = Progress::window(window, "octree-progress");
     // Its own stage: the Cloud registration panel's Stop reaches this
     // run and not a skeleton build or transfer, and the other way round.
     let run = crate::commands::cancel::try_begin("align").ok_or_else(|| {
@@ -24906,21 +25767,21 @@ pub async fn octree_skeleton_align(
     let dtm_c = dtm_cell.unwrap_or(0.50).clamp(0.05, 5.0);
     let window_m = search_radius.unwrap_or(30.0).clamp(2.0, 300.0);
     let rotate = allow_rotation.unwrap_or(true);
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let _run = run;
-        run_skeleton_align(&window, &baseline_dir, &target_dir, dtm_c, window_m, rotate)
+        run_skeleton_align(&progress, &baseline_dir, &target_dir, dtm_c, window_m, rotate)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_skeleton_align(
-    window: &Window, baseline_dir: &str, target_dir: &str, dtm_cell: f64, window_m: f64, rotate: bool,
+pub fn run_skeleton_align(
+    progress: &Progress, baseline_dir: &str, target_dir: &str, dtm_cell: f64, window_m: f64, rotate: bool,
 ) -> Result<StoredAlignment, String> {
     use crate::commands::skelalign::*;
     use std::io::Read;
     use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-    emit_progress(window, "align", 0.0);
+    emit_progress(progress, "align", 0.0);
 
     // ---- The skeletons, and each tree's stem and top. ---------------
     let b_dir = Path::new(baseline_dir);
@@ -24971,7 +25832,7 @@ fn run_skeleton_align(
         let s = stem_anchors.iter().fold([0.0, 0.0], |m, a| [m[0] + a[0], m[1] + a[1]]);
         [s[0] / n, s[1] / n]
     };
-    emit_progress(window, "align", 0.05);
+    emit_progress(progress, "align", 0.05);
 
     // ---- The target's verticality and canopy, rasterised. ----------
     let t_dir = Path::new(target_dir);
@@ -25046,7 +25907,7 @@ fn run_skeleton_align(
                     }
                 }
             });
-            if rec_idx % 256 == 0 { emit_progress(window, "align", 0.05 + 0.55 * (rec_idx as f32 / t_n_records.max(1) as f32)); }
+            if rec_idx % 256 == 0 { emit_progress(progress, "align", 0.05 + 0.55 * (rec_idx as f32 / t_n_records.max(1) as f32)); }
         }
     }
     let mut vert = Raster2::new(min_x, min_y, v_cell, v_cols, v_rows);
@@ -25060,7 +25921,7 @@ fn run_skeleton_align(
     if vert.w.iter().all(|&w| w <= 0.0) && tops.w.iter().all(|&w| w <= 0.0) {
         return Err("the target shows no vertical structure between 1 and 9 m above ground and no canopy above 4 m — nothing to align to".into());
     }
-    emit_progress(window, "align", 0.65);
+    emit_progress(progress, "align", 0.65);
 
     // ---- Coarse: the shift, and a small rotation, by vote. ---------
     let thetas: Vec<f64> = if rotate {
@@ -25080,7 +25941,7 @@ fn run_skeleton_align(
         if let Some(pk) = peak(&grid, 3.0) {
             if best.map(|(b, _)| pk.score > b.score).unwrap_or(true) { best = Some((pk, theta)); }
         }
-        emit_progress(window, "align", 0.65 + 0.25 * ((k + 1) as f32 / thetas.len() as f32));
+        emit_progress(progress, "align", 0.65 + 0.25 * ((k + 1) as f32 / thetas.len() as f32));
     }
     let Some((pk, theta)) = best else { return Err("no translation gathered any votes — the two clouds may not overlap within the search radius".into()) };
     let coarse = Rigid2 { theta, dx: pk.dx, dy: pk.dy, cx: centre[0], cy: centre[1] };
@@ -25088,7 +25949,7 @@ fn run_skeleton_align(
 
     // ---- Fine: tree by tree. ----------------------------------------
     let refined = refine(&stem_anchors, &vert, Some((&top_anchors, &tops)), coarse, rotate);
-    emit_progress(window, "align", 1.0);
+    emit_progress(progress, "align", 1.0);
     let r = refined.rigid;
     let stored = StoredAlignment {
         format: ALIGNMENT_FORMAT.into(),
@@ -25115,10 +25976,10 @@ fn chrono_like_now() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default()
 }
 
-/// The stored alignment beside `target_dir`, or None.
-#[tauri::command]
-pub async fn octree_skeleton_alignment_read(target_dir: String) -> Result<Option<StoredAlignment>, String> {
-    let p = Path::new(&target_dir).join(ALIGNMENT_FILE);
+/// The stored alignment beside `target_dir`, or None when there is none
+/// or it is in an older format.
+pub fn read_stored_alignment(target_dir: &str) -> Result<Option<StoredAlignment>, String> {
+    let p = Path::new(target_dir).join(ALIGNMENT_FILE);
     if !p.exists() { return Ok(None); }
     let bytes = std::fs::read(&p).map_err(|e| format!("read {ALIGNMENT_FILE}: {e}"))?;
     let a: StoredAlignment = serde_json::from_slice(&bytes).map_err(|e| format!("parse {ALIGNMENT_FILE}: {e}"))?;
@@ -25127,12 +25988,23 @@ pub async fn octree_skeleton_alignment_read(target_dir: String) -> Result<Option
 }
 
 /// Forget the stored alignment beside `target_dir`. True when there was one.
-#[tauri::command]
-pub async fn octree_skeleton_alignment_clear(target_dir: String) -> Result<bool, String> {
-    let p = Path::new(&target_dir).join(ALIGNMENT_FILE);
+pub fn clear_stored_alignment(target_dir: &str) -> Result<bool, String> {
+    let p = Path::new(target_dir).join(ALIGNMENT_FILE);
     if !p.exists() { return Ok(false); }
     std::fs::remove_file(&p).map_err(|e| format!("remove {ALIGNMENT_FILE}: {e}"))?;
     Ok(true)
+}
+
+/// The stored alignment beside `target_dir`, or None.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_skeleton_alignment_read(target_dir: String) -> Result<Option<StoredAlignment>, String> {
+    read_stored_alignment(&target_dir)
+}
+
+/// Forget the stored alignment beside `target_dir`. True when there was one.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_skeleton_alignment_clear(target_dir: String) -> Result<bool, String> {
+    clear_stored_alignment(&target_dir)
 }
 
 /// What a georeference shift did.
@@ -25157,18 +26029,18 @@ pub struct GeoreferenceShift {
 /// dataset's own skeletons.bin has its origin moved; a stored skeleton
 /// alignment onto this dataset has its remaining offset re-derived; the
 /// terrain cache is dropped (its stamp covers metadata.json too).
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn octree_shift_georeference(
     octree_dir: String, dx: f64, dy: f64, note: Option<String>,
 ) -> Result<GeoreferenceShift, String> {
     if !dx.is_finite() || !dy.is_finite() { return Err("the shift must be finite".into()); }
     let _dataset_guard = lock_dataset(&octree_dir)?;
-    tauri::async_runtime::spawn_blocking(move || shift_georeference_core(Path::new(&octree_dir), dx, dy, note.as_deref()))
+    crate::rt::spawn_blocking(move || shift_georeference_core(Path::new(&octree_dir), dx, dy, note.as_deref()))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
 
-fn shift_georeference_core(dir: &Path, dx: f64, dy: f64, note: Option<&str>) -> Result<GeoreferenceShift, String> {
+pub fn shift_georeference_core(dir: &Path, dx: f64, dy: f64, note: Option<&str>) -> Result<GeoreferenceShift, String> {
     let meta_path = dir.join("metadata.json");
     let bytes = std::fs::read(&meta_path).map_err(|e| format!("read metadata.json: {e}"))?;
     let mut meta: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse metadata.json: {e}"))?;
@@ -26496,7 +27368,7 @@ fn schedule_largest_first(
 /// gets a clean fraction.
 #[allow(clippy::too_many_arguments)]
 fn build_skeleton_from_baseline(
-    window: &Window,
+    progress: &Progress,
     baseline_dir: &str,
     skeleton_spacing: f64,
     r_cover: f64,
@@ -26627,7 +27499,7 @@ fn build_skeleton_from_baseline(
         let mut f = |id: i32, _p: [f64; 3]| { *counts.entry(id).or_insert(0) += 1; };
         scan_baseline(&mut f)?
     };
-    emit_progress(window, "tst", progress_lo + (progress_hi - progress_lo) * 0.30);
+    emit_progress(progress, "tst", progress_lo + (progress_hi - progress_lo) * 0.30);
 
     // Per-tree QSM + skeleton sampling, one tree per core.
     //
@@ -26733,7 +27605,7 @@ fn build_skeleton_from_baseline(
     let tree_cap = if max_tree_points > 0 { max_tree_points as usize } else { auto_tree_cap(budget) };
     let qsm_lo = progress_lo + (progress_hi - progress_lo) * 0.30;
     let qsm_span = (progress_hi - progress_lo) * 0.70;
-    let progress = std::sync::Mutex::new(
+    let tree_progress = std::sync::Mutex::new(
         TreeProgress::new(order.iter().map(|&(_, n)| tree_cost(charged(n as usize, tree_cap)))));
     let cancel = crate::commands::cancel::token("tst");
 
@@ -27026,8 +27898,8 @@ fn build_skeleton_from_baseline(
             let mut last_stall_line = std::time::Instant::now();
             while ticking.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let f = progress.lock().unwrap_or_else(|e| e.into_inner()).fraction();
-                emit_progress(window, "tst", qsm_lo + qsm_span * f);
+                let f = tree_progress.lock().unwrap_or_else(|e| e.into_inner()).fraction();
+                emit_progress(progress, "tst", qsm_lo + qsm_span * f);
                 // WHEN NOTHING FINISHES, SAY WHAT THE RUN IS DOING. Five
                 // minutes without a completion, then a line a minute:
                 // which trees are running and for how long, what the
@@ -27080,12 +27952,12 @@ fn build_skeleton_from_baseline(
             let t0 = std::time::Instant::now();
             let n0 = pts.len();
             let cost = tree_cost(charged(n0, tree_cap));
-            progress.lock().unwrap_or_else(|e| e.into_inner()).start(cost);
+            tree_progress.lock().unwrap_or_else(|e| e.into_inner()).start(cost);
             // Every path out of here from this point on has to hand the
             // cost back, or the bar stalls at whatever this tree's share
             // was — so the two skips below finish it as done.
             if (n0 as u32) < min_tree_points {
-                progress.lock().unwrap_or_else(|e| e.into_inner())
+                tree_progress.lock().unwrap_or_else(|e| e.into_inner())
                     .finish(cost, t0.elapsed());
                 release_tree(&queue, &space, n0, 0);
                 continue;
@@ -27156,7 +28028,7 @@ fn build_skeleton_from_baseline(
                 }
                 crate::crash::log_event("tst-tree-skipped", &format!("tree {tree_id} ({n0} points): {why}; passes: {}", trace.summary()));
                 skipped_trees.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                progress.lock().unwrap_or_else(|e| e.into_inner()).finish_skipped(cost);
+                tree_progress.lock().unwrap_or_else(|e| e.into_inner()).finish_skipped(cost);
                 release_tree(&queue, &space, n0, 0);
                 finished_one();
             };
@@ -27225,7 +28097,7 @@ fn build_skeleton_from_baseline(
                               fragment_points_dropped, height_ratio, skeleton_z_span, cloud_z_span, qsm_csv } = one;
             finished_one();
             if too_small {
-                progress.lock().unwrap_or_else(|e| e.into_inner())
+                tree_progress.lock().unwrap_or_else(|e| e.into_inner())
                     .finish(cost, t0.elapsed());
                 release_tree(&queue, &space, n0, 0);
                 continue;
@@ -27285,7 +28157,7 @@ fn build_skeleton_from_baseline(
             // The reconstruction is what took the time, so this is where
             // the tree stops being "running" — and what it actually took
             // is what calibrates the estimate for the ones still going.
-            progress.lock().unwrap_or_else(|e| e.into_inner())
+            tree_progress.lock().unwrap_or_else(|e| e.into_inner())
                 .finish(cost, t0.elapsed());
             // The reconstruction is over, so its memory is gone and the
             // room it held belongs to whoever is waiting — before the
@@ -27417,7 +28289,7 @@ fn build_skeleton_from_baseline(
         skel_order.extend(order);
         skel_radius.extend(radius);
     }
-    emit_progress(window, "tst", progress_hi);
+    emit_progress(progress, "tst", progress_hi);
 
     // A finished run has nothing to resume from. A stopped one does,
     // so its key stays and the next run with the same settings picks
@@ -27682,7 +28554,8 @@ pub struct SkeletonBuildResult {
 // A Tauri command's arguments ARE its wire format — the panel sends a
 // named object — so grouping them into a struct to satisfy the lint
 // would change the interface for no gain to anyone reading it.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_build_skeletons(
     window: Window,
@@ -27719,6 +28592,7 @@ pub async fn octree_build_skeletons(
     // ON — see far_fragments_with_mask; off gives the reference's input.
     drop_far_fragments: Option<bool>,
 ) -> Result<SkeletonBuildResult, String> {
+    let progress = Progress::window(window, "octree-progress");
     let spacing = skeleton_spacing.unwrap_or(0.02).clamp(0.005, 0.50);
     let r_cov = r_cover.unwrap_or(0.08).clamp(0.01, 0.50);
     // No floor. The reference has no minimum at all —
@@ -27747,63 +28621,83 @@ pub async fn octree_build_skeletons(
         "a skeleton build or transfer is already running — stop it first, or wait for it to finish"
             .to_string()
     })?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let _run = run;
-        let (data, account) = build_skeleton_from_baseline(
-            &window, &baseline_dir, spacing, r_cov, min_n, max_n, dtm_c, ground, models, skip_added, drop_fragments,
-            0.0, 0.95,
-        )?;
-        if data.xyz.is_empty() {
-            // Two very different reasons for an empty result, and the
-            // wrong message sends the user to look at their
-            // segmentation for a stop they asked for themselves.
-            if crate::commands::cancel::was_requested("tst") {
-                return Err("stopped before any tree finished — nothing was saved".into());
-            }
-            return Err("no skeleton points produced — no tree had a usable QSM (lower min_tree_points or check baseline segmentation)".into());
-        }
-        let cache_path = Path::new(&baseline_dir).join("skeletons.bin");
-        let bytes_written = save_skeleton_cache(&cache_path, &data)?;
-        // Full only when the run is. A stopped run's bar stays where the
-        // stop found it instead of announcing a finish that did not happen.
-        if data.complete { emit_progress(&window, "tst", 1.0); }
-
-        // Per-tree summary for the panel header.
-        let mut by_tree: FxHashMap<i32, (u32, [f64; 3], [f64; 3])> = FxHashMap::default();
-        for (i, &tid) in data.tree_id.iter().enumerate() {
-            let q = data.xyz[i];
-            let p = [data.origin[0] + q[0] as f64, data.origin[1] + q[1] as f64, data.origin[2] + q[2] as f64];
-            let e = by_tree.entry(tid).or_insert((0, [f64::INFINITY; 3], [f64::NEG_INFINITY; 3]));
-            e.0 += 1;
-            for a in 0..3 {
-                if p[a] < e.1[a] { e.1[a] = p[a]; }
-                if p[a] > e.2[a] { e.2[a] = p[a]; }
-            }
-        }
-        let mut trees: Vec<SkeletonTreeSummary> = by_tree.into_iter()
-            .map(|(tree_id, (point_count, bbox_min, bbox_max))| SkeletonTreeSummary {
-                tree_id, point_count, bbox_min, bbox_max,
-            })
-            .collect();
-        trees.sort_by_key(|t| t.tree_id);
-
-        Ok(SkeletonBuildResult {
-            tree_count: data.tree_count,
-            point_count: data.xyz.len() as u32,
-            skeleton_spacing: data.skeleton_spacing,
-            bytes_written,
-            trees,
-            complete: data.complete,
-            trees_total: account.trees_total,
-            trees_remaining: account.trees_remaining,
-            qsm_path: {
-                let p = Path::new(&baseline_dir).join(QSM_CSV_FILE);
-                if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-            },
-        })
+        run_build_skeletons(&progress, &baseline_dir, spacing, r_cov, min_n, max_n, dtm_c, ground, models, skip_added, drop_fragments)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Build one TreeQSM skeleton per tree of the baseline and save them to
+/// `skeletons.bin` beside it — the pass behind the Build button and the
+/// catalogue's `skeletons.build`. The caller holds the "tst" run guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_build_skeletons(
+    progress: &Progress,
+    baseline_dir: &str,
+    spacing: f64,
+    r_cov: f64,
+    min_n: u32,
+    max_n: u32,
+    dtm_c: f64,
+    ground: f64,
+    models: usize,
+    skip_added: bool,
+    drop_fragments: bool,
+) -> Result<SkeletonBuildResult, String> {
+    let (data, account) = build_skeleton_from_baseline(
+        progress, baseline_dir, spacing, r_cov, min_n, max_n, dtm_c, ground, models, skip_added, drop_fragments,
+        0.0, 0.95,
+    )?;
+    if data.xyz.is_empty() {
+        // Two very different reasons for an empty result, and the
+        // wrong message sends the user to look at their
+        // segmentation for a stop they asked for themselves.
+        if crate::commands::cancel::was_requested("tst") {
+            return Err("stopped before any tree finished — nothing was saved".into());
+        }
+        return Err("no skeleton points produced — no tree had a usable QSM (lower min_tree_points or check baseline segmentation)".into());
+    }
+    let cache_path = Path::new(baseline_dir).join("skeletons.bin");
+    let bytes_written = save_skeleton_cache(&cache_path, &data)?;
+    // Full only when the run is. A stopped run's bar stays where the
+    // stop found it instead of announcing a finish that did not happen.
+    if data.complete { emit_progress(progress, "tst", 1.0); }
+
+    // Per-tree summary for the panel header.
+    let mut by_tree: FxHashMap<i32, (u32, [f64; 3], [f64; 3])> = FxHashMap::default();
+    for (i, &tid) in data.tree_id.iter().enumerate() {
+        let q = data.xyz[i];
+        let p = [data.origin[0] + q[0] as f64, data.origin[1] + q[1] as f64, data.origin[2] + q[2] as f64];
+        let e = by_tree.entry(tid).or_insert((0, [f64::INFINITY; 3], [f64::NEG_INFINITY; 3]));
+        e.0 += 1;
+        for a in 0..3 {
+            if p[a] < e.1[a] { e.1[a] = p[a]; }
+            if p[a] > e.2[a] { e.2[a] = p[a]; }
+        }
+    }
+    let mut trees: Vec<SkeletonTreeSummary> = by_tree.into_iter()
+        .map(|(tree_id, (point_count, bbox_min, bbox_max))| SkeletonTreeSummary {
+            tree_id, point_count, bbox_min, bbox_max,
+        })
+        .collect();
+    trees.sort_by_key(|t| t.tree_id);
+
+    Ok(SkeletonBuildResult {
+        tree_count: data.tree_count,
+        point_count: data.xyz.len() as u32,
+        skeleton_spacing: data.skeleton_spacing,
+        bytes_written,
+        trees,
+        complete: data.complete,
+        trees_total: account.trees_total,
+        trees_remaining: account.trees_remaining,
+        qsm_path: {
+            let p = Path::new(baseline_dir).join(QSM_CSV_FILE);
+            if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
+        },
+    })
 }
 
 /// What a dataset's cached skeletons are, without reading them.
@@ -27829,7 +28723,7 @@ pub struct SkeletonInfo {
     pub path: String,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_skeleton_info(octree_dir: String) -> Result<Option<SkeletonInfo>, String> {
     let path = Path::new(&octree_dir).join("skeletons.bin");
     let Ok(meta) = std::fs::metadata(&path) else { return Ok(None) };
@@ -27867,7 +28761,7 @@ const SKEL_PLANAR_VERSION: u32 = 3;
 const SKEL_PLANAR_HEADER: usize = 56;
 const SKEL_PLANAR_BYTES_PER_POINT: usize = 19;
 
-fn skeleton_planar_bytes(file: &[u8]) -> Result<Vec<u8>, String> {
+pub fn skeleton_planar_bytes(file: &[u8]) -> Result<Vec<u8>, String> {
     let h = read_skel_header(file)?;
     let n = h.n;
     let mut out = vec![0u8; SKEL_PLANAR_HEADER + n * SKEL_PLANAR_BYTES_PER_POINT];
@@ -27903,7 +28797,8 @@ fn skeleton_planar_bytes(file: &[u8]) -> Result<Vec<u8>, String> {
 /// had just finished. The renderer died there, an hour in, with nothing
 /// on screen to say why. Bytes into an ArrayBuffer sit outside the JS
 /// heap, are a fraction of the size, and are parsed by nobody.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_read_skeletons(octree_dir: String) -> Result<tauri::ipc::Response, String> {
     let path = Path::new(&octree_dir).join("skeletons.bin");
     if !path.exists() {
@@ -27915,7 +28810,7 @@ pub fn octree_read_skeletons(octree_dir: String) -> Result<tauri::ipc::Response,
 
 /// Remove the cached skeletons.bin (the transfer falls back to the
 /// rebuild-from-scratch path next time).
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_clear_skeletons(octree_dir: String) -> Result<bool, String> {
     let path = Path::new(&octree_dir).join("skeletons.bin");
     if !path.exists() { return Ok(false); }
@@ -28157,7 +29052,8 @@ fn write_skeleton_file(
 /// path already decided, so the tests can exercise the writer without
 /// standing up a `tauri::State` — and so there is exactly one line
 /// deciding whether a write is permitted.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub fn octree_export_skeletons(
     state: State<'_, AppState>,
@@ -28188,7 +29084,7 @@ pub fn octree_export_skeletons(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn export_skeletons_to(
+pub fn export_skeletons_to(
     octree_dir: String,
     out_path: String,
     // "csv", "txt", "ply", "las" or "laz". "txt" is the reference's own
@@ -28873,7 +29769,7 @@ pub struct ScanInspectionResult {
     pub color_max: f64,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn octree_scan_inspection(
     octree_dir: String,
@@ -28887,7 +29783,7 @@ pub async fn octree_scan_inspection(
     let az = az_bins.unwrap_or(1024).clamp(64, 4096) as usize;
     let el = el_bins.unwrap_or(512).clamp(32, 2048) as usize;
     let mode = color_mode.unwrap_or_else(|| "range".to_string());
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         run_scan_inspection(&octree_dir, [viewpoint_x, viewpoint_y, viewpoint_z], az, el, &mode)
     })
     .await
@@ -29479,6 +30375,9 @@ mod export_pipeline_tests {
             target_crs: None,
             geoid: None,
             las_14: false,
+            standard_fields: true,
+            text: Default::default(),
+            ply_ascii: false,
         }
     }
 
@@ -29856,13 +30755,13 @@ mod morphology_tests {
         // A radius-2 window spans 5 cells — wider than the tree.
         let wide = open(&with_tree, cols, rows, 2);
         assert!((wide[at(cols, 12, 12)] - 100.0).abs() < 1e-4,
-            "the tree survived a wider window: {}", wide[at(cols, 12, 12)]);
+            "the tree survived a wider progress: {}", wide[at(cols, 12, 12)]);
 
         // A radius-1 window spans 3 — the same width, so its centre
         // still sees only tree.
         let narrow = open(&with_tree, cols, rows, 1);
         assert!(narrow[at(cols, 12, 12)] > 117.0,
-            "a window no wider than the object should not remove its centre: {}",
+            "a progress no wider than the object should not remove its centre: {}",
             narrow[at(cols, 12, 12)]);
     }
 
@@ -30221,9 +31120,9 @@ mod csf_tests {
             }).count()
         };
         assert!(left_standing(10.0) > 0,
-            "a 10 m window must NOT be able to open away a 10 m object");
+            "a 10 m progress must NOT be able to open away a 10 m object");
         assert_eq!(left_standing(15.0), 0,
-            "a 15 m window must open away a 10 m object");
+            "a 15 m progress must open away a 10 m object");
     }
 
     /// What the boundary fix costs, stated rather than hidden.
@@ -30436,7 +31335,8 @@ mod no_ground_tests {
             include_standing_deadwood: false, include_laying_deadwood: false,
             keep_classification: true, keep_intensity: true,
             out_scale: None, extras_to_export: Vec::new(), filter: None,
-            target_crs: None, geoid: None, las_14: false,
+            target_crs: None, geoid: None, las_14: false, standard_fields: true,
+            text: Default::default(), ply_ascii: false,
         };
         let report = run_export_octree_las(
             &(|_p| {}), &dir.to_string_lossy(), &out.to_string_lossy(), &opts,
@@ -32933,5 +33833,1024 @@ mod quantisation_alignment_tests {
         assert!(max_err_old > 1e-5, "this test's premise: the old offset was biased ({max_err_old})");
         // Already aligned: nothing moves.
         assert_eq!(realign_offset(scale, new_offset, &src), new_offset);
+    }
+
+    /// THE SOURCE CHECK LOOKS AT THE GROUND FOOTPRINT, NOT AT Z. The
+    /// dataset's box is the padded cube, so its Z reaches are made up,
+    /// and a header's Z extremes are noise returns and stale headers:
+    /// a plot corrected in an old version was refused because its file
+    /// said Z up to 77.4 m while the 50 m cube stopped at 45.1 — with X
+    /// and Y agreeing to the decimetre.
+    #[test]
+    fn the_source_check_accepts_the_same_plot_whatever_the_header_says_about_z() {
+        let ds_min = [500_000.0, 6_900_000.0, -4.9];
+        let ds_max = [500_050.0, 6_900_050.0, 45.1];
+        let r = source_matches_dataset("2023-03-29_FP08_MLS.laz",
+            [500_000.2, 6_900_000.1, -0.6], [500_049.8, 6_900_049.9, 77.4], ds_min, ds_max);
+        assert!(r.is_ok(), "the refused plot: {r:?}");
+        // Z far below the cube, too.
+        assert!(source_matches_dataset("low.laz", [500_000.2, 6_900_000.1, -300.0], [500_049.8, 6_900_049.9, 40.0], ds_min, ds_max).is_ok());
+        // A file larger than the dataset: the dataset is a crop of it.
+        assert!(source_matches_dataset("big.laz", [499_900.0, 6_899_900.0, 0.0], [500_200.0, 6_900_200.0, 40.0], ds_min, ds_max).is_ok());
+        // A header padded by a metre, as some writers do.
+        assert!(source_matches_dataset("pad.laz", [499_999.0, 6_899_999.0, 0.0], [500_051.0, 6_900_051.0, 40.0], ds_min, ds_max).is_ok());
+        // A file that covers only part of the plot — cleaned harder than the import was.
+        assert!(source_matches_dataset("part.laz", [500_005.0, 6_900_005.0, 0.0], [500_045.0, 6_900_045.0, 40.0], ds_min, ds_max).is_ok());
+    }
+
+    /// A FILE FROM ANOTHER PLOT IS REFUSED BY WHERE IT STANDS, and the
+    /// message names the axis and both extents.
+    #[test]
+    fn a_file_from_another_plot_is_refused_by_its_footprint() {
+        let ds_min = [500_000.0, 6_900_000.0, -4.9];
+        let ds_max = [500_050.0, 6_900_050.0, 45.1];
+        // The same heights, 200 m to the east.
+        let err = source_matches_dataset("FP09.laz", [500_200.0, 6_900_000.0, -0.6], [500_250.0, 6_900_050.0, 40.0], ds_min, ds_max).unwrap_err();
+        assert!(err.starts_with("FP09.laz does not look like this dataset's source"), "{err}");
+        assert!(err.contains("X extent (500200.0..500250.0)") && err.contains("dataset's (500000.0..500050.0)"), "{err}");
+        // Overlapping one corner only is not the same plot.
+        let err = source_matches_dataset("corner.laz", [500_040.0, 6_900_040.0, 0.0], [500_090.0, 6_900_090.0, 40.0], ds_min, ds_max).unwrap_err();
+        assert!(err.contains("does not look like this dataset's source"), "{err}");
+        // Displaced along Y alone: the message says Y.
+        let err = source_matches_dataset("north.laz", [500_000.0, 6_900_035.0, 0.0], [500_050.0, 6_900_085.0, 40.0], ds_min, ds_max).unwrap_err();
+        assert!(err.contains("its Y extent"), "{err}");
+        // An empty header (a writer that never filled the bounds) elsewhere on the map.
+        assert!(source_matches_dataset("zero.laz", [0.0; 3], [0.0; 3], ds_min, ds_max).is_err());
+    }
+}
+
+// =====================================================================
+// Fine registration of one dataset onto another — the Editor's Fine
+// registration panel and the `change.register` / `dataset.transform`
+// operations. The arithmetic is commands::register; this is the dataset
+// side of it: the two clouds read and decimated into one frame, the
+// start (as they stand, a stored skeleton alignment, a manual offset, or
+// an automatic coarse search by stems and crowns), and the moved copy
+// written as a new dataset with every label it had.
+// =====================================================================
+
+use crate::commands::register::{self as reg, Rigid};
+
+/// Where the fine fit starts from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RegisterInitMode {
+    /// As the two datasets stand.
+    Current,
+    /// A coarse search first: the moving cloud's stems and crowns voted onto the reference's, over the search radius and a fan of yaw.
+    Auto,
+    /// The stored skeleton alignment (Cloud registration panel) onto the reference, inverted.
+    Skeleton,
+    /// The offset and yaw given below, about the moving cloud's centre.
+    Manual,
+    /// A global search by surface features (FPFH + RANSAC): any heading, any offset, both clouds whole.
+    Features,
+}
+
+/// The start of the fit, and the automatic search's reach.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisterInit {
+    #[serde(default = "init_current")]
+    pub mode: RegisterInitMode,
+    /// Manual: metres east, north, up.
+    #[serde(default)]
+    pub dx: f64,
+    #[serde(default)]
+    pub dy: f64,
+    #[serde(default)]
+    pub dz: f64,
+    /// Manual: degrees about the vertical, counter-clockwise.
+    #[serde(default)]
+    pub yaw_deg: f64,
+    /// Auto: how far the moving cloud may have to move, metres (default 30).
+    #[serde(default = "f_30")]
+    pub search_radius: f64,
+    /// Auto: the yaw fan, ± degrees (default 5; up to 180 for an unknown heading).
+    #[serde(default = "f_5")]
+    pub yaw_range_deg: f64,
+    /// Auto: the ground cell for the heights above ground, metres (default 0.5).
+    #[serde(default = "f_0_5")]
+    pub dtm_cell: f64,
+    /// Features: the cell the features are computed on, metres (default 0.3).
+    #[serde(default = "f_0_3")]
+    pub feature_voxel: f64,
+    /// Features: transform hypotheses at most (default 50000) — eight per feature pair, the pairs agreeing with the most others first.
+    #[serde(default = "u_50000")]
+    pub feature_iterations: u32,
+}
+
+fn init_current() -> RegisterInitMode { RegisterInitMode::Current }
+fn f_30() -> f64 { 30.0 }
+fn f_5() -> f64 { 5.0 }
+fn f_0_5() -> f64 { 0.5 }
+fn f_0_3() -> f64 { 0.3 }
+fn u_50000() -> u32 { 50_000 }
+
+impl Default for RegisterInit {
+    fn default() -> Self {
+        RegisterInit { mode: init_current(), dx: 0.0, dy: 0.0, dz: 0.0, yaw_deg: 0.0, search_radius: f_30(), yaw_range_deg: f_5(), dtm_cell: f_0_5(), feature_voxel: f_0_3(), feature_iterations: u_50000() }
+    }
+}
+
+/// What the automatic coarse search found.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoarseReport {
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+    pub yaw_deg: f64,
+    /// The vote's peak over its best rival elsewhere: above ~1.3 unambiguous, near 1 a guess.
+    pub confidence: f64,
+    pub stem_anchors: usize,
+    pub top_anchors: usize,
+    /// Trees matched stem to stem by the 2-D refinement.
+    pub matched_trees: usize,
+}
+
+/// A dataset registration: the transform in world coordinates and the
+/// fit's report.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetRegistration {
+    pub reference_dir: String,
+    pub moving_dir: String,
+    pub reference_name: String,
+    pub moving_name: String,
+    /// Moving → reference, world coordinates, row-major 4 × 4.
+    pub matrix: Vec<f64>,
+    /// The start the fit was given, the same way.
+    pub init_matrix: Vec<f64>,
+    pub init_mode: RegisterInitMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse: Option<CoarseReport>,
+    /// What the feature search found, when it was the start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<reg::GlobalReport>,
+    /// The origin the fit's own frame is relative to (the reference's offset).
+    pub origin: [f64; 3],
+    /// The moving cloud's centre in world coordinates — the rotation is about it.
+    pub centre_world: [f64; 3],
+    pub reference_points: usize,
+    pub moving_points: usize,
+    pub report: reg::RegisterReport,
+    pub seconds: f64,
+}
+
+/// Every point of a dataset, edits applied, voxel-decimated to `cell`
+/// and relative to `origin`; `keep` says which world points to read
+/// at all (the overlap).
+fn register_load(
+    dir: &Path, cell: f64, origin: [f64; 3], keep: &dyn Fn([f64; 3]) -> bool,
+    cancel: &std::sync::atomic::AtomicBool, progress: &dyn Fn(f32),
+) -> Result<Vec<[f64; 3]>, String> {
+    use std::io::Read;
+    let (_m, scale, offset, _b, point_bytes, _e) = open_octree_meta(dir)?;
+    let hier = std::fs::read(dir.join("hierarchy.bin")).map_err(|e| format!("read hierarchy.bin: {e}"))?;
+    if hier.len() % 24 != 0 { return Err(format!("hierarchy.bin length {} not a multiple of 24", hier.len())); }
+    let n_records = hier.len() / 24;
+    let patches = parse_export_patches(&dir.join("patches.bin"))?;
+    let inv = 1.0 / cell;
+    let mut vox: FxHashMap<(i32, i32, i32), ([f64; 3], u32)> = FxHashMap::default();
+    let mut bin = BufReader::with_capacity(4 * 1024 * 1024,
+        File::open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin: {e}"))?);
+    let mut block: Vec<u8> = Vec::new();
+    let mut cur_pos: u64 = 0;
+    for rec_idx in 0..n_records {
+        if rec_idx % 64 == 0 {
+            if crate::commands::cancel::stopped(cancel) { return Err("Stopped — nothing was changed.".to_string()); }
+            progress(rec_idx as f32 / n_records.max(1) as f32);
+        }
+        let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
+        let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let byte_size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+        if byte_size == 0 { continue; }
+        let num_points = byte_size / point_bytes;
+        block.resize(byte_size, 0);
+        if byte_offset != cur_pos { bin.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("seek octree.bin: {e}"))?; cur_pos = byte_offset; }
+        bin.read_exact(&mut block).map_err(|e| format!("read octree.bin block: {e}"))?;
+        cur_pos += byte_size as u64;
+        for p in 0..num_points {
+            if let Some(&(_t, _s, del)) = patches.get(&(rec_idx as u32, p as u32)) { if del == 1 { continue; } }
+            let o = p * point_bytes;
+            let xi = i32::from_le_bytes(block[o..o + 4].try_into().unwrap());
+            let yi = i32::from_le_bytes(block[o + 4..o + 8].try_into().unwrap());
+            let zi = i32::from_le_bytes(block[o + 8..o + 12].try_into().unwrap());
+            let w = [xi as f64 * scale[0] + offset[0], yi as f64 * scale[1] + offset[1], zi as f64 * scale[2] + offset[2]];
+            if !keep(w) { continue; }
+            let r = [w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]];
+            let key = ((r[0] * inv).floor() as i32, (r[1] * inv).floor() as i32, (r[2] * inv).floor() as i32);
+            let e = vox.entry(key).or_insert(([0.0; 3], 0));
+            e.0[0] += r[0]; e.0[1] += r[1]; e.0[2] += r[2]; e.1 += 1;
+        }
+    }
+    let mut cells: Vec<((i32, i32, i32), ([f64; 3], u32))> = vox.into_iter().collect();
+    cells.sort_unstable_by_key(|(k, _)| *k);
+    Ok(cells.into_iter().map(|(_, (s, n))| [s[0] / n as f64, s[1] / n as f64, s[2] / n as f64]).collect())
+}
+
+/// A cloud's vertical structure and canopy tops, rasterised in the
+/// `origin` frame over its own extent, and its ground.
+struct StructureRasters {
+    vert: crate::commands::skelalign::Raster2,
+    tops: crate::commands::skelalign::Raster2,
+    dtm: DtmGrid,
+}
+
+fn structure_rasters(
+    dir: &Path, origin: [f64; 3], dtm_cell: f64, cancel: &std::sync::atomic::AtomicBool, progress: &dyn Fn(f32),
+) -> Result<StructureRasters, String> {
+    use crate::commands::skelalign::*;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+    let (meta, scale, offset, _bbox, point_bytes, _extras) = open_octree_meta(dir)?;
+    let dtm = build_dtm_grid(dir, dtm_cell).map_err(|e| format!("{}: ground: {e}", dir.display()))?;
+    let bbox = meta.get("boundingBox").ok_or("metadata.boundingBox missing")?;
+    let bmin = json_f64_3(bbox, "min")?;
+    let bmax = json_f64_3(bbox, "max")?;
+    let (min_x, min_y) = (bmin[0] - origin[0], bmin[1] - origin[1]);
+    let (span_x, span_y) = ((bmax[0] - bmin[0]).max(1.0), (bmax[1] - bmin[1]).max(1.0));
+    let fit_cell = |cell: f64| -> f64 {
+        let mut c = cell;
+        while ((span_x / c).ceil() + 1.0) * ((span_y / c).ceil() + 1.0) > MAX_ALIGN_CELLS as f64 { c *= 2.0; }
+        c
+    };
+    let v_cell = fit_cell(VERT_CELL);
+    let c_cell = fit_cell(CHM_CELL);
+    let v_cols = (span_x / v_cell).ceil() as usize + 1;
+    let v_rows = (span_y / v_cell).ceil() as usize + 1;
+    let c_cols = (span_x / c_cell).ceil() as usize + 1;
+    let c_rows = (span_y / c_cell).ceil() as usize + 1;
+    let masks: Vec<AtomicU16> = (0..v_cols * v_rows).map(|_| AtomicU16::new(0)).collect();
+    let chm_bits: Vec<AtomicU32> = (0..c_cols * c_rows).map(|_| AtomicU32::new(0)).collect();
+    let hier = std::fs::read(dir.join("hierarchy.bin")).map_err(|e| format!("read hierarchy.bin: {e}"))?;
+    if hier.len() % 24 != 0 { return Err(format!("hierarchy.bin length {} not a multiple of 24", hier.len())); }
+    let n_records = hier.len() / 24;
+    let patches = parse_export_patches(&dir.join("patches.bin"))?;
+    let cloud = TargetCloud { patches: &patches, scale, offset, point_bytes, dtm: &dtm };
+    let mut bin = BufReader::with_capacity(4 * 1024 * 1024,
+        File::open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin: {e}"))?);
+    let mut block: Vec<u8> = Vec::new();
+    let mut cur_pos: u64 = 0;
+    for rec_idx in 0..n_records {
+        let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
+        let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let byte_size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+        if byte_size == 0 { continue; }
+        if rec_idx % 64 == 0 {
+            if crate::commands::cancel::stopped(cancel) { return Err("Stopped — nothing was changed.".to_string()); }
+            progress(rec_idx as f32 / n_records.max(1) as f32);
+        }
+        block.resize(byte_size, 0);
+        if byte_offset != cur_pos { bin.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("seek octree.bin: {e}"))?; cur_pos = byte_offset; }
+        bin.read_exact(&mut block).map_err(|e| format!("read octree.bin: {e}"))?;
+        cur_pos += byte_size as u64;
+        block.par_chunks(point_bytes).enumerate().for_each(|(p, pt)| {
+            let Some(d) = cloud.decode(rec_idx, p, pt) else { return };
+            let x = d.wx - origin[0];
+            let y = d.wy - origin[1];
+            if let Some(layer) = vert_layer(d.hag) {
+                let cx = ((x - min_x) / v_cell).floor();
+                let cy = ((y - min_y) / v_cell).floor();
+                if cx >= 0.0 && cy >= 0.0 && (cx as usize) < v_cols && (cy as usize) < v_rows {
+                    masks[cy as usize * v_cols + cx as usize].fetch_or(1u16 << layer, Ordering::Relaxed);
+                }
+            }
+            if d.hag >= 2.0 {
+                let cx = ((x - min_x) / c_cell).floor();
+                let cy = ((y - min_y) / c_cell).floor();
+                if cx >= 0.0 && cy >= 0.0 && (cx as usize) < c_cols && (cy as usize) < c_rows {
+                    chm_bits[cy as usize * c_cols + cx as usize].fetch_max((d.hag as f32).to_bits(), Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    let mut vert = Raster2::new(min_x, min_y, v_cell, v_cols, v_rows);
+    {
+        let m: Vec<u16> = masks.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        verticality_weights(&m, &mut vert.w);
+    }
+    let mut chm = Raster2::new(min_x, min_y, c_cell, c_cols, c_rows);
+    for (i, a) in chm_bits.iter().enumerate() { chm.w[i] = f32::from_bits(a.load(Ordering::Relaxed)); }
+    let tops = canopy_tops(&chm, 4.0, 3);
+    Ok(StructureRasters { vert, tops, dtm })
+}
+
+/// The strongest local maxima of a raster, as anchors (centre x, y):
+/// a stem's cell among its eight neighbours. At most `max` of them.
+fn raster_peaks(r: &crate::commands::skelalign::Raster2, max: usize) -> Vec<[f64; 2]> {
+    let mut peaks: Vec<(f32, usize)> = Vec::new();
+    for row in 0..r.rows as i64 {
+        for col in 0..r.cols as i64 {
+            let i = row as usize * r.cols + col as usize;
+            let w = r.w[i];
+            if w <= 0.0 { continue; }
+            let mut top = true;
+            'n: for dr in -1..=1i64 { for dc in -1..=1i64 {
+                if dr == 0 && dc == 0 { continue; }
+                let (rr, cc) = (row + dr, col + dc);
+                if rr < 0 || cc < 0 || rr >= r.rows as i64 || cc >= r.cols as i64 { continue; }
+                let o = r.w[rr as usize * r.cols + cc as usize];
+                if o > w || (o == w && (dr < 0 || (dr == 0 && dc < 0))) { top = false; break 'n; }
+            } }
+            if top { peaks.push((w, i)); }
+        }
+    }
+    peaks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    peaks.truncate(max);
+    peaks.into_iter().map(|(_, i)| { let (x, y) = r.centre(i); [x, y] }).collect()
+}
+
+/// The automatic coarse search: the moving cloud's stems and crown tops
+/// voted onto the reference's over the search window and a fan of yaw
+/// (the skeleton alignment's vote, with the moving cloud's own structure
+/// in place of skeletons), refined stem to stem, and the height from
+/// the two grounds. In the `origin` frame.
+fn coarse_search(
+    reference: &StructureRasters, moving: &StructureRasters, origin: [f64; 3], init: &RegisterInit,
+    cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(f32) + Sync),
+) -> Result<(Rigid, CoarseReport), String> {
+    use crate::commands::skelalign::*;
+    const MAX_ANCHORS: usize = 3000;
+    let stem_anchors = raster_peaks(&moving.vert, MAX_ANCHORS);
+    let top_anchors = raster_peaks(&moving.tops, MAX_ANCHORS);
+    if stem_anchors.len() + top_anchors.len() < 3 {
+        return Err("the moving dataset shows no vertical structure between 1 and 9 m above ground and no canopy above 4 m — nothing to search with; start from a manual offset instead".into());
+    }
+    let ref_vert = reference.vert.nonzero();
+    let ref_tops = reference.tops.nonzero();
+    if ref_vert.is_empty() && ref_tops.is_empty() {
+        return Err("the reference shows no vertical structure and no canopy — nothing to search in".into());
+    }
+    let all: Vec<[f64; 2]> = stem_anchors.iter().chain(top_anchors.iter()).cloned().collect();
+    let centre = {
+        let n = all.len() as f64;
+        let s = all.iter().fold([0.0, 0.0], |m, a| [m[0] + a[0], m[1] + a[1]]);
+        [s[0] / n, s[1] / n]
+    };
+    let window = init.search_radius.max(1.0);
+    let range = init.yaw_range_deg.clamp(0.0, 180.0);
+    let step = if range <= 10.0 { 0.25 } else { 1.0 };
+    let n_steps = (range / step).round() as i64;
+    let thetas: Vec<f64> = (-n_steps..=n_steps).map(|k| (k as f64 * step).to_radians()).collect();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Option<(Peak, f64)>> = thetas.par_iter().map(|&theta| {
+        if crate::commands::cancel::stopped(cancel) { return None; }
+        let r = Rigid2 { theta, dx: 0.0, dy: 0.0, cx: centre[0], cy: centre[1] };
+        let mut grid = vote_cells(&stem_anchors, &ref_vert, window, 0.2, &r);
+        let top_grid = vote_cells(&top_anchors, &ref_tops, window, 0.2, &r);
+        let m = grid.max();
+        if m > 0.0 { for v in &mut grid.v { *v /= m; } }
+        grid.add_normalised(&top_grid);
+        let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        progress((k + 1) as f32 / thetas.len() as f32);
+        peak(&grid, 3.0).map(|p| (p, theta))
+    }).collect();
+    if crate::commands::cancel::stopped(cancel) { return Err("Stopped — nothing was changed.".to_string()); }
+    let mut best: Option<(Peak, f64)> = None;
+    for r in results.into_iter().flatten() {
+        if best.map(|(b, _)| r.0.score > b.score).unwrap_or(true) { best = Some(r); }
+    }
+    let Some((pk, theta)) = best else { return Err("no translation gathered any votes — the two clouds may not overlap within the search radius".into()) };
+    let coarse = Rigid2 { theta, dx: pk.dx, dy: pk.dy, cx: centre[0], cy: centre[1] };
+    let confidence = if pk.second > 0.0 { (pk.score / pk.second) as f64 } else { f64::INFINITY };
+    let refined = refine(&stem_anchors, &reference.vert, Some((&top_anchors, &reference.tops)), coarse, range > 0.0);
+    let r2 = if refined.matched >= 3 { refined.rigid } else { coarse };
+    // The height: the median difference of the two grounds where the
+    // moved anchors land on reference ground.
+    let mut dz: Vec<f64> = all.iter().filter_map(|a| {
+        let (x, y) = r2.apply(a[0], a[1]);
+        // The DTMs are in world coordinates; the rasters' frame is the
+        // origin's, a shift away.
+        let g_mov = moving.dtm.sample(a[0] + origin[0], a[1] + origin[1])?;
+        let g_ref = reference.dtm.sample(x + origin[0], y + origin[1])?;
+        Some(g_ref as f64 - g_mov as f64)
+    }).collect();
+    let dz = if dz.is_empty() { 0.0 } else {
+        let mid = dz.len() / 2;
+        let (_, m, _) = dz.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        *m
+    };
+    let rigid = Rigid::about(reg::exp_so3([0.0, 0.0, r2.theta]), [r2.dx, r2.dy, dz], [r2.cx, r2.cy, 0.0]);
+    Ok((rigid, CoarseReport {
+        dx: r2.dx, dy: r2.dy, dz, yaw_deg: r2.theta.to_degrees(),
+        confidence: if confidence.is_finite() { confidence } else { 99.0 },
+        stem_anchors: stem_anchors.len(), top_anchors: top_anchors.len(), matched_trees: refined.matched,
+    }))
+}
+
+/// Dataset `dir`'s name and bounding box from its metadata.
+fn dataset_name_and_bbox(dir: &Path) -> Result<(String, [f64; 3], [f64; 3], serde_json::Value), String> {
+    let (meta, _s, _o, bbox, _pb, _e) = open_octree_meta(dir)?;
+    let name = meta.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .unwrap_or_else(|| dir.file_name().and_then(|n| n.to_str()).unwrap_or("dataset").to_string());
+    Ok((name, bbox.min, bbox.max, meta))
+}
+
+fn same_dir(a: &str, b: &str) -> bool {
+    if a == b { return true; }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The eight corners of a box through a transform, as a box.
+fn transformed_bbox(t: &Rigid, min: [f64; 3], max: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for k in 0..8 {
+        let c = [
+            if k & 1 == 0 { min[0] } else { max[0] },
+            if k & 2 == 0 { min[1] } else { max[1] },
+            if k & 4 == 0 { min[2] } else { max[2] },
+        ];
+        let p = t.apply(c);
+        for a in 0..3 { lo[a] = lo[a].min(p[a]); hi[a] = hi[a].max(p[a]); }
+    }
+    (lo, hi)
+}
+
+fn inside(p: [f64; 3], lo: [f64; 3], hi: [f64; 3], margin: f64) -> bool {
+    (0..3).all(|a| p[a] >= lo[a] - margin && p[a] <= hi[a] + margin)
+}
+
+/// Register `moving_dir` onto `reference_dir`: the start as asked, the
+/// two clouds read and decimated into the reference offset's frame over
+/// their overlap, the fit, and the transform carried to world
+/// coordinates. Nothing is written — see `run_transform_dataset`.
+pub fn run_register(
+    progress: &Progress, reference_dir: &str, moving_dir: &str, init: &RegisterInit, params: &reg::RegisterParams,
+) -> Result<DatasetRegistration, String> {
+    let started = std::time::Instant::now();
+    params.validate()?;
+    if same_dir(reference_dir, moving_dir) {
+        return Err("the reference and the moving dataset are the same — pick two datasets".into());
+    }
+    if !(init.search_radius > 0.0 && init.search_radius.is_finite()) { return Err("searchRadius must be positive".into()); }
+    if !(init.dtm_cell > 0.0 && init.dtm_cell.is_finite()) { return Err("dtmCell must be positive".into()); }
+    if !(init.feature_voxel > 0.0 && init.feature_voxel.is_finite()) { return Err("featureVoxel must be positive".into()); }
+    if ![init.dx, init.dy, init.dz, init.yaw_deg, init.yaw_range_deg].iter().all(|v| v.is_finite()) {
+        return Err("the start must be finite".into());
+    }
+    let cancel = crate::commands::cancel::token("register");
+    emit_progress(progress, "register", 0.0);
+    let r_dir = Path::new(reference_dir);
+    let m_dir = Path::new(moving_dir);
+    let (reference_name, r_min, r_max, r_meta) = dataset_name_and_bbox(r_dir)?;
+    let (moving_name, m_min, m_max, _m_meta) = dataset_name_and_bbox(m_dir)?;
+    let origin = json_f64_3(&r_meta, "offset")?;
+    let rel = |p: [f64; 3]| [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let m_centre_rel = rel([(m_min[0] + m_max[0]) * 0.5, (m_min[1] + m_max[1]) * 0.5, (m_min[2] + m_max[2]) * 0.5]);
+
+    // ---- The start, in the origin's frame. ----------------------------
+    let mut coarse: Option<CoarseReport> = None;
+    let mut global: Option<reg::GlobalReport> = None;
+    let init_rigid: Rigid = match init.mode {
+        RegisterInitMode::Current => Rigid::IDENTITY,
+        RegisterInitMode::Manual => Rigid::about(reg::exp_so3([0.0, 0.0, init.yaw_deg.to_radians()]), [init.dx, init.dy, init.dz], m_centre_rel),
+        RegisterInitMode::Skeleton => {
+            let a = read_stored_alignment(moving_dir)?
+                .ok_or("the moving dataset has no stored skeleton alignment — measure one in the Cloud registration panel, or start another way")?;
+            if !same_dir(&a.baseline_dir, reference_dir) {
+                return Err(format!("the stored alignment is against {}, not the reference chosen", a.baseline_dir));
+            }
+            // From the reference's skeletons onto the moving cloud's
+            // trees, in the skeleton origin's frame: the moving cloud
+            // goes the other way.
+            let inv = a.param().rigid().inverse();
+            let centre = [inv.cx + a.origin[0] - origin[0], inv.cy + a.origin[1] - origin[1], 0.0];
+            Rigid::about(reg::exp_so3([0.0, 0.0, inv.theta]), [inv.dx, inv.dy, 0.0], centre)
+        }
+        RegisterInitMode::Auto => {
+            let r_ras = structure_rasters(r_dir, origin, init.dtm_cell, &cancel, &|p| emit_progress(progress, "register", 0.04 * p))?;
+            let m_ras = structure_rasters(m_dir, origin, init.dtm_cell, &cancel, &|p| emit_progress(progress, "register", 0.04 + 0.04 * p))?;
+            let (rigid, report) = coarse_search(&r_ras, &m_ras, origin, init, &cancel, &|p| emit_progress(progress, "register", 0.08 + 0.04 * p))?;
+            coarse = Some(report);
+            rigid
+        }
+        RegisterInitMode::Features => {
+            // Both clouds whole, at the feature cell: nothing is known
+            // about where they stand.
+            let r_all = register_load(r_dir, init.feature_voxel, origin, &|_| true, &cancel, &|p| emit_progress(progress, "register", 0.02 * p))?;
+            let m_all = register_load(m_dir, init.feature_voxel, origin, &|_| true, &cancel, &|p| emit_progress(progress, "register", 0.02 + 0.02 * p))?;
+            let gp = reg::GlobalParams { voxel: init.feature_voxel, iterations: init.feature_iterations, ..reg::GlobalParams::default() };
+            let (rigid, report) = reg::global_align(&r_all, &m_all, &gp, &|p| {
+                emit_progress(progress, "register", 0.04 + 0.08 * p);
+                !crate::commands::cancel::stopped(&cancel)
+            }).map_err(|e| if e == "stopped" { "Stopped — nothing was changed.".to_string() } else { e })?;
+            global = Some(report);
+            rigid
+        }
+    };
+    emit_progress(progress, "register", 0.12);
+
+    // ---- The two clouds, over their overlap. ----------------------------
+    // A point the other cloud cannot reach — outside its box by more than
+    // a correspondence can span after the start — is never a pair, so it
+    // is not read. For two scans of one plot that is nothing; for a long
+    // MLS walk through a TLS plot it is most of the walk.
+    let margin = params.max_corr_dist + params.voxel;
+    let (mm_lo, mm_hi) = transformed_bbox(&init_rigid, rel(m_min), rel(m_max));
+    let (rr_lo, rr_hi) = (rel(r_min), rel(r_max));
+    let ref_pts = register_load(r_dir, params.voxel, origin, &|w| inside(rel(w), mm_lo, mm_hi, margin), &cancel,
+        &|p| emit_progress(progress, "register", 0.12 + 0.2 * p))?;
+    let mov_pts = register_load(m_dir, params.voxel, origin, &|w| inside(init_rigid.apply(rel(w)), rr_lo, rr_hi, margin), &cancel,
+        &|p| emit_progress(progress, "register", 0.32 + 0.2 * p))?;
+    if ref_pts.len() < 10 || mov_pts.len() < 10 {
+        return Err(format!(
+            "the datasets do not overlap from this start (reference {} points, moving {} within reach) — start closer, or let the automatic search find the offset",
+            ref_pts.len(), mov_pts.len()
+        ));
+    }
+    emit_progress(progress, "register", 0.52);
+
+    // ---- The fit. ----------------------------------------------------------
+    let report = reg::register(&ref_pts, &mov_pts, init_rigid, params, &|p| {
+        emit_progress(progress, "register", 0.52 + 0.47 * p);
+        !crate::commands::cancel::stopped(&cancel)
+    }).map_err(|e| if e == "stopped" { "Stopped — nothing was changed.".to_string() } else { e })?;
+    emit_progress(progress, "register", 1.0);
+    let world = report.transform.shifted_frame(origin);
+    let centre_world = [report.centre[0] + origin[0], report.centre[1] + origin[1], report.centre[2] + origin[2]];
+    Ok(DatasetRegistration {
+        reference_dir: reference_dir.to_string(),
+        moving_dir: moving_dir.to_string(),
+        reference_name,
+        moving_name,
+        matrix: world.to_mat4(),
+        init_matrix: init_rigid.shifted_frame(origin).to_mat4(),
+        init_mode: init.mode,
+        coarse,
+        global,
+        origin,
+        centre_world,
+        reference_points: ref_pts.len(),
+        moving_points: mov_pts.len(),
+        report,
+        seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+/// Write `src_dir` moved by `matrix` (world, row-major 4 × 4) as a new
+/// dataset at `out_dir`: every point through the transform and
+/// re-quantised on a fresh millimetre grid, every edit baked in (deleted
+/// points gone, tree ids and semantic labels and deadwood overrides
+/// applied, the tree-id merge map applied), every extra column kept, the
+/// CRS carried, the species and review sidecars copied, and
+/// `registration` recorded in the new metadata.json with the matrix and
+/// whatever `record` says about where it came from. The plot boundary is
+/// not copied: a rectangle cannot rotate.
+pub fn run_transform_dataset(
+    progress: &Progress, src_dir: &str, out_dir: &str, name: &str, matrix: &[f64], record: Option<serde_json::Value>,
+) -> Result<OctreeImportResult, String> {
+    use std::io::Read;
+    let transform = Rigid::from_mat4(matrix)?;
+    let cancel = crate::commands::cancel::token("transform");
+    let started = std::time::Instant::now();
+    let dir = Path::new(src_dir);
+    let out_path = PathBuf::from(out_dir);
+    if same_dir(src_dir, out_dir) { return Err("the moved copy cannot overwrite its source".into()); }
+    create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
+    emit_progress(progress, "transform", 0.0);
+
+    let (meta, scale, offset, bbox, point_bytes, n_extras) = open_octree_meta(dir)?;
+    let root_spacing_src = meta.get("rootSpacing").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1e-6);
+    let max_depth = meta.get("maxDepth").and_then(|v| v.as_u64()).unwrap_or(14) as u32;
+    let scanner_type = meta.get("scannerType").and_then(|v| v.as_str()).unwrap_or("other").to_string();
+    let cols = extra_layout(&meta);
+    if layout_stride(&cols) != point_bytes {
+        return Err(format!("metadata.pointBytes {point_bytes} disagrees with the {n_extras} extras declared"));
+    }
+    let standing_dw_off = extra_byte_offset(&meta, STANDING_DEADWOOD_NAME);
+    let laying_dw_off = extra_byte_offset(&meta, LAYING_DEADWOOD_NAME);
+
+    // The new box: the old one through the transform, cubed like a
+    // fresh import; the new grid on its corner at the finer of a
+    // millimetre and what the extent allows.
+    let (lo, hi) = transformed_bbox(&transform, bbox.min, bbox.max);
+    let cube = Aabb { min: lo, max: hi }.cube_around();
+    let new_scale = choose_scale(cube);
+    let new_offset = cube.min;
+    let root_spacing = (cube.max[0] - cube.min[0]).max(1e-6);
+    let _ = root_spacing_src;
+
+    let hier = std::fs::read(dir.join("hierarchy.bin")).map_err(|e| format!("read hierarchy.bin: {e}"))?;
+    if hier.len() % 24 != 0 { return Err(format!("hierarchy.bin length {} not a multiple of 24", hier.len())); }
+    let n_records = hier.len() / 24;
+    let ExportPatches { main: patches, deadwood: dw_patches } = parse_export_patches_full(&dir.join("patches.bin"))?;
+    let remap = parse_remap(&dir.join("treemap.json"))?;
+
+    let inv_cell = [
+        GRID_SIZE as f64 / (cube.max[0] - cube.min[0]).max(1e-9),
+        GRID_SIZE as f64 / (cube.max[1] - cube.min[1]).max(1e-9),
+        GRID_SIZE as f64 / (cube.max[2] - cube.min[2]).max(1e-9),
+    ];
+    let stride = point_bytes;
+    let mut chunks: Vec<Vec<u8>> = (0..GRID_CUBED).map(|_| Vec::new()).collect();
+    let mut extras_minmax: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); n_extras];
+    let mut intensity_minmax: (u16, u16) = (u16::MAX, 0);
+    let mut kept: u64 = 0;
+    let mut bin = BufReader::with_capacity(4 * 1024 * 1024,
+        File::open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin: {e}"))?);
+    let mut block: Vec<u8> = Vec::new();
+    let mut cur_pos: u64 = 0;
+    let mut packed = vec![0u8; stride];
+
+    for rec_idx in 0..n_records {
+        let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
+        let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let byte_size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+        if byte_size == 0 { continue; }
+        let num_points = byte_size / point_bytes;
+        block.resize(byte_size, 0);
+        if byte_offset != cur_pos {
+            bin.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("seek octree.bin: {e}"))?;
+            cur_pos = byte_offset;
+        }
+        bin.read_exact(&mut block).map_err(|e| format!("read octree.bin block: {e}"))?;
+        cur_pos += byte_size as u64;
+        for p in 0..num_points {
+            let o = p * point_bytes;
+            let mut tree_id = i32::from_le_bytes(block[o + 12..o + 16].try_into().unwrap());
+            let mut sem = if point_bytes >= 21 { block[o + 20] } else { 0 };
+            if let Some(&(p_tree, p_sem, p_del)) = patches.get(&(rec_idx as u32, p as u32)) {
+                if p_del == 1 { continue; }
+                if p_tree >= 0 { tree_id = p_tree; }
+                if p_sem != 0 { sem = if p_sem == 3 { 0 } else { p_sem }; }
+            }
+            if let Some(&to) = remap.get(&tree_id) { tree_id = to; }
+            let xi = i32::from_le_bytes(block[o..o + 4].try_into().unwrap());
+            let yi = i32::from_le_bytes(block[o + 4..o + 8].try_into().unwrap());
+            let zi = i32::from_le_bytes(block[o + 8..o + 12].try_into().unwrap());
+            let w = transform.apply([xi as f64 * scale[0] + offset[0], yi as f64 * scale[1] + offset[1], zi as f64 * scale[2] + offset[2]]);
+            let nxi = ((w[0] - new_offset[0]) / new_scale[0]).round() as i32;
+            let nyi = ((w[1] - new_offset[1]) / new_scale[1]).round() as i32;
+            let nzi = ((w[2] - new_offset[2]) / new_scale[2]).round() as i32;
+            packed[..stride].copy_from_slice(&block[o..o + stride]);
+            packed[0..4].copy_from_slice(&nxi.to_le_bytes());
+            packed[4..8].copy_from_slice(&nyi.to_le_bytes());
+            packed[8..12].copy_from_slice(&nzi.to_le_bytes());
+            packed[12..16].copy_from_slice(&tree_id.to_le_bytes());
+            if stride >= 21 { packed[20] = sem; }
+            if let Some(&(sd, ld)) = dw_patches.get(&(rec_idx as u32, p as u32)) {
+                if sd >= 0 { if let Some(off) = standing_dw_off { packed[off..off + 4].copy_from_slice(&(sd as f32).to_le_bytes()); } }
+                if ld >= 0 { if let Some(off) = laying_dw_off { packed[off..off + 4].copy_from_slice(&(ld as f32).to_le_bytes()); } }
+            }
+            for (c, mm) in cols.iter().zip(extras_minmax.iter_mut()) {
+                minmax_fold(mm, c.read(&packed));
+            }
+            let intensity = u16::from_le_bytes(block[o + 16..o + 18].try_into().unwrap());
+            intensity_minmax.0 = intensity_minmax.0.min(intensity);
+            intensity_minmax.1 = intensity_minmax.1.max(intensity);
+            let cx = (((w[0] - cube.min[0]) * inv_cell[0]) as usize).min(GRID_SIZE - 1);
+            let cy = (((w[1] - cube.min[1]) * inv_cell[1]) as usize).min(GRID_SIZE - 1);
+            let cz = (((w[2] - cube.min[2]) * inv_cell[2]) as usize).min(GRID_SIZE - 1);
+            let idx = (cz * GRID_SIZE + cy) * GRID_SIZE + cx;
+            chunks[idx].extend_from_slice(&packed[..stride]);
+            kept += 1;
+        }
+        if n_records > 0 && rec_idx % 256 == 0 {
+            if crate::commands::cancel::stopped(&cancel) { let _ = std::fs::remove_dir_all(&out_path); return Err("Stopped — the partial dataset was removed.".to_string()); }
+            emit_progress(progress, "transform", 0.5 * (rec_idx as f32 / n_records as f32));
+        }
+    }
+    emit_progress(progress, "transform", 0.5);
+    if kept == 0 {
+        let _ = std::fs::remove_dir_all(&out_path);
+        return Err("the dataset has no points left after its edits".into());
+    }
+    let extras_report: Vec<ExtraColumnReport> = cols.iter().zip(extras_minmax).map(|(c, (lo, hi))| {
+        let (lo, hi) = minmax_report(lo, hi);
+        ExtraColumnReport { name: c.name.clone(), min: lo, max: hi, kind: c.kind }
+    }).collect();
+    let intensity_range = if intensity_minmax.0 < intensity_minmax.1 { Some(intensity_minmax) } else { None };
+    let (tiles, _bytes) = phase23_build_write(
+        ChunkSource::Mem(chunks), cube, new_scale, new_offset, root_spacing, max_depth, stride, &out_path,
+        &|stage, p| emit_progress(progress, stage, p),
+    )?;
+    let total_stored: u64 = tiles.iter().map(|t| t.point_count).sum();
+    write_metadata(
+        &out_path, name, total_stored, cube, new_scale, new_offset, root_spacing, max_depth, &scanner_type, &tiles,
+        &extras_report, intensity_range, Some(&meta),
+    ).map_err(|e| format!("write metadata: {e}"))?;
+
+    // The record of the move, in the new dataset's own metadata.
+    {
+        let meta_path = out_path.join("metadata.json");
+        let bytes = std::fs::read(&meta_path).map_err(|e| format!("read metadata.json: {e}"))?;
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse metadata.json: {e}"))?;
+        let mut rec = record.unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert("matrix".into(), serde_json::json!(matrix));
+            obj.insert("sourceDir".into(), serde_json::json!(src_dir));
+            obj.insert("sourceName".into(), meta.get("name").cloned().unwrap_or(serde_json::Value::Null));
+            obj.insert("at".into(), serde_json::json!(unix_seconds()));
+        }
+        if let Some(obj) = json.as_object_mut() { obj.insert("registration".into(), rec); }
+        let text = serde_json::to_vec_pretty(&json).map_err(|e| format!("serialise metadata.json: {e}"))?;
+        write_file_atomic(&meta_path, &text, "metadata.json")?;
+    }
+    // The sidecars keyed by tree id come along; the merge map was baked.
+    for sidecar in ["species.json", "review.json"] {
+        let from = dir.join(sidecar);
+        if from.exists() { let _ = std::fs::copy(&from, out_path.join(sidecar)); }
+    }
+    emit_progress(progress, "transform", 1.0);
+    Ok(OctreeImportResult {
+        out_dir: out_path.to_string_lossy().into_owned(),
+        point_count: total_stored,
+        tile_count: tiles.len(),
+        bbox_min: cube.min,
+        bbox_max: cube.max,
+        scale: new_scale,
+        offset: new_offset,
+        root_spacing,
+        max_depth,
+        duration_ms: started.elapsed().as_millis() as u64,
+        tree_id_range: None,
+    })
+}
+
+/// Register one dataset onto another — the Fine registration panel's
+/// Measure. Reports; writes nothing.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_register(
+    window: Window, reference_dir: String, moving_dir: String, init: RegisterInit, params: reg::RegisterParams,
+) -> Result<DatasetRegistration, String> {
+    let progress = Progress::window(window, "octree-progress");
+    let run = crate::commands::cancel::try_begin("register").ok_or_else(|| {
+        "a registration is already running — stop it first, or wait for it to finish".to_string()
+    })?;
+    crate::rt::spawn_blocking(move || {
+        let _run = run;
+        run_register(&progress, &reference_dir, &moving_dir, &init, &params)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Write a dataset moved by a rigid transform as a new dataset — the
+/// Fine registration panel's Apply, and `dataset.transform`.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_transform_dataset(
+    window: Window, octree_dir: String, out_dir: String, name: String, matrix: Vec<f64>, record: Option<serde_json::Value>,
+) -> Result<OctreeImportResult, String> {
+    let progress = Progress::window(window, "octree-progress");
+    let run = crate::commands::cancel::try_begin("transform").ok_or_else(|| {
+        "a moved copy is already being written — wait for it to finish".to_string()
+    })?;
+    if Path::new(&out_dir).exists() { return Err(format!("{out_dir} already exists")); }
+    crate::rt::spawn_blocking(move || {
+        let _run = run;
+        run_transform_dataset(&progress, &octree_dir, &out_dir, &name, &matrix, record)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+/// The standard fields of a LAS point record — GPS time, colour, the
+/// scan angle, user data, the scan position, the flags — imported as
+/// columns under their reserved names and written back where the record
+/// keeps them.
+#[cfg(test)]
+mod standard_field_tests {
+    use super::*;
+    use las::{Builder, Color as LasColor, Point as LasPoint, Transform as LasTransform, Vector, Writer};
+
+    /// 24 points in format 3 — GPS time and colour — with every standard
+    /// field set to a value that tells the fields apart.
+    fn write_source(path: &Path, format: u8) -> Vec<LasPoint> {
+        let mut b = Builder::from((1, 4));
+        b.point_format = las::point::Format::new(format).unwrap();
+        b.gps_time_type = las::GpsTimeType::Standard;
+        b.transforms = Vector {
+            x: LasTransform { scale: 0.001, offset: 500_000.0 },
+            y: LasTransform { scale: 0.001, offset: 6_800_000.0 },
+            z: LasTransform { scale: 0.001, offset: 100.0 },
+        };
+        let mut w = Writer::from_path(path, b.into_header().unwrap()).unwrap();
+        let mut pts = Vec::new();
+        for i in 0..24u32 {
+            let t = i as f64;
+            let p = LasPoint {
+                x: 500_000.0 + t * 0.25,
+                y: 6_800_000.0 + t * 0.125,
+                z: 100.0 + (t * 0.3).sin(),
+                intensity: 1000 + i as u16,
+                return_number: 1 + (i % 3) as u8,
+                number_of_returns: 3,
+                point_source_id: 7 + (i % 2) as u16,
+                scan_angle: -12.0 + i as f32,
+                user_data: 40 + i as u8,
+                is_edge_of_flight_line: i % 4 == 0,
+                scan_direction: if i % 2 == 0 { las::point::ScanDirection::LeftToRight } else { las::point::ScanDirection::RightToLeft },
+                is_synthetic: i % 5 == 0,
+                is_key_point: i % 7 == 0,
+                is_withheld: i == 3,
+                // Adjusted standard GPS time, a second apart with a
+                // microsecond's fraction that f32 could not keep.
+                gps_time: if matches!(format, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10) { Some(1_234_567_890.000001 + t) } else { None },
+                color: if matches!(format, 2 | 3 | 5 | 7 | 8 | 10) {
+                    Some(LasColor { red: 1000 + i as u16, green: 2000 + i as u16, blue: 3000 + i as u16 })
+                } else { None },
+                ..Default::default()
+            };
+            w.write_point(p.clone()).unwrap();
+            pts.push(p);
+        }
+        w.close().unwrap();
+        pts
+    }
+
+    fn import(src: &Path, out: &Path, names: &[&str]) {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        run_convert(&|_, _| {}, src.to_str().unwrap(), out.to_str().unwrap(), "std", "tls", 0.0, 0, "", "", "", "", &names, false)
+            .expect("import");
+    }
+
+    fn by_time(pts: Vec<LasPoint>) -> Vec<LasPoint> {
+        let mut v = pts;
+        v.sort_by(|a, b| a.gps_time.unwrap_or(a.x).partial_cmp(&b.gps_time.unwrap_or(b.x)).unwrap());
+        v
+    }
+
+    #[test]
+    fn the_table_knows_which_formats_carry_what() {
+        assert!(StdField::GpsTime.available(1) && !StdField::GpsTime.available(0) && !StdField::GpsTime.available(2));
+        assert!(StdField::Red.available(2) && StdField::Red.available(7) && !StdField::Red.available(6));
+        assert!(StdField::Nir.available(8) && !StdField::Nir.available(7));
+        assert!(StdField::Overlap.available(6) && !StdField::Overlap.available(3));
+        assert_eq!(StdField::GpsTime.kind(), ExtraKind::F64);
+        assert_eq!(StdField::Red.kind(), ExtraKind::F32);
+        assert_eq!(StdField::by_name("GPS Time"), Some(StdField::GpsTime));
+        assert_eq!(StdField::by_name("PointSourceId"), Some(StdField::PointSourceId));
+        assert_eq!(StdField::by_name("reflectance"), None);
+        // Format 0: scan angle, user data, the scan position, two
+        // direction flags, three classification flags. Format 3 adds
+        // GPS time and the three colours.
+        assert_eq!(StdField::names_for(0).len(), 8);
+        assert_eq!(StdField::names_for(3).len(), 12);
+        assert_eq!(StdField::names_for(8).len(), 15);
+        assert!(StdField::names_for(8).contains(&"nir"));
+    }
+
+    /// Every field through its own write and read, in a legacy and a
+    /// LAS 1.4 record: what goes in comes out.
+    #[test]
+    fn write_then_read_is_the_identity_in_every_format() {
+        for f in [0u8, 1, 2, 3, 6, 7, 8] {
+            let mut rec = vec![0u8; las_standard_record_length(f)];
+            let wanted: Vec<(StdField, f64)> = STD_FIELDS.iter().filter(|s| s.available(f)).map(|&s| (s, match s {
+                StdField::GpsTime => 1_234_567_890.000001,
+                StdField::ScanAngle => if f <= 5 { -17.0 } else { -17.004 },
+                StdField::UserData => 200.0,
+                StdField::PointSourceId => 65000.0,
+                StdField::Red => 1.0, StdField::Green => 65535.0, StdField::Blue => 12345.0,
+                StdField::Nir => 777.0,
+                StdField::ScannerChannel => 2.0,
+                _ => 1.0,
+            })).collect();
+            for (s, v) in &wanted { s.write(&mut rec, f, *v); }
+            for (s, v) in &wanted {
+                let got = s.read(&rec, f);
+                assert!((got - v).abs() < 1e-9, "format {f}, {}: wrote {v}, read {got}", s.name());
+            }
+            // The flags did not clobber each other or the return bits.
+            rec[14] = 0;
+            for (s, v) in &wanted { s.write(&mut rec, f, *v); }
+            assert_eq!(StdField::ScanDirection.read(&rec, f), 1.0);
+            assert_eq!(StdField::EdgeOfFlightLine.read(&rec, f), 1.0);
+        }
+    }
+
+    /// Import with the standard fields as columns: GPS time comes back
+    /// as an f64 column with every digit, the colour and the rest as f32
+    /// columns, the stride the sum of their widths, and the type of
+    /// time recorded. Then export: a LAS 1.2 file in format 3, every
+    /// field back in the record, bit-exact; and a LAS 1.4 file in
+    /// format 7.
+    #[test]
+    fn the_standard_fields_survive_import_and_export() {
+        let dir = std::env::temp_dir().join(format!("pcl-stdfields-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.las");
+        let written = write_source(&src, 3);
+        let out = dir.join("ds");
+        import(&src, &out, &["gps_time", "red", "green", "blue", "scan_angle", "user_data", "point_source_id", "scan_direction", "edge_of_flight_line", "synthetic", "key_point", "withheld"]);
+
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        let cols = extra_layout(&meta);
+        assert_eq!(cols.len(), 12);
+        assert_eq!(cols[0].name, "gps_time");
+        assert_eq!(cols[0].kind, ExtraKind::F64);
+        assert_eq!(cols[1].offset, BASE_POINT_BYTES + 8, "the f32 after the f64 starts eight bytes on");
+        assert_eq!(point_bytes_of(&meta).unwrap(), BASE_POINT_BYTES + 8 + 11 * 4);
+        assert_eq!(meta["extras"][0]["type"], "float64");
+        assert_eq!(meta["extras"][1]["type"], "float32");
+        assert_eq!(meta["gpsTimeType"], "standard");
+        let t_min = meta["extras"][0]["min"].as_f64().unwrap();
+        assert_eq!(t_min, 1_234_567_890.000001, "the range is kept in f64 too");
+        assert_eq!(meta["extras"][1]["min"].as_f64().unwrap(), 1000.0);
+
+        // Every point's time, exactly, from the record on disk.
+        let bin = std::fs::read(out.join("octree.bin")).unwrap();
+        let pb = point_bytes_of(&meta).unwrap();
+        let mut times: Vec<f64> = (0..bin.len() / pb).map(|i| cols[0].read(&bin[i * pb..(i + 1) * pb])).collect();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let want: Vec<f64> = (0..24).map(|i| 1_234_567_890.000001 + i as f64).collect();
+        assert_eq!(times, want, "GPS time to the microsecond");
+
+        // LAS 1.2 export: format 3, the fields where the record keeps them.
+        let las12 = dir.join("out12.las");
+        let opts = ExportOpts {
+            normalize: false, cell: 0.5, include_tree_id: true, include_semantic: true,
+            include_standing_deadwood: false, include_laying_deadwood: false,
+            keep_classification: true, keep_intensity: true, out_scale: None,
+            extras_to_export: vec!["gps_time".into(), "red".into()], filter: None,
+            target_crs: None, geoid: None, las_14: false, standard_fields: true,
+            text: Default::default(), ply_ascii: false,
+        };
+        run_export_octree(&|_| {}, out.to_str().unwrap(), las12.to_str().unwrap(), &opts).expect("export 1.2");
+        let mut r = las::Reader::from_path(&las12).unwrap();
+        assert_eq!(r.header().point_format().to_u8().unwrap(), 3, "GPS time and colour ask for format 3");
+        assert_eq!(r.header().gps_time_type(), las::GpsTimeType::Standard);
+        let got = by_time(r.points().map(|p| p.unwrap()).collect());
+        let want = by_time(written.clone());
+        assert_eq!(got.len(), 24);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.gps_time, w.gps_time, "GPS time bit-exact");
+            assert_eq!(g.color, w.color);
+            assert_eq!(g.scan_angle, w.scan_angle);
+            assert_eq!(g.user_data, w.user_data);
+            assert_eq!(g.point_source_id, w.point_source_id, "the scan position, not the tree id");
+            assert_eq!(g.is_edge_of_flight_line, w.is_edge_of_flight_line);
+            assert_eq!(g.scan_direction, w.scan_direction);
+            assert_eq!(g.is_synthetic, w.is_synthetic);
+            assert_eq!(g.is_key_point, w.is_key_point);
+            assert_eq!(g.is_withheld, w.is_withheld);
+            assert_eq!(g.intensity, w.intensity);
+            assert_eq!(g.return_number, w.return_number);
+            assert_eq!(g.number_of_returns, w.number_of_returns);
+        }
+        // The standard fields are in the record, not doubled as Extra Bytes.
+        let eb = parse_extra_dims(r.header().vlrs());
+        let eb_names: Vec<&str> = eb.iter().map(|d| d.name_lower.as_str()).collect();
+        assert!(!eb_names.contains(&"gps_time") && !eb_names.contains(&"red"), "{eb_names:?}");
+
+        // LAS 1.4 export: format 7.
+        let las14 = dir.join("out14.las");
+        let opts14 = ExportOpts { las_14: true, ..opts.clone() };
+        run_export_octree(&|_| {}, out.to_str().unwrap(), las14.to_str().unwrap(), &opts14).expect("export 1.4");
+        let mut r = las::Reader::from_path(&las14).unwrap();
+        assert_eq!(r.header().point_format().to_u8().unwrap(), 7);
+        let got = by_time(r.points().map(|p| p.unwrap()).collect());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.gps_time, w.gps_time);
+            assert_eq!(g.color, w.color);
+            assert!((g.scan_angle - w.scan_angle).abs() < 0.004, "{} vs {}", g.scan_angle, w.scan_angle);
+            assert_eq!(g.point_source_id, w.point_source_id);
+            assert_eq!(g.is_withheld, w.is_withheld);
+        }
+
+        // Standard fields off: the stock format, zeros in the record,
+        // and the time offered as an f64 Extra Bytes column instead.
+        let plain = dir.join("plain.las");
+        let opts0 = ExportOpts { standard_fields: false, ..opts.clone() };
+        run_export_octree(&|_| {}, out.to_str().unwrap(), plain.to_str().unwrap(), &opts0).expect("export plain");
+        let r = las::Reader::from_path(&plain).unwrap();
+        assert_eq!(r.header().point_format().to_u8().unwrap(), 0);
+        let eb = parse_extra_dims(r.header().vlrs());
+        let t = eb.iter().find(|d| d.name_lower == "gps_time").expect("gps_time as Extra Bytes");
+        assert_eq!(t.data_type, 10, "an f64 column is a double, not a float");
+
+        // A subset keeps the typed column as it is.
+        let sub = dir.join("sub");
+        run_subset(&Progress::silent(), out.to_str().unwrap(), sub.to_str().unwrap(), "sub", "tls", &SubsetFilter::default()).expect("subset");
+        let smeta: serde_json::Value = serde_json::from_slice(&std::fs::read(sub.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(smeta["extras"][0]["type"], "float64");
+        assert_eq!(smeta["extras"][0]["min"].as_f64().unwrap(), t_min);
+        assert_eq!(point_bytes_of(&smeta).unwrap(), pb);
+
+        // Removing the f64 column takes its eight bytes with it.
+        run_remove_extra(&Progress::silent(), sub.to_str().unwrap(), "gps_time").expect("remove");
+        let smeta: serde_json::Value = serde_json::from_slice(&std::fs::read(sub.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(point_bytes_of(&smeta).unwrap(), pb - 8);
+        assert_eq!(extra_layout(&smeta)[0].name, "red");
+
+        // A field the format does not have is refused with a reason.
+        let src0 = dir.join("in0.las");
+        write_source(&src0, 0);
+        let names = vec!["gps_time".to_string()];
+        let err = match run_convert(&|_, _| {}, src0.to_str().unwrap(), dir.join("ds0").to_str().unwrap(), "x", "tls", 0.0, 0, "", "", "", "", &names, false) {
+            Err(e) => e,
+            Ok(_) => panic!("a field the format does not have must be refused"),
+        };
+        assert!(err.contains("point format 0 does not carry gps_time"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

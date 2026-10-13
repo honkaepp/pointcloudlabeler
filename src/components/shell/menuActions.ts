@@ -56,6 +56,7 @@ export const MENU_TARGETS: Readonly<Record<string, MenuTarget>> = {
   'panel-pointqc': panel('pointqc'),
   'panel-tst': panel('tst'),
   'panel-register': panel('register'),
+  'panel-finereg': panel('finereg'),
   'panel-growth': panel('growth'),
   'panel-m3c2': panel('m3c2'),
   'panel-subset': panel('subset'),

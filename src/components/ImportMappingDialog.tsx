@@ -13,7 +13,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { SCANNER_TYPES, SCANNER_TYPE_LABELS, type ScannerType } from '../state/multiCloud';
 import { ROLE_INFO, type ColumnMapping, type ColumnRole } from '../io/columnMapping';
 import { isDeadwoodExtra } from '../persistence/octreeReader';
-import { unsupportedLasFields } from '../io/parseLasStream';
+import { standardLasFields, unsupportedLasFields } from '../io/parseLasStream';
+import {
+  POINT_FILE_KIND_LABELS, POINT_FILE_ROLES, type PointFileKind, type PointFileMapping, type PointFileProbe,
+} from '../io/pointFile';
 
 interface Props {
   fileName: string;
@@ -46,14 +49,21 @@ interface Props {
      *  can still be enabled later in-app. Defaults to true so the import
      *  matches the legacy behaviour unless the user explicitly opts out. */
     includeDeadwood?: boolean,
+    /** For the pointFile route only — which column of the text, PLY or
+     *  E57 file fills which field, and which others ride along. */
+    fileMapping?: PointFileMapping,
   ) => void;
   onCancel: () => void;
   /** 'full' (default) shows scanner type + vertical axis + column
    *  mapping for the in-memory parser. 'scannerOnly' is used by the
    *  octree route, where X/Y/Z/intensity/class/return are read straight
    *  from the LAS geometry by the Rust converter — only the scanner
-   *  type + the pre-segmented extras are real user choices. */
-  mode?: 'full' | 'scannerOnly';
+   *  type + the pre-segmented extras are real user choices. 'pointFile'
+   *  is a text, PLY or E57 file: every field of the record is a column
+   *  pick, started from the probe's guess. */
+  mode?: 'full' | 'scannerOnly' | 'pointFile';
+  /** The pointFile route's file: what the Rust probe found in it. */
+  pointFile?: { kind: PointFileKind; probe: PointFileProbe };
 }
 
 // Standard LAS fields the octree stores natively — kept as a safety net
@@ -64,17 +74,15 @@ interface Props {
 // so this filter is normally a no-op.
 const STANDARD_FIELDS = new Set(['x', 'y', 'z', 'tree_id', 'intensity', 'classification', 'return_number']);
 
-/** The one standard LAS field worth carrying as a column.
- *
- *  `point_source_id` says which sensor pass produced a point — the scan
- *  position in a merged TLS cloud, the flight line in ALS. The octree
- *  has no native slot for it, `detectLasColumns` never reports it
- *  (it is not an Extra-Bytes dimension), and without it the point-QC
- *  tool's wind stage cannot run at all: it works by asking whether a
- *  point's neighbours were seen from OTHER scan positions. So it is
- *  offered here for every LAS file rather than only when a file happens
- *  to declare a dimension by that name. The importer resolves it from
- *  the standard record (octree.rs's POINT_SOURCE_ID_NAME). */
+/** The standard LAS fields the base record does not keep — GPS time,
+ *  the colour, the scan position, the scan angle, the flags — are
+ *  offered as columns for every LAS file whose point format carries
+ *  them (see standardLasFields), under their reserved names, and the
+ *  importer reads them from the record itself (octree.rs's StdField).
+ *  GPS time is stored as an f64 column, so a pulse's time comes back
+ *  exactly; the rest fit an f32. The import dialog used to say these
+ *  were dropped; now they are columns like any other, colourable and
+ *  exported back into the record. */
 const PSID_COLUMN = 'point_source_id';
 
 // Best-guess pre-fill: only ever match a column the file ACTUALLY has
@@ -90,11 +98,36 @@ function detectRole(columns: string[], names: string[]): string {
   return '';
 }
 
-export default function ImportMappingDialog({ fileName, isLas, columns, suggested, onConfirm, onCancel, mode = 'full', pointFormat = null}: Props) {
+export default function ImportMappingDialog({ fileName, isLas, columns, suggested, onConfirm, onCancel, mode = 'full', pointFormat = null, pointFile }: Props) {
   // Standard LAS fields this file has that the octree cannot carry.
   const dropped = unsupportedLasFields(pointFormat);
 
   const scannerOnly = mode === 'scannerOnly';
+  const isPointFile = mode === 'pointFile' && !!pointFile;
+  // The text / PLY / E57 mapping, from the probe's guess. Every
+  // optional field present (null) so the selects are controlled.
+  const [fileMapping, setFileMapping] = useState<PointFileMapping>(() => {
+    const m: PointFileMapping = { x: null, y: null, z: null, extras: [], ...(pointFile?.probe.suggested ?? {}) };
+    for (const r of POINT_FILE_ROLES) if (m[r.key] === undefined) m[r.key] = null;
+    return m;
+  });
+  const setFileRole = (key: keyof PointFileMapping, value: string) =>
+    setFileMapping(m => ({ ...m, [key]: value || null }));
+  const toggleFileExtra = (c: string) =>
+    setFileMapping(m => ({ ...m, extras: m.extras.includes(c) ? m.extras.filter(e => e !== c) : [...m.extras, c] }));
+  const fileXyzOk = !!fileMapping.x && !!fileMapping.y && !!fileMapping.z
+    && new Set([fileMapping.x, fileMapping.y, fileMapping.z]).size === 3;
+  // Columns a file role claims — shown dimmed in the extras list, still
+  // tickable: the intensity scaled into the record AND exact beside it.
+  const fileClaimed = useMemo(() => {
+    const s = new Set<string>();
+    for (const r of POINT_FILE_ROLES) { const v = fileMapping[r.key]; if (v) s.add(v); }
+    return s;
+  }, [fileMapping]);
+  const fileExtraOptions = useMemo(
+    () => (pointFile ? pointFile.probe.columns.filter(c => c !== fileMapping.x && c !== fileMapping.y && c !== fileMapping.z) : []),
+    [pointFile, fileMapping.x, fileMapping.y, fileMapping.z],
+  );
   // Pre-fill role columns from EXACT-name matches in the file's real
   // columns (never a phantom). tree_id / semantic / class are the common
   // spellings; deadwood channels match their reserved names. If any match,
@@ -151,28 +184,36 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
     return out;
   }, [columns]);
 
+  // The standard fields this file's point format carries, offered first
+  // and only for LAS: a text file has no such field.
+  const standardFields = useMemo(() => (isLas ? standardLasFields(pointFormat) : []), [isLas, pointFormat]);
+  const standardNames = useMemo(() => new Set(standardFields.map(f => f.name)), [standardFields]);
   // Columns that are real Extra-Bytes dimensions worth carrying as numeric
-  // f32 extras — i.e. everything EXCEPT the standard LAS fields the octree
-  // already stores natively (X/Y/Z, intensity, classification, return,
-  // and tree_id which has its own slot). So species / reflectance /
-  // amplitude / pulse_width / … surface here, ready to colour by.
+  // extras — i.e. everything EXCEPT the fields the octree already stores
+  // natively (X/Y/Z, intensity, classification, return, and tree_id
+  // which has its own slot) and the standard fields offered above. So
+  // species / reflectance / amplitude / pulse_width / … surface here,
+  // ready to colour by.
   const extraCarryOptions = useMemo(() => {
     const dims = extraColumnOptions.filter(
-      c => !STANDARD_FIELDS.has(c.toLowerCase()) && !isDeadwoodExtra(c) && c.toLowerCase() !== PSID_COLUMN,
+      c => !STANDARD_FIELDS.has(c.toLowerCase()) && !isDeadwoodExtra(c) && c.toLowerCase() !== PSID_COLUMN && !standardNames.has(c.toLowerCase()),
     );
-    // Offered first, and only for LAS: a text file has no such field.
-    return isLas ? [PSID_COLUMN, ...dims] : dims;
-  }, [extraColumnOptions, isLas]);
-  // Default: carry every detected extra so a richly-attributed cloud
-  // arrives with all its columns visible in the Display panel — the user
-  // unticks any they don't want rather than hunting for each.
+    return [...standardFields.map(f => f.name), ...dims];
+  }, [extraColumnOptions, standardFields, standardNames]);
+  // Default: carry every detected Extra Bytes column so a richly-
+  // attributed cloud arrives with all its columns visible in the Display
+  // panel — the user unticks any they don't want rather than hunting
+  // for each — and the standard fields that are data (time, colour, the
+  // scan position); the flags and the scan angle start unticked.
   useEffect(() => {
     setIncludeExtras(() => {
       const m: Record<string, boolean> = {};
       for (const c of extraCarryOptions) m[c] = true;
+      for (const f of standardFields) m[f.name] = f.on;
       return m;
     });
-  }, [extraCarryOptions]);
+  }, [extraCarryOptions, standardFields]);
+  const standardLabel = (name: string) => standardFields.find(f => f.name === name)?.label;
 
   // Which roles are editable here. LAS coordinates are fixed by the file's
   // scale/offset, so X/Y/Z aren't user-mappable for LAS (H still is — it can
@@ -192,8 +233,11 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
   const vertMissing = !isLas && !mapping.z && !mapping.h;
   const axisZNoSource = verticalAxis === 'Z' && !isLas && !mapping.z;
   // The scanner-only (octree) route has nothing to validate — the
-  // converter reads every geometric field itself.
-  const canConfirm = scannerOnly || (!xyMissing && !xyDup && !vertMissing && !axisZNoSource);
+  // converter reads every geometric field itself. A point file needs
+  // three distinct position columns.
+  const canConfirm = isPointFile
+    ? fileXyzOk
+    : scannerOnly || (!xyMissing && !xyDup && !vertMissing && !axisZNoSource);
 
   // The tree_id / semantic role columns are stored as their own fixed
   // fields, so don't duplicate them into the f32 extras payload even if
@@ -207,7 +251,12 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
     ? extraCarryOptions.filter(c => includeExtras[c] && !claimedAsRole.has(c))
     : [];
 
-  const confirm = () => onConfirm(
+  const confirm = () => isPointFile
+    ? onConfirm(scannerType, mapping, 'Z', undefined, undefined, includeDeadwoodCols, {
+        ...fileMapping,
+        extras: fileMapping.extras.filter(c => c !== fileMapping.x && c !== fileMapping.y && c !== fileMapping.z),
+      })
+    : onConfirm(
     scannerType, mapping, verticalAxis,
     scannerOnly
       ? {
@@ -229,7 +278,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scannerType, mapping, verticalAxis, canConfirm, scannerOnly, preSegmented, treeIdExtra, semanticExtra, standingDeadwoodExtra, layingDeadwoodExtra, includeExtras, includeDeadwoodCols]);
+  }, [scannerType, mapping, verticalAxis, canConfirm, scannerOnly, preSegmented, treeIdExtra, semanticExtra, standingDeadwoodExtra, layingDeadwoodExtra, includeExtras, includeDeadwoodCols, fileMapping, isPointFile]);
 
   return (
     <div
@@ -247,7 +296,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
           <div className="flex-1 min-w-0">
             <div className="text-[14px] font-semibold" style={{ color: 'var(--text)' }}>Import cloud</div>
             <div className="mono text-[10.5px] truncate" style={{ color: 'var(--text-mute)' }}>
-              {fileName} · {isLas ? 'LAS / LAZ' : 'TXT / XYZ / CSV'} · {columns.length} source column{columns.length === 1 ? '' : 's'}
+              {fileName} · {isLas ? 'LAS / LAZ' : pointFile ? POINT_FILE_KIND_LABELS[pointFile.kind] : 'TXT / XYZ / CSV'} · {columns.length} source column{columns.length === 1 ? '' : 's'}{pointFile ? ` · ~${pointFile.probe.approxPointCount.toLocaleString()} points` : ''}
             </div>
           </div>
           <button className="btn btn-ghost !h-7 !w-7 !p-0 justify-center" onClick={onCancel} title="Cancel (Esc)">✕</button>
@@ -304,11 +353,10 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
                 </div>
               )}
               <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
-                Converting to an out-of-core LOD octree. X / Y / Z, intensity, classification and return number come straight from the LAS geometry.
+                Converting to an out-of-core LOD octree. X / Y / Z, intensity, classification, return number and number of returns come straight from the LAS geometry; every other field of the record is a column above, ticked or not.
               </div>
               {/* Naming what is read does not tell anyone what is lost.
-                  A colourised MLS delivery arriving grey, discovered
-                  after the import, is the case this exists for. */}
+                  Only the waveform packets are left out now. */}
               {dropped.length > 0 && (
                 <div
                   className="mono text-[10px] mt-1.5 px-1.5 py-1 rounded-sm"
@@ -323,7 +371,120 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
             </Field>
           )}
 
-          {scannerOnly && (
+          {isPointFile && pointFile && (<>
+            <Field label="Position">
+              <div className="rounded-md p-2.5 flex flex-col gap-1.5" style={{ border: '1px solid var(--line)', background: 'rgba(0,0,0,0.18)' }}>
+                {(['x', 'y', 'z'] as const).map(k => (
+                  <ColumnPick
+                    key={k}
+                    label={k.toUpperCase()}
+                    hint={`The ${k.toUpperCase()} coordinate, in metres.`}
+                    value={fileMapping[k] ?? ''}
+                    options={pointFile.probe.columns}
+                    onChange={v => setFileRole(k, v)}
+                    required
+                  />
+                ))}
+              </div>
+              {!fileXyzOk && (
+                <div className="mono text-[10.5px] mt-1.5 px-2 py-1.5 rounded-md" style={{ color: 'var(--danger, #e0506b)', background: 'rgba(224,80,107,0.10)', border: '1px solid color-mix(in oklch, var(--danger, #e0506b) 50%, transparent)' }}>
+                  X, Y and Z must be three different columns.
+                </div>
+              )}
+              <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+                {pointFile.kind === 'text'
+                  ? `${pointFile.probe.hasHeader ? 'Column names from the header line' : 'No header line — columns are numbered'}, ${pointFile.probe.delimiter ?? 'space'}-separated. Coordinates keep the file's own decimals (to six).`
+                  : pointFile.kind === 'ply'
+                    ? 'The scalar properties of the vertex element, read as doubles whatever their type.'
+                    : `${pointFile.probe.scans.length} scan position${pointFile.probe.scans.length === 1 ? '' : 's'} (${pointFile.probe.scans.join(', ')}) — each scan's pose applied, all in one dataset; the "scan" column is the scan's index, 1 upwards, the point source id by default.`}
+              </div>
+            </Field>
+
+            <Field label="Fields" optional>
+              <div className="rounded-md p-2.5 grid grid-cols-2 gap-x-3 gap-y-1.5" style={{ border: '1px solid var(--line)', background: 'rgba(0,0,0,0.18)' }}>
+                {POINT_FILE_ROLES.map(r => (
+                  <ColumnPick
+                    key={r.key}
+                    label={r.label}
+                    hint={r.hint}
+                    value={fileMapping[r.key] ?? ''}
+                    options={pointFile.probe.columns}
+                    onChange={v => setFileRole(r.key, v)}
+                  />
+                ))}
+              </div>
+              <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+                Matched by column name; change any that is wrong, leave <span style={{ color: 'var(--text-dim)' }}>— none —</span> for what the file does not have. Intensity and colour are scaled into the record's 16 bits by the file's own range; GPS time is kept exact. A cloud with no tree_id column imports unsegmented.
+              </div>
+            </Field>
+
+            <Field label="Extra columns" optional>
+              <div className="mono text-[10px] mb-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+                Every ticked column is carried into the dataset as a 64-bit value under its own name — exact — to colour by, filter on and export again. A column used as a field above can be ticked too (the amplitude scaled as intensity, and exact beside it). A reflectance column stays here, where Point QC finds it by name.
+              </div>
+              {fileExtraOptions.length === 0 ? (
+                <div className="mono text-[10.5px] px-2 py-1.5 rounded-md" style={{ border: '1px solid var(--line)', background: 'rgba(0,0,0,0.18)', color: 'var(--text-mute)' }}>
+                  No columns besides the position.
+                </div>
+              ) : (
+                <div className="rounded-md p-2 flex flex-col gap-1" style={{ border: '1px solid var(--line)', background: 'rgba(0,0,0,0.18)' }}>
+                  <div className="flex items-center justify-between mb-0.5">
+                    <span className="mono text-[10px]" style={{ color: 'var(--text-mute)' }}>
+                      {fileMapping.extras.filter(c => fileExtraOptions.includes(c)).length} of {fileExtraOptions.length} selected
+                    </span>
+                    <div className="flex gap-1">
+                      <button type="button" className="mono text-[10px] px-1.5 py-0.5 rounded-sm" style={{ color: 'var(--text-dim)', border: '1px solid var(--line)' }}
+                        onClick={() => setFileMapping(m => ({ ...m, extras: [...fileExtraOptions] }))}>all</button>
+                      <button type="button" className="mono text-[10px] px-1.5 py-0.5 rounded-sm" style={{ color: 'var(--text-dim)', border: '1px solid var(--line)' }}
+                        onClick={() => setFileMapping(m => ({ ...m, extras: [] }))}>none</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1 max-h-[180px] overflow-y-auto scroll-thin">
+                    {fileExtraOptions.map(c => {
+                      const on = fileMapping.extras.includes(c);
+                      const claimed = fileClaimed.has(c);
+                      return (
+                        <label
+                          key={c}
+                          className="flex items-center gap-1.5 mono text-[10.5px] cursor-pointer px-1.5 py-1 rounded-sm"
+                          style={{ opacity: claimed && !on ? 0.6 : 1, background: on ? 'color-mix(in oklch, var(--accent) 12%, transparent)' : 'transparent' }}
+                          title={claimed ? `'${c}' also fills a field above; ticked, it is kept exact as well` : `Carry '${c}' as a numeric column`}
+                        >
+                          <input type="checkbox" checked={on} onChange={() => toggleFileExtra(c)} />
+                          <span className="truncate" style={{ color: on ? 'var(--text)' : 'var(--text-dim)' }}>{c}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </Field>
+
+            {pointFile.probe.preview.length > 0 && (
+              <Field label="First rows">
+                <div className="rounded-md overflow-x-auto scroll-thin" style={{ border: '1px solid var(--line)', background: 'rgba(0,0,0,0.18)', maxHeight: 160 }}>
+                  <table className="mono text-[10px]" style={{ borderCollapse: 'collapse', whiteSpace: 'nowrap' }}>
+                    <thead>
+                      <tr>
+                        {pointFile.probe.columns.map(c => (
+                          <th key={c} className="px-2 py-1 text-left" style={{ color: 'var(--text-dim)', borderBottom: '1px solid var(--line)', position: 'sticky', top: 0, background: 'var(--wash-1)' }}>{c}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pointFile.probe.preview.map((row, i) => (
+                        <tr key={i}>
+                          {row.map((v, j) => <td key={j} className="px-2 py-0.5" style={{ color: 'var(--text-mute)' }}>{v}</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Field>
+            )}
+          </>)}
+
+          {(scannerOnly || isPointFile) && (
             <Field label="Deadwood labelling" optional>
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <Checkbox checked={includeDeadwoodCols} onChange={setIncludeDeadwoodCols} />
@@ -343,9 +504,9 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
           {scannerOnly && (
             <Field label="Extra columns" optional>
               <div className="mono text-[10px] mb-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
-                Extra LAS columns carried into the octree as numeric values — e.g. species, amplitude, reflectance, pulse width. All are kept by default; untick any you don't need. Each adds 4 bytes per point and appears in the Display panel's <b>Colour by</b> menu under its own name.
+                Columns carried into the octree as numeric values: the file's Extra Bytes — species, amplitude, reflectance, pulse width — and, for LAS, the standard fields of the record the base record does not keep: GPS time (8 bytes a point, exact), colour, near-infrared, the scan position, the scan angle, user data and the flags. Each appears in the Display panel's <b>Colour by</b> menu under its own name, filters, and is written back where it came from on export. Each costs 4 bytes a point (GPS time 8); untick what you don't need.
                 {isLas && (
-                  <> <b>point_source_id</b> is the scan position (or flight line) each point came from — the Point QC tool's wind filter needs it, and nothing else in the octree records it.</>
+                  <> <b>point_source_id</b> is the scan position (or flight line) each point came from — the Point QC tool's wind filter needs it.</>
                 )}
               </div>
               {extraCarryOptions.length === 0 ? (
@@ -399,7 +560,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
                             disabled={claimed}
                             onChange={() => setIncludeExtras(m => ({ ...m, [c]: !m[c] }))}
                           />
-                          <span className="truncate" style={{ color: on ? 'var(--text)' : 'var(--text-dim)' }}>{c}</span>
+                          <span className="truncate" style={{ color: on ? 'var(--text)' : 'var(--text-dim)' }}>{c}{standardLabel(c) ? <span style={{ color: 'var(--text-mute)' }}> · {standardLabel(c)}</span> : null}</span>
                         </label>
                       );
                     })}
@@ -409,7 +570,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
             </Field>
           )}
 
-          {!scannerOnly && (<>
+          {mode === 'full' && (<>
             <Field label="Vertical axis">
               <div className="grid grid-cols-2 gap-1.5">
                 {(['Z', 'H'] as const).map(ax => {
@@ -511,7 +672,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
               className="btn btn-primary !px-3"
               onClick={confirm}
               disabled={!canConfirm}
-              title={canConfirm ? 'Import with these settings' : 'Assign X, Y and a vertical (Z or H) first'}
+              title={canConfirm ? 'Import with these settings' : isPointFile ? 'Pick three different columns for X, Y and Z first' : 'Assign X, Y and a vertical (Z or H) first'}
             >Import</button>
           </div>
         </div>
@@ -544,13 +705,14 @@ function Field({ label, optional, children }: { label: string; optional?: boolea
   );
 }
 
-function ColumnPick({ label, hint, value, options, onChange }: {
+function ColumnPick({ label, hint, value, options, onChange, required }: {
   label: string; hint: string;
   value: string; options: string[]; onChange: (v: string) => void;
+  required?: boolean;
 }) {
   return (
     <div className="flex items-center gap-2">
-      <span className="mono text-[11px]" style={{ width: 112, color: 'var(--text)' }}>{label}</span>
+      <span className="mono text-[11px]" style={{ width: 112, color: 'var(--text)' }}>{label}{required && <span style={{ color: 'var(--danger)' }}> *</span>}</span>
       <select
         value={value}
         onChange={e => onChange(e.target.value)}
@@ -564,7 +726,7 @@ function ColumnPick({ label, hint, value, options, onChange }: {
         onBlur={focusOff}
         title={hint}
       >
-        <option value="">— none —</option>
+        <option value="">{required ? '— pick —' : '— none —'}</option>
         {options.map(c => <option key={c} value={c}>{c}</option>)}
       </select>
     </div>

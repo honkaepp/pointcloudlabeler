@@ -418,8 +418,7 @@ PointCloudLabeler reads point-cloud formats produced by other people's
 instruments and software, and names them so a user can tell what it
 opens.
 
-RIEGL, RiSCAN PRO, RiPROCESS, RDB and RXP are trademarks of RIEGL Laser
-Measurement Systems GmbH. FARO is a trademark of FARO Technologies.
+FARO is a trademark of FARO Technologies.
 Leica and Cyclone are trademarks of Leica Geosystems / Hexagon. Trimble
 is a trademark of Trimble Inc. NavVis, Emesent, XGRIDS and GreenValley
 are trademarks of their respective owners. E57 is an ASTM standard
@@ -434,20 +433,7 @@ to describe an importer.
 No vendor SDK is bundled, redistributed or required. Every format the
 default build reads is read through published specifications and
 open-source libraries: E57 through the `e57` crate, LAS/LAZ through
-`las`/`laz`. RIEGL's own point formats — `.rdbx` (RDB 2) and `.rxp` —
-are read by no default build: each needs RIEGL's own library, and the
-route into PointCloudLabeler is RiSCAN PRO's export to E57 or LAS. No
-RIEGL code is read, decompiled or shipped.
-
-Two optional build features link RIEGL's proprietary SDKs and are off
-by default: `rdblib` (RIEGL's `.rdbx` SDK — the only reader of RDB 2
-there is) and `rivlib` (`.rxp`, RIEGL's
-closed streaming format — the only way to read what a scanner writes to
-its own `.PROJ` project, and the SDK is the only reader there is).
-**A binary built with either cannot be distributed under the GPL** — the
-SDKs are non-redistributable, so §6's Corresponding Source is impossible
-for the combined work. Building one for your own use is unaffected; the
-packaging script refuses to make a release from it.
+`las`/`laz`.
 
 ---
 
@@ -460,25 +446,25 @@ packaging script refuses to make a release from it.
      src/testing/notices.test.ts, which fails when this
      section no longer matches the lockfiles. -->
 
-### Rust crates (499)
+### Rust crates (549)
 
 Licence expressions in use, by package count:
 
-  * 237 × `MIT OR Apache-2.0`
-  * 109 × `MIT`
-  * 33 × `Apache-2.0 OR MIT`
+  * 263 × `MIT OR Apache-2.0`
+  * 123 × `MIT`
+  * 35 × `Apache-2.0 OR MIT`
   * 26 × `MIT/Apache-2.0`
   * 18 × `Unicode-3.0`
   * 17 × `Zlib OR Apache-2.0 OR MIT`
   * 15 × `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
-  * 5 × `Apache-2.0/MIT`
+  * 6 × `Apache-2.0/MIT`
   * 5 × `MPL-2.0`
   * 4 × `Apache-2.0`
+  * 4 × `BSD-3-Clause`
+  * 4 × `ISC`
   * 4 × `Unlicense OR MIT`
-  * 3 × `BSD-3-Clause`
   * 2 × `BSD-2-Clause OR Apache-2.0 OR MIT`
   * 2 × `BSD-3-Clause OR MIT OR Apache-2.0`
-  * 2 × `ISC`
   * 2 × `MIT OR Apache-2.0 OR LGPL-2.1-or-later`
   * 2 × `MIT OR Apache-2.0 OR Zlib`
   * 2 × `Unlicense/MIT`
@@ -486,11 +472,15 @@ Licence expressions in use, by package count:
   * 1 × `(MIT OR Apache-2.0) AND Unicode-3.0`
   * 1 × `0BSD OR MIT OR Apache-2.0`
   * 1 × `Apache-2.0 / MIT`
+  * 1 × `Apache-2.0 AND ISC`
   * 1 × `Apache-2.0 AND MIT`
+  * 1 × `Apache-2.0 OR BSL-1.0`
+  * 1 × `Apache-2.0 OR ISC OR MIT`
   * 1 × `Apache-2.0 WITH LLVM-exception`
   * 1 × `BSD-3-Clause AND MIT`
   * 1 × `BSD-3-Clause/MIT`
   * 1 × `CC0-1.0 OR MIT-0 OR Apache-2.0`
+  * 1 × `MIT / Apache-2.0`
   * 1 × `MIT OR Zlib OR Apache-2.0`
 
 | Package | Version | Licence | Copyright |
@@ -500,7 +490,13 @@ Licence expressions in use, by package count:
 | `aho-corasick` | 1.1.4 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `alloc-no-stdlib` | 2.0.4 | BSD-3-Clause | Copyright (c) 2016 Dropbox, Inc. |
 | `alloc-stdlib` | 0.2.2 | BSD-3-Clause | — |
+| `allocator-api2` | 0.2.21 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `android_system_properties` | 0.1.5 | MIT/Apache-2.0 | Copyright 2016 Nicolas Silva<br>Copyright (c) 2013 Nicolas Silva<br>COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER |
+| `anstream` | 1.0.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `anstyle` | 1.0.14 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `anstyle-parse` | 1.0.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `anstyle-query` | 1.1.5 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `anstyle-wincon` | 3.0.11 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `atk` | 0.18.2 | MIT | — |
 | `atk-sys` | 0.18.2 | MIT | — |
@@ -529,6 +525,8 @@ Licence expressions in use, by package count:
 | `cargo-platform` | 0.1.9 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `cargo_metadata` | 0.19.2 | MIT | — |
 | `cargo_toml` | 0.22.3 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `cassowary` | 0.3.0 | MIT / Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 Dylan Ede |
+| `castaway` | 0.2.4 | MIT | Copyright (c) 2021 Stephen M. Coakley |
 | `cc` | 1.2.62 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 Alex Crichton |
 | `cesu8` | 1.1.0 | Apache-2.0/MIT | — |
 | `cexpr` | 0.6.0 | Apache-2.0/MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
@@ -537,7 +535,12 @@ Licence expressions in use, by package count:
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 Alex Crichton |
 | `chrono` | 0.4.44 | MIT OR Apache-2.0 | Copyright (c) 2014, Kang Seonghoon.<br>copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `clang-sys` | 1.8.1 | Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `clap` | 4.5.61 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `clap_builder` | 4.5.61 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
+| `clap_lex` | 1.1.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright Individual contributors<br>Copyright (c) Individual contributors |
+| `colorchoice` | 1.0.5 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
 | `combine` | 4.6.7 | MIT | Copyright (c) 2015 Markus Westerlind |
+| `compact_str` | 0.8.2 | MIT | Copyright (c) 2021 Parker Timmerman |
 | `console_log` | 1.1.0 | MIT/Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2018 Matthew Nicholson |
 | `cookie` | 0.18.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2017 Sergio Benitez<br>Copyright 2014 Alex Chricton |
 | `core-foundation` | 0.10.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2012-2013 Mozilla Foundation |
@@ -550,14 +553,19 @@ Licence expressions in use, by package count:
 | `crossbeam-deque` | 0.8.6 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 The Crossbeam Project Developers |
 | `crossbeam-epoch` | 0.9.21 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 The Crossbeam Project Developers |
 | `crossbeam-utils` | 0.8.21 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 The Crossbeam Project Developers |
+| `crossterm` | 0.28.1 | MIT | Copyright (c) 2019 Timon |
+| `crossterm_winapi` | 0.9.1 | MIT | Copyright (c) 2019 Timon |
 | `crypto-common` | 0.1.7 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2021 RustCrypto Developers |
 | `cssparser` | 0.36.0 | MPL-2.0 | — |
 | `cssparser-macros` | 0.6.1 | MPL-2.0 | — |
 | `ctor` | 0.8.0 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `ctor-proc-macro` | 0.0.7 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `darling` | 0.23.0 | MIT | Copyright (c) 2017 Ted Driggs |
+| `darling` | 0.24.1 | MIT | Copyright (c) 2017 Ted Driggs |
 | `darling_core` | 0.23.0 | MIT | Copyright (c) 2017 Ted Driggs |
+| `darling_core` | 0.24.1 | MIT | Copyright (c) 2017 Ted Driggs |
 | `darling_macro` | 0.23.0 | MIT | Copyright (c) 2017 Ted Driggs |
+| `darling_macro` | 0.24.1 | MIT | Copyright (c) 2017 Ted Driggs |
 | `dbus` | 0.9.11 | Apache-2.0/MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2014-2018 David Henningsson <diwic@ubuntu.com> and other contributors<br>Copyright (c) 2014-2018 David Henningsson <diwic@ubuntu.com> and other contributors |
 | `deranged` | 0.5.8 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2024 Jacob Pratt et al.<br>Copyright (c) 2024 Jacob Pratt et al. |
 | `derive_more` | 2.1.1 | MIT | Copyright (c) 2016 Jelte Fennema |
@@ -643,6 +651,7 @@ Licence expressions in use, by package count:
 | `http-body` | 1.0.1 | MIT | Copyright (c) 2019-2024 Sean McArthur & Hyper Contributors |
 | `http-body-util` | 0.1.3 | MIT | Copyright (c) 2019-2025 Sean McArthur & Hyper Contributors |
 | `httparse` | 1.10.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015-2025 Sean McArthur |
+| `httpdate` | 1.0.3 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 Pyfisch |
 | `hyper` | 1.9.0 | MIT | Copyright (c) 2014-2026 Sean McArthur |
 | `hyper-util` | 0.1.20 | MIT | Copyright (c) 2023-2025 Sean McArthur |
 | `iana-time-zone` | 0.1.65 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2020 Andrew Straw<br>Copyright (c) 2020 Andrew D. Straw |
@@ -661,9 +670,13 @@ Licence expressions in use, by package count:
 | `idna_adapter` | 1.2.2 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) The rust-url developers |
 | `indexmap` | 1.9.3 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016--2017 |
 | `indexmap` | 2.14.0 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016--2017 |
+| `indoc` | 2.0.7 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `infer` | 0.19.0 | MIT | Copyright (c) 2019 Bojan |
+| `instability` | 0.3.14 | MIT | Copyright (c) 2020 Stephen M. Coakley<br>Copyright (c) The Ratatui Developers |
 | `ipnet` | 2.12.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2017 Juniper Networks, Inc. |
+| `is_terminal_polyfill` | 1.70.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
 | `itertools` | 0.12.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 |
+| `itertools` | 0.13.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `javascriptcore-rs` | 1.1.2 | MIT | Copyright (c) 2013-2021, The Gtk-rs Project Developers.<br>Copyright (c) 2021, Tauri Programme within The Commons Conservancy. |
 | `javascriptcore-rs-sys` | 1.1.1 | MIT | Copyright (c) 2013-2017, The Gtk-rs Project Developers. |
@@ -693,6 +706,7 @@ Licence expressions in use, by package count:
 | `litemap` | 0.8.2 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |
 | `lock_api` | 0.4.14 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 The Rust Project Developers |
 | `log` | 0.4.29 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 The Rust Project Developers |
+| `lru` | 0.12.5 | MIT | Copyright (c) 2016 Jerome Froelich |
 | `markup5ever` | 0.38.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 The html5ever Project Developers |
 | `memchr` | 2.8.0 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `memoffset` | 0.9.1 | MIT | Copyright (c) 2017 Gilad Naaman |
@@ -728,11 +742,13 @@ Licence expressions in use, by package count:
 | `objc2-user-notifications` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | — |
 | `objc2-web-kit` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | — |
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `once_cell_polyfill` | 1.70.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
 | `option-ext` | 0.2.0 | MPL-2.0 | — |
 | `pango` | 0.18.3 | MIT | — |
 | `pango-sys` | 0.18.0 | MIT | — |
 | `parking_lot` | 0.12.5 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 The Rust Project Developers |
 | `parking_lot_core` | 0.9.12 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 The Rust Project Developers |
+| `paste` | 1.0.15 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `percent-encoding` | 2.3.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2013-2025 The rust-url developers |
 | `phf` | 0.13.1 | MIT | Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi<br>COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER |
 | `phf_codegen` | 0.13.1 | MIT | Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi<br>COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER |
@@ -759,6 +775,7 @@ Licence expressions in use, by package count:
 | `quote` | 1.0.45 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `r-efi` | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | — |
 | `r-efi` | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | — |
+| `ratatui` | 0.29.0 | MIT | Copyright (c) 2016-2022 Florian Dehau<br>Copyright (c) 2023-2024 The Ratatui Developers |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 Osspial<br>Copyright (c) 2020 Osspial |
 | `rayon` | 1.12.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2010 The Rust Project Developers |
 | `rayon-core` | 1.13.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2010 The Rust Project Developers |
@@ -772,18 +789,24 @@ Licence expressions in use, by package count:
 | `regex-syntax` | 0.8.10 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 The Rust Project Developers |
 | `reqwest` | 0.13.3 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2016 Sean McArthur<br>Copyright (c) 2016-2026 Sean McArthur |
 | `rfd` | 0.16.0 | MIT | Copyright (c) 2022 Bartłomiej Maryńczak |
+| `ring` | 0.17.14 | Apache-2.0 AND ISC | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2009 The Go Authors. All rights reserved.<br>copyright notice, this list of conditions and the following disclaimer |
 | `roxmltree` | 0.21.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2018 Yevhenii Reizner |
 | `rusqlite` | 0.32.1 | MIT | Copyright (c) 2014-2021 The rusqlite developers |
 | `rustc-hash` | 1.1.0 | Apache-2.0/MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `rustc-hash` | 2.1.2 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 The Rust Project Developers |
 | `rustix` | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `rustls` | 0.23.45 | Apache-2.0 OR ISC OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com><br>Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com> |
+| `rustls-pki-types` | 1.15.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2023 Dirkjan Ochtman<br>Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl> |
+| `rustls-webpki` | 0.103.15 | ISC | Copyright 2015 Brian Smith.<br>copyright notice and this permission notice appear in all copies. |
 | `rustversion` | 1.0.22 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `ryu` | 1.0.23 | Apache-2.0 OR BSL-1.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `same-file` | 1.0.6 | Unlicense/MIT | Copyright (c) 2017 Andrew Gallant |
 | `schemars` | 0.8.22 | MIT | Copyright (c) 2019 Graham Esau |
 | `schemars` | 0.9.0 | MIT | Copyright (c) 2019 Graham Esau |
 | `schemars` | 1.2.1 | MIT | Copyright (c) 2019 Graham Esau |
 | `schemars_derive` | 0.8.22 | MIT | Copyright (c) 2019 Graham Esau |
+| `schemars_derive` | 1.2.1 | MIT | Copyright (c) 2019 Graham Esau |
 | `scopeguard` | 1.2.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers |
 | `selectors` | 0.36.1 | MPL-2.0 | — |
 | `semver` | 1.0.28 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
@@ -803,6 +826,9 @@ Licence expressions in use, by package count:
 | `servo_arc` | 0.4.3 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `sha2` | 0.10.9 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2006-2009 Graydon Hoare<br>Copyright (c) 2009-2013 Mozilla Foundation |
 | `shlex` | 1.3.0 | MIT OR Apache-2.0 | Copyright 2015 Nicholas Allegra (comex).<br>Copyright (c) 2015 Nicholas Allegra (comex). |
+| `signal-hook` | 0.3.18 | Apache-2.0/MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 tokio-jsonrpc developers |
+| `signal-hook-mio` | 0.2.5 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 tokio-jsonrpc developers |
+| `signal-hook-registry` | 1.4.8 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 tokio-jsonrpc developers |
 | `simd-adler32` | 0.3.9 | MIT | Copyright (c) [2021] [Marvin Countryman] |
 | `siphasher` | 1.0.3 | MIT/Apache-2.0 | Copyright 2012-2016 The Rust Project Developers.<br>Copyright 2016-2026 Frank Denis. |
 | `slab` | 0.4.12 | MIT | Copyright (c) 2019 Carl Lerche |
@@ -812,12 +838,17 @@ Licence expressions in use, by package count:
 | `soup3` | 0.5.0 | MIT | Copyright (c) 2013-2017, The Gtk-rs Project Developers. |
 | `soup3-sys` | 0.5.0 | MIT | Copyright (c) 2013-2017, The Gtk-rs Project Developers. |
 | `stable_deref_trait` | 1.2.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 Robert Grosse |
+| `static_assertions` | 1.1.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 Nikolai Vazquez |
 | `string_cache` | 0.9.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2012-2013 Mozilla Foundation |
 | `string_cache_codegen` | 0.6.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2012-2013 Mozilla Foundation |
 | `strsim` | 0.11.1 | MIT | Copyright (c) 2015 Danny Guo<br>Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com><br>Copyright (c) 2018 Akash Kurdekar |
+| `strum` | 0.26.3 | MIT | Copyright (c) 2019 Peter Glotfelty |
+| `strum_macros` | 0.26.4 | MIT | Copyright (c) 2019 Peter Glotfelty |
+| `subtle` | 2.6.1 | BSD-3-Clause | Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.<br>Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved. |
 | `swift-rs` | 1.0.7 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2023 The swift-rs developers<br>Copyright (c) 2023 The swift-rs Developers |
 | `syn` | 1.0.109 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `syn` | 2.0.117 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
+| `syn` | 3.0.6 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `sync_wrapper` | 1.0.2 | Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `synstructure` | 0.13.2 | MIT | Copyright 2016 Nika Layzell |
 | `system-deps` | 6.2.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
@@ -847,6 +878,8 @@ Licence expressions in use, by package count:
 | `tinyvec` | 1.11.0 | Zlib OR Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 Daniel "Lokathor" Gee. |
 | `tinyvec_macros` | 0.1.1 | MIT OR Apache-2.0 OR Zlib | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2020 Tomasz "Soveu" Marx<br>Copyright (c) 2020 Soveu |
 | `tokio` | 1.52.3 | MIT | Copyright (c) Tokio Contributors |
+| `tokio-macros` | 2.7.2 | MIT | Copyright (c) 2019 Yoshua Wuyts<br>Copyright (c) Tokio Contributors |
+| `tokio-rustls` | 0.26.6 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2017 quininer kel<br>Copyright (c) 2017 quininer kel |
 | `tokio-util` | 0.7.18 | MIT | Copyright (c) Tokio Contributors |
 | `toml` | 0.8.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
 | `toml` | 0.9.12+spec-1.1.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Individual contributors |
@@ -876,11 +909,16 @@ Licence expressions in use, by package count:
 | `unic-ucd-version` | 0.9.0 | MIT/Apache-2.0 | — |
 | `unicode-ident` | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 1991-2023 Unicode, Inc. |
 | `unicode-segmentation` | 1.13.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 The Rust Project Developers |
+| `unicode-truncate` | 1.1.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2019 Aetf <aetf at unlimitedcodeworks dot xyz> |
+| `unicode-width` | 0.1.14 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 The Rust Project Developers |
+| `unicode-width` | 0.2.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 The Rust Project Developers |
 | `unicode-xid` | 0.2.6 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2015 The Rust Project Developers |
+| `untrusted` | 0.9.0 | ISC | Copyright 2015-2016 Brian Smith.<br>copyright notice and this permission notice appear in all copies. |
 | `url` | 2.5.8 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2013-2025 The rust-url developers |
 | `urlpattern` | 0.3.0 | MIT | Copyright (c) 2021 the Deno authors |
 | `utf-8` | 0.7.6 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of, |
 | `utf8_iter` | 1.0.4 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright Mozilla Foundation |
+| `utf8parse` | 0.2.2 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2016 Joe Wilm |
 | `uuid` | 1.23.1 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2014 The Rust Project Developers<br>Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon |
 | `vcpkg` | 0.2.15 | MIT/Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2017 Jim McGrath |
 | `version-compare` | 0.2.1 | MIT | Copyright (c) 2017 Tim Visée |
@@ -930,6 +968,7 @@ Licence expressions in use, by package count:
 | `windows-strings` | 0.5.1 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
 | `windows-sys` | 0.45.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
 | `windows-sys` | 0.48.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
+| `windows-sys` | 0.52.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
 | `windows-sys` | 0.59.0 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
 | `windows-sys` | 0.60.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
 | `windows-sys` | 0.61.2 | MIT OR Apache-2.0 | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) Microsoft Corporation. |
@@ -990,6 +1029,7 @@ Licence expressions in use, by package count:
 | `zerocopy-derive` | 0.8.48 | BSD-2-Clause OR Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright 2023 The Fuchsia Authors<br>Copyright 2019 The Fuchsia Authors. |
 | `zerofrom` | 0.1.8 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |
 | `zerofrom-derive` | 0.1.7 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |
+| `zeroize` | 1.9.0 | Apache-2.0 OR MIT | copyright notice that is included in or attached to the work<br>copyright license to reproduce, prepare Derivative Works of,<br>Copyright (c) 2018-2026 The RustCrypto Project Developers |
 | `zerotrie` | 0.2.4 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |
 | `zerovec` | 0.11.6 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |
 | `zerovec-derive` | 0.11.3 | Unicode-3.0 | COPYRIGHT AND PERMISSION NOTICE<br>Copyright © 2020-2024 Unicode, Inc. |

@@ -22,7 +22,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useThree } from '@react-three/fiber';
 import * as THREE from 'three';
-import { decodeNodePoints, readBlock, type OpenOctree } from '../persistence/octreeReader';
+import { decodeNodePoints, readBlock, type ExtraArray, type OpenOctree } from '../persistence/octreeReader';
 import type { FilterConfig } from '../components/shell/OctreeShellContext';
 import { classColor01, treeIdColor01, hexToRgb01, UNASSIGNED_RGB } from './palette';
 import type { TerrainDisplay } from './terrain';
@@ -66,7 +66,7 @@ interface TileData {
   classification: Uint8Array;
   intensity: Uint16Array;
   /** Numeric extra columns decoded from the overlay's octree, keyed by name. */
-  extras: Record<string, Float32Array>;
+  extras: Record<string, ExtraArray>;
   count: number;
   points: THREE.Points;
 }
@@ -157,7 +157,7 @@ export default function OverlayCloud({ octree, primaryOffset, visible, color, co
           if (cancelled) return;
           const decoded = decodeNodePoints(
             bytes, octree.meta.scale, octree.meta.offset, octree.meta.pointBytes,
-            (octree.meta.extras ?? []).map(e => e.name),
+            octree.meta.extras ?? [],
           );
           if (decoded.count === 0) continue;
           // Heights above ground: the terrain off each point, in this

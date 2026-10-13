@@ -47,7 +47,7 @@ export interface SecondaryCloud {
  *  string literals; per-extra modes are encoded as `extra:<name>` so the
  *  same ColorMode field carries everything the Display panel exposes
  *  without a separate `extraName` field. */
-export type ColorMode = 'height' | 'intensity' | 'classification' | 'tree_id' | 'semantic' | 'standing_deadwood' | 'laying_deadwood' | 'flat' | 'x' | 'y' | `extra:${string}`;
+export type ColorMode = 'height' | 'intensity' | 'classification' | 'tree_id' | 'semantic' | 'standing_deadwood' | 'laying_deadwood' | 'flat' | 'x' | 'y' | 'return_number' | 'number_of_returns' | `extra:${string}`;
 export type SelectTool = 'rect' | 'lasso' | 'poly';
 export type SelectDepth = 'visible' | 'through';
 /** Continuous colour ramp applied to the scalar modes (height /
@@ -290,7 +290,7 @@ export type HeightMode = 'stored' | 'above_ground';
 export const DEFAULT_DISPLAY: DisplayConfig = {
   colorMode: 'height',
   // Eye-Dome Lighting is off by default — it's a depth-cue post-process
-  // some users want, but the cloud should read the same as RiSCAN's plain
+  // some users want, but the cloud should read the same as a scanner suite's plain
   // dots out of the box. Toggle it on from the Display panel.
   edlEnabled: false,
   edlStrength: 1.5,
@@ -1099,7 +1099,7 @@ export interface TaperMeasurement {
   pulpwoodM3: number;
 }
 
-export type PanelId = 'tools' | 'display' | 'filters' | 'review' | 'ground' | 'history' | 'layers' | 'subset' | 'segment' | 'keys' | 'qc' | 'pointqc' | 'rescan' | 'validation' | 'bucking' | 'thinning' | 'density' | 'report' | 'caliper' | 'slab' | 'scaninspect' | 'plotbound' | 'treehandle' | 'centerline' | 'tst' | 'm3c2' | 'taper' | 'growth' | 'crosssensor' | 'register';
+export type PanelId = 'tools' | 'display' | 'filters' | 'review' | 'ground' | 'history' | 'layers' | 'subset' | 'segment' | 'keys' | 'qc' | 'pointqc' | 'rescan' | 'validation' | 'bucking' | 'thinning' | 'density' | 'report' | 'caliper' | 'slab' | 'scaninspect' | 'plotbound' | 'treehandle' | 'centerline' | 'tst' | 'm3c2' | 'taper' | 'growth' | 'crosssensor' | 'finereg' | 'register';
 
 export interface OctreeShellState {
   /** Currently visible floating panels. The activity bar toggles these. */
@@ -1231,6 +1231,11 @@ export interface OctreeShellState {
    *  Owned by M3C2Panel; see {@link M3C2Summary}. */
   m3c2Summary: M3C2Summary | null;
   setM3c2Summary: (s: M3C2Summary | null) => void;
+  /** The last fine registration's position error (m) — hand-off to the
+   *  M3C2 panel's registration error. Owned by FineRegistrationPanel;
+   *  null until a measurement, cleared with it. */
+  registrationError: { metres: number; movingName: string; referenceName: string } | null;
+  setRegistrationError: (e: { metres: number; movingName: string; referenceName: string } | null) => void;
   /** Measured stems from the Stem Taper panel — hand-off for the Report
    *  panel. Owned by StemTaperPanel; see {@link TaperMeasurement}. */
   taperMeasurements: TaperMeasurement[] | null;

@@ -613,7 +613,7 @@ fn inspect(name: &str, dir: &Path, size: u64) -> GeoidGridFile {
 // Commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn geoid_status() -> GeoidStatus {
     status()
 }
@@ -621,7 +621,7 @@ pub fn geoid_status() -> GeoidStatus {
 /// `model` is a file name, e.g. `"egm96_15.gtx"` — resolved the same way
 /// `nadgrid`'s grid names are, through `geodata::resolve` against the
 /// shared geodetic data folder. `lat`/`lon` are degrees.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn geoid_undulation(model: String, lat: f64, lon: f64) -> Result<f64, String> {
     undulation(&model, lat, lon)
 }

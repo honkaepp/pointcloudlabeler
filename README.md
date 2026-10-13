@@ -27,7 +27,7 @@ Releases page; macOS and Linux build from source.
 
 ## Status
 
-Version 0.1.2 is the current release: a Windows installer on the
+Version 0.1.3 is the current release: a Windows installer on the
 [Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page,
 built from this repository. Development continues here, and a
 software article describing PointCloudLabeler is in preparation for
@@ -62,8 +62,6 @@ SoftwareX.
   (Kabsch), sphere targets matched by RANSAC, point-to-point and
   point-to-plane ICP, and a multi-station adjustment over the whole
   set
-- RIEGL scans: export them from RiSCAN PRO as E57 or LAS/LAZ and
-  import that; the registration comes with the file
 
 ### Analytics
 - Ground classification (Progressive Morphological Filter; Cloth
@@ -86,6 +84,31 @@ SoftwareX.
   crowns (shift over tens of metres plus a small rotation, refined tree
   by tree), checked side by side, and fixed by a lossless georeference
   shift that rewrites no point and is undone by the opposite shift
+- **Every column of the LAS record**: GPS time (stored as an f64, so a
+  pulse's time comes back to the microsecond), colour, near-infrared,
+  scan angle, user data, point source id and the flags are imported as
+  columns under their reserved names, coloured and filtered in the
+  viewport, and written back where the record keeps them on export, in
+  a point format with room for them — as imported, or as edited
+- **Text, PLY and E57 in and out**: the Editor imports a TXT / XYZ /
+  CSV file (columns mapped by name, or by hand in the import dialog,
+  every other column carried exact under its own name), a PLY (its
+  vertex properties) and an E57 (every scan, poses applied, the scan
+  index as the point source id) straight into a dataset, and exports a
+  dataset as text, PLY or E57 with every column along — the same
+  filters, normalisation and reprojection as a LAS export
+- **Fine registration**: two datasets of one plot — two epochs, two
+  sensors — put on each other in six degrees of freedom: symmetric
+  point-to-plane ICP (Rusinkiewicz 2019; GICP, point-to-plane and
+  point-to-point as choices) over a pyramid of decimations with a
+  robust kernel, started from an automatic coarse search by stems and
+  crowns or a global feature search (FPFH + RANSAC) from any heading,
+  the translation and rotation with their standard errors from the
+  covariance at the solution and from a spatial block jackknife, the
+  observability of the fit (a flat field constrains height and tilt
+  and nothing else, and the panel says so), and the registration error
+  handed to M3C2; applied as a new, moved copy with every label kept,
+  the source untouched
 - **Biomass + carbon with uncertainty**: per-tree and plot totals,
   species-specific wood density presets (Repola 2006/2008; Kärkkäinen
   2007; Global Wood Density DB), uncertainty propagated in quadrature
@@ -93,7 +116,8 @@ SoftwareX.
 
 ### Export
 - LAS / LAZ round-trip with Extra Bytes (tree_id, semantic_class,
-  deadwood ids, height-above-ground, …)
+  deadwood ids, height-above-ground, …); the same export as text
+  (TXT / XYZ / CSV), PLY or E57, every column along
 - CSV with all per-tree metrics + QSM uncertainty fields
 - GeoTIFF rasters with EPSG metadata
 
@@ -158,11 +182,44 @@ an `.msi`. Both install the same application.)
 `npm run pack` then zips that MSI together with the install guide as
 `PointCloudLabeler-<version>.zip`, ready to hand to someone else.
 
+### Without a window: command line, console, API, MCP
+
+The same analyses run with no window at all — on a compute server,
+over SSH, from a script, from another program, or from an AI
+assistant. The headless binary links no Tauri, GTK or WebKit:
+
+```bash
+cd src-tauri
+cargo build --release -p pointcloudlabeler
+# → target/release/pointcloudlabeler
+
+pointcloudlabeler preprocess import --source-path plot1001.e57   # a scanner project; then register and export
+pointcloudlabeler dataset import --src-path plot1001.laz --project-folder ./evo
+pointcloudlabeler ground classify --octree-dir ./evo/octrees/plot1001
+pointcloudlabeler segment chm --octree-dir ./evo/octrees/plot1001 --min-height 3
+pointcloudlabeler qc flags --octree-dir ./evo/octrees/plot1001 | jq '.critical'
+pointcloudlabeler metrics plot --octree-dir … --fit rectangular   # stems/ha, m²/ha, Lorey's H
+pointcloudlabeler export report --octree-dir … --out-path plot1001.html   # the inventory report
+pointcloudlabeler export csv --octree-dir … --out-path plot1001_trees.csv  # the per-tree table
+pointcloudlabeler recipe run plots.json      # one recipe, many plots, overnight
+pointcloudlabeler tui                        # the console interface
+pointcloudlabeler serve                      # HTTP API on 127.0.0.1:7878, MCP on /mcp
+pointcloudlabeler mcp                        # MCP server over stdio
+```
+
+Every subcommand is one operation of the **operation catalogue** —
+about seventy, each the same Rust pass a desktop panel runs, with the
+panel's defaults — and the command line, the console, the API and the
+MCP tools are generated from it, so they always agree. See
+[`docs/HEADLESS.md`](docs/HEADLESS.md) for the surfaces and
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for every operation and
+parameter.
+
 ## Quick start
 
 ```
 Project ▶ New Project…      # picks a folder; project metadata only
-Editor ▶ Import LAS / LAZ   # → out-of-core octree
+Editor ▶ Import point cloud # LAS / LAZ / TXT / PLY / E57 → out-of-core octree
 Terrain ▶ Classify ground   # PMF or CSF, then the DTM / DSM / CHM rasters
 Auto-segment ▶ Tree crowns  # CHM-watershed individual-tree delineation
 Metrics ▶ Compute           # per-tree height, DBH, basal area, …
@@ -187,11 +244,21 @@ pointcloudlabeler/
 │   ├── metrics/      # Biomass + carbon (browser-side math)
 │   └── persistence/  # File I/O, octree reader, project store
 ├── src-tauri/        # Rust backend
-│   └── src/commands/ # IPC commands: octree builder, importers,
-│                     # QSM (slice + Raumonen 2013), terrain,
-│                     # co-registration, GeoTIFF, exports
+│   ├── src/commands/ # IPC commands: octree builder, importers,
+│   │                 # QSM (slice + Raumonen 2013), terrain,
+│   │                 # co-registration, GeoTIFF, exports
+│   ├── src/ops/      # The operation catalogue: every analysis as a
+│   │                 # named, typed, headless operation
+│   └── src/headless/ # Command line, recipes, console, HTTP API, MCP
 └── docs/             # User documentation
 ```
+
+The Rust crate builds two binaries. The desktop application (feature
+`gui`, the default) is the Tauri shell around the commands; the
+headless binary (features `cli`, `tui`, `api`, `mcp` — `headless` for
+all) is the operation catalogue behind a command line, a console, an
+HTTP API and an MCP server, and links no Tauri, GTK or WebKit. The
+analysis passes are shared; only the surfaces differ.
 
 Each importer is a self-contained module under `commands/` with its
 own UI panel under `components/preprocessing/`, and no importer touches
@@ -207,7 +274,8 @@ segmentation + branch hierarchy).
 ```bash
 cd src-tauri
 cargo test --lib qsm        # the QSM math tests
-cargo test --lib            # all backend tests
+cargo test --lib            # all backend tests, desktop build
+cargo test --no-default-features --features headless   # the same, headless build, plus the surfaces
 cd ..
 npx tsc --noEmit            # frontend type check
 npm test                    # frontend tests, including the source-pinning suites

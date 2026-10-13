@@ -128,7 +128,7 @@ fn write_crash_entry(info: &std::panic::PanicInfo<'_>) -> std::io::Result<()> {
 /// unhandled rejections. `kind` is a short token so the log stays
 /// greppable; the message is capped so a page in a loop cannot fill the
 /// disk with one entry per frame.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crash_log(kind: String, message: String) -> bool {
     const MAX_MESSAGE: usize = 16 * 1024;
     let kind: String = kind
@@ -156,7 +156,7 @@ pub fn crash_log(kind: String, message: String) -> bool {
 }
 
 /// Where the log is, so the page can tell the user where to look.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crash_log_location() -> Option<String> {
     crash_log_path().map(|p| p.to_string_lossy().into_owned())
 }
@@ -192,7 +192,7 @@ static LAST_RENDERER_FAILURE: Mutex<Option<RendererFailure>> = Mutex::new(None);
 /// deliberately: the page that asks is the one reloaded after the
 /// failure, and this process outlived it. A restart clears it; the log
 /// file keeps the history.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn renderer_last_failure() -> Option<RendererFailure> {
     LAST_RENDERER_FAILURE.lock().clone()
 }
@@ -269,14 +269,14 @@ pub fn reload_recovers(kind: i32) -> bool {
 /// Subscribe to WebView2's ProcessFailed on the main window. Called once
 /// from setup. On other platforms there is nothing to subscribe to, and
 /// the crash log still gets the panic hook and the renderer's reports.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 pub fn watch_webview(window: &tauri::WebviewWindow) {
     let _ = window.with_webview(|platform| {
         webview_watch::install(&platform.controller());
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "gui"))]
 pub fn watch_webview(_window: &tauri::WebviewWindow) {}
 
 // ---------------------------------------------------------------------
@@ -353,6 +353,7 @@ pub fn sample_interval(busy: bool) -> std::time::Duration {
 /// Start the sampler. One thread for the life of the process; each
 /// sample is taken on the main thread, because the WebView2 objects it
 /// asks live there.
+#[cfg(feature = "gui")]
 pub fn start_memory_watch(window: tauri::WebviewWindow) {
     std::thread::Builder::new()
         .name("memory-watch".into())
@@ -369,7 +370,7 @@ pub fn start_memory_watch(window: tauri::WebviewWindow) {
         .ok();
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 fn sample_once(window: &tauri::WebviewWindow, busy: bool) {
     let _ = window.with_webview(move |platform| {
         let webview = webview_watch::process_memory(&platform.environment());
@@ -382,7 +383,7 @@ fn sample_once(window: &tauri::WebviewWindow, busy: bool) {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "gui"))]
 fn sample_once(_window: &tauri::WebviewWindow, busy: bool) {
     log_memory(&format_sample(
         busy,
@@ -392,7 +393,7 @@ fn sample_once(_window: &tauri::WebviewWindow, busy: bool) {
     ));
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 mod webview_watch {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2Environment8,

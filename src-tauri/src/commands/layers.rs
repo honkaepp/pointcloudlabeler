@@ -107,7 +107,7 @@ pub fn delete_layer(octree_dir: &str, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_layers_list(octree_dir: String) -> Result<Vec<LayerEntry>, String> {
     list_layers(&octree_dir)
 }
@@ -118,7 +118,8 @@ pub fn octree_layers_list(octree_dir: String) -> Result<Vec<LayerEntry>, String>
 /// user chose in a dialog. A renderer naming any other directory is
 /// refused, so nothing here can make or delete a file outside what the
 /// user opened.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_layer_prepare(
     state: tauri::State<'_, crate::state::AppState>,
     octree_dir: String,
@@ -128,7 +129,8 @@ pub fn octree_layer_prepare(
     prepare_layer(&dir.to_string_lossy(), &id)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_layer_delete(
     state: tauri::State<'_, crate::state::AppState>,
     octree_dir: String,

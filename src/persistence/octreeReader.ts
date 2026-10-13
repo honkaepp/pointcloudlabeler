@@ -449,13 +449,59 @@ export interface OctreeTile {
 }
 
 /** One numeric extra column carried into the octree from the source file
- *  (LAS Extra-Bytes). Stored as a trailing f32 per point on disk. The
- *  observed min/max — recorded by the converter — drive the colour ramp
- *  the Display panel exposes for this extra. */
+ *  (a LAS Extra-Bytes dimension, or a standard field under its reserved
+ *  name — gps_time, red, scan_angle, …). Stored after the base record,
+ *  one after the other, as an f32 (4 bytes) or — `type: 'float64'` — an
+ *  f64 (8 bytes): GPS time is about 1e9 s and f32 steps by 64 s there.
+ *  The observed min/max — recorded by the converter — drive the colour
+ *  ramp the Display panel exposes for this extra. */
 export interface OctreeExtra {
   name: string;
   min: number;
   max: number;
+  /** Absent on datasets written before the type existed: float32. */
+  type?: 'float32' | 'float64';
+}
+
+/** A decoded extra column: f32 columns as Float32Array, f64 as Float64Array. */
+export type ExtraArray = Float32Array | Float64Array;
+
+/** An extra column's place in the point record. */
+export interface ExtraSlot {
+  name: string;
+  offset: number;
+  width: 4 | 8;
+  f64: boolean;
+}
+
+/** The record layout of the extras — the one place a column's offset
+ *  and width come from. A bare name (the old call shape, and the
+ *  tests') is an f32 column. */
+export function extraLayout(extras: readonly (string | OctreeExtra)[]): ExtraSlot[] {
+  const out: ExtraSlot[] = [];
+  let offset = 21;
+  for (const e of extras) {
+    const name = typeof e === 'string' ? e : e.name;
+    const f64 = typeof e !== 'string' && e.type === 'float64';
+    const width = f64 ? 8 : 4;
+    out.push({ name, offset, width, f64 });
+    offset += width;
+  }
+  return out;
+}
+
+/** The point stride a layout implies. */
+export function layoutStride(extras: readonly (string | OctreeExtra)[]): number {
+  const l = extraLayout(extras);
+  return l.length === 0 ? 21 : l[l.length - 1].offset + l[l.length - 1].width;
+}
+
+function allocExtra(slot: ExtraSlot, count: number): ExtraArray {
+  return slot.f64 ? new Float64Array(count) : new Float32Array(count);
+}
+
+function readExtraAt(dv: DataView, o: number, slot: ExtraSlot): number {
+  return slot.f64 ? dv.getFloat64(o, true) : dv.getFloat32(o, true);
 }
 
 /** A dataset's recorded coordinate reference system: either a lookup
@@ -998,10 +1044,10 @@ export interface DecodedNode {
    *  see an all-zero buffer. The editor's PatchStore overrides this
    *  in-memory without rewriting octree.bin. */
   semantic: Uint8Array;
-  /** Per-extra-column Float32Array (length = count), keyed by the
-   *  extra's name from metadata.extras. Empty object on v1 / v2 files
-   *  or v3 files imported without extras. */
-  extras: Record<string, Float32Array>;
+  /** Per-extra-column typed array (length = count; Float64Array for an
+   *  f64 column), keyed by the extra's name from metadata.extras. Empty
+   *  object on v1 / v2 files or v3 files imported without extras. */
+  extras: Record<string, ExtraArray>;
   count: number;
 }
 
@@ -1014,10 +1060,11 @@ export function decodeNodePoints(
    *  Falls back to 20 if undefined so the function stays
    *  backwards-compatible. */
   pointBytes: number = 20,
-  /** Names of the extra columns in record order, matched against
-   *  metadata.extras. Empty / undefined skips the trailing extras even
-   *  if pointBytes implies they're present. */
-  extraNames: readonly string[] = [],
+  /** The extra columns in record order — metadata.extras entries (with
+   *  their types), or bare names for f32 columns. Empty / undefined
+   *  skips the trailing extras even if pointBytes implies they're
+   *  present. */
+  extraNames: readonly (string | OctreeExtra)[] = [],
   /** When given, only extras whose name is in this set are materialised
    *  as Float32Arrays — the rest are skipped entirely. On clouds with
    *  many extra columns this is the difference between 4·N bytes/point
@@ -1040,16 +1087,16 @@ export function decodeNodePoints(
   // extras are present, but we don't enforce — the cap on the f32 read
   // is whatever pointBytes − 21 fits.
   const hasSemantic = pointBytes >= 21;
-  const nExtras = Math.max(0, Math.min(extraNames.length, Math.floor((pointBytes - 21) / 4)));
-  const extras: Record<string, Float32Array> = {};
-  // Decode plan: (column index, output array) for each wanted extra.
-  const plan: Array<{ off: number; arr: Float32Array }> = [];
-  for (let k = 0; k < nExtras; k++) {
-    const name = extraNames[k];
-    if (wantedExtras && !wantedExtras.has(name)) continue;
-    const arr = new Float32Array(count);
-    extras[name] = arr;
-    plan.push({ off: 21 + k * 4, arr });
+  const extras: Record<string, ExtraArray> = {};
+  // Decode plan: (slot, output array) for each wanted extra that fits
+  // inside the record.
+  const plan: Array<{ slot: ExtraSlot; arr: ExtraArray }> = [];
+  for (const slot of extraLayout(extraNames)) {
+    if (slot.offset + slot.width > pointBytes) break;
+    if (wantedExtras && !wantedExtras.has(slot.name)) continue;
+    const arr = allocExtra(slot, count);
+    extras[slot.name] = arr;
+    plan.push({ slot, arr });
   }
   for (let i = 0; i < count; i++) {
     const o = i * pointBytes;
@@ -1075,7 +1122,7 @@ export function decodeNodePoints(
     returnNumber[i] = ret;
     semantic[i] = sem;
     for (let k = 0; k < plan.length; k++) {
-      plan[k].arr[i] = dv.getFloat32(o + plan[k].off, true);
+      plan[k].arr[i] = readExtraAt(dv, o + plan[k].slot.offset, plan[k].slot);
     }
   }
   return { positions, treeIds, intensity, classification, returnNumber, semantic, extras, count };
@@ -1089,14 +1136,18 @@ export function decodeExtraColumn(
   bytes: ArrayBuffer,
   pointBytes: number,
   k: number,
-): Float32Array {
+  /** The extras in record order (with their types); absent = every
+   *  column an f32, as before types existed. */
+  extras?: readonly (string | OctreeExtra)[],
+): ExtraArray {
   const dv = new DataView(bytes);
   const count = (bytes.byteLength / pointBytes) | 0;
-  const off = 21 + k * 4;
-  const out = new Float32Array(count);
-  if (off + 4 > pointBytes) return out; // column out of range — all zeros
+  const slot: ExtraSlot = extras ? extraLayout(extras)[k] : { name: '', offset: 21 + k * 4, width: 4, f64: false };
+  if (!slot) return new Float32Array(count);
+  const out = allocExtra(slot, count);
+  if (slot.offset + slot.width > pointBytes) return out; // column out of range — all zeros
   for (let i = 0; i < count; i++) {
-    out[i] = dv.getFloat32(i * pointBytes + off, true);
+    out[i] = readExtraAt(dv, i * pointBytes + slot.offset, slot);
   }
   return out;
 }
@@ -1116,7 +1167,7 @@ export async function readNodePoints(
   scale: [number, number, number],
   offset: [number, number, number],
   pointBytes: number,
-  extraNames: readonly string[],
+  extraNames: readonly (string | OctreeExtra)[],
   wantedExtras: ReadonlySet<string>,
 ): Promise<DecodedNode> {
   const api = getApi();
@@ -1135,13 +1186,13 @@ export async function readNodePoints(
   ];
   if (hasSemantic) fields.push([20, 1]);
   // Wanted extras, in metadata.extras record order so the decode below
-  // can walk extraKs and the returned sections in lock-step.
-  const extraKs: number[] = [];
-  const nExtras = Math.max(0, Math.floor((pointBytes - 21) / 4));
-  for (let k = 0; k < Math.min(extraNames.length, nExtras); k++) {
-    if (!wantedExtras.has(extraNames[k])) continue;
-    fields.push([21 + k * 4, 4]);
-    extraKs.push(k);
+  // can walk the slots and the returned sections in lock-step.
+  const slots: ExtraSlot[] = [];
+  for (const slot of extraLayout(extraNames)) {
+    if (slot.offset + slot.width > pointBytes) break;
+    if (!wantedExtras.has(slot.name)) continue;
+    fields.push([slot.offset, slot.width]);
+    slots.push(slot);
   }
 
   const buf = await api.octreeReadBlockColumns(dir, byteOffset, byteSize, pointBytes, fields);
@@ -1154,7 +1205,7 @@ export async function readNodePoints(
   const classification = new Uint8Array(count);
   const returnNumber = new Uint8Array(count);
   const semantic = new Uint8Array(count);
-  const extras: Record<string, Float32Array> = {};
+  const extras: Record<string, ExtraArray> = {};
 
   let s = 0; // running section start within the SoA buffer
   // xyz — same world reconstruction + axis remap as decodeNodePoints
@@ -1182,11 +1233,11 @@ export async function readNodePoints(
     for (let i = 0; i < count; i++) semantic[i] = dv.getUint8(s + i);
     s += count;
   }
-  for (const k of extraKs) {
-    const arr = new Float32Array(count);
-    for (let i = 0; i < count; i++) arr[i] = dv.getFloat32(s + i * 4, true);
-    s += count * 4;
-    extras[extraNames[k]] = arr;
+  for (const slot of slots) {
+    const arr = allocExtra(slot, count);
+    for (let i = 0; i < count; i++) arr[i] = readExtraAt(dv, s + i * slot.width, slot);
+    s += count * slot.width;
+    extras[slot.name] = arr;
   }
 
   return { positions, treeIds, intensity, classification, returnNumber, semantic, extras, count };
@@ -1201,18 +1252,21 @@ export async function readExtraColumn(
   byteSize: number,
   pointBytes: number,
   k: number,
-): Promise<Float32Array> {
+  /** The extras in record order (with their types); absent = all f32. */
+  extras?: readonly (string | OctreeExtra)[],
+): Promise<ExtraArray> {
   const api = getApi();
-  if (api?.octreeReadBlockColumns) {
-    const buf = await api.octreeReadBlockColumns(dir, byteOffset, byteSize, pointBytes, [[21 + k * 4, 4]]);
+  const slot: ExtraSlot | undefined = extras ? extraLayout(extras)[k] : { name: '', offset: 21 + k * 4, width: 4, f64: false };
+  if (api?.octreeReadBlockColumns && slot) {
+    const buf = await api.octreeReadBlockColumns(dir, byteOffset, byteSize, pointBytes, [[slot.offset, slot.width]]);
     const count = (byteSize / pointBytes) | 0;
     const dv = new DataView(buf);
-    const out = new Float32Array(count);
-    for (let i = 0; i < count; i++) out[i] = dv.getFloat32(i * 4, true);
+    const out = allocExtra(slot, count);
+    for (let i = 0; i < count; i++) out[i] = readExtraAt(dv, i * slot.width, slot);
     return out;
   }
   const bytes = await readBlock(dir, byteOffset, byteSize);
-  return decodeExtraColumn(bytes, pointBytes, k);
+  return decodeExtraColumn(bytes, pointBytes, k, extras);
 }
 
 /** Fetch the fields the deep-selection pass needs from one node —

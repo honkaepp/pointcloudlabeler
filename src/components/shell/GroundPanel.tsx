@@ -454,7 +454,7 @@ export default function GroundPanel() {
           className="btn !h-7 w-full justify-center mono text-[11px] mt-1.5"
           disabled={!canExportNormalized || running}
           onClick={exportNormalized}
-          title="Export a LAS/LAZ where Z is height above ground (Z − DTM)"
+          title="Export the cloud (LAS, LAZ, TXT, PLY or E57) with Z as height above ground (Z − DTM)"
         >
           Export normalized cloud…
         </button>

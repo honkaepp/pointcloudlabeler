@@ -39,9 +39,9 @@ export interface KeyAction {
 
 // The canonical action list — order defines panel order within each group.
 export const KEY_ACTIONS: readonly KeyAction[] = [
-  { id: 'file.import',          group: 'File',   label: 'Import LAS / LAZ',            defaultChord: 'o' },
+  { id: 'file.import',          group: 'File',   label: 'Import point cloud',            defaultChord: 'o' },
   { id: 'file.save',            group: 'File',   label: 'Save edits',                  defaultChord: 'mod+s' },
-  { id: 'file.export',          group: 'File',   label: 'Export to LAS',               defaultChord: '' },
+  { id: 'file.export',          group: 'File',   label: 'Export cloud',               defaultChord: '' },
 
   { id: 'edit.assign',          group: 'Edit',   label: 'Assign active id to selection', defaultChord: 'a', hint: 'tree_id / deadwood / semantic — follows the colour mode' },
   { id: 'edit.reset',           group: 'Edit',   label: 'Reset selection to 0',        defaultChord: 'r', hint: 'unassign / unlabel the selected points' },

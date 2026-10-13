@@ -1,6 +1,6 @@
 // E57 scan-position list — one row per Data3D section in the imported
 // .e57 file. Pick which scans to export, optionally crop to a world bbox
-// (post-pose / project frame, same convention as the Riegl panel) and
+// (post-pose / project frame, the same convention every panel uses) and
 // merge into a single LAS / LAZ the Editor module can open.
 
 import { useMemo, useState } from 'react';

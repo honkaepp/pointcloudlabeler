@@ -21,7 +21,7 @@ fn settings_path() -> AppResult<PathBuf> {
     Ok(dir.join(SETTINGS_FILE))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn settings_load() -> AppResult<JsonValue> {
     let path = settings_path()?;
     if !path.exists() {
@@ -35,7 +35,7 @@ pub fn settings_load() -> AppResult<JsonValue> {
     Ok(value)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn settings_save(value: JsonValue) -> AppResult<()> {
     let path = settings_path()?;
     // Atomic write: stage to a temp file then rename, so a crash mid-write

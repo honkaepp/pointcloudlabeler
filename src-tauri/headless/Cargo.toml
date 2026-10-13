@@ -1,0 +1,40 @@
+# PointCloudLabeler without its window: the command line and, with their
+# features, the console interface, the HTTP API and the MCP server over
+# the operation catalogue — see ../src/headless. Everything is in the
+# application's library, built without its `gui` feature; this crate is
+# the binary. Its own crate rather than a second `[[bin]]` of the
+# application's: the installer bundles every binary of that package,
+# and one that is only built with other features is not there to
+# bundle.
+#
+#     cd src-tauri
+#     cargo build --release -p pointcloudlabeler
+#     # → target/release/pointcloudlabeler   (pointcloudlabeler.exe on Windows)
+[package]
+name = "pointcloudlabeler"
+version = "0.1.3"
+description = "PointCloudLabeler without its window: the command line, the console interface, the HTTP API and the MCP server"
+authors = ["Eppu Honkanen"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/honkaepp/pointcloudlabeler"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+
+[[bin]]
+name = "pointcloudlabeler"
+path = "src/main.rs"
+
+[dependencies]
+pointcloudlabeler-editor = { path = "..", default-features = false }
+
+[features]
+# The surfaces, each the library's feature of the same name — see the
+# table in docs/HEADLESS.md. `headless` is every one of them.
+default = ["headless"]
+cli = ["pointcloudlabeler-editor/cli"]
+tui = ["pointcloudlabeler-editor/tui"]
+mcp = ["pointcloudlabeler-editor/mcp"]
+api = ["pointcloudlabeler-editor/api"]
+api-tls = ["pointcloudlabeler-editor/api-tls"]
+headless = ["cli", "tui", "mcp", "api", "api-tls"]

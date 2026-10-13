@@ -88,7 +88,7 @@ pub const Q_WIND: u8 = 4;
 /// Not evaluated — no tree id, deleted, or a tree below the size floor.
 pub const Q_UNEVALUATED: u8 = 0;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, schemars::JsonSchema, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PointQcParams {
     /// Reflectance band to keep, in the units of the chosen column.

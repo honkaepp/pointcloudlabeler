@@ -13,15 +13,23 @@
 //! chunk to a persistent BufWriter-wrapped fd — no structured-clone IPC,
 //! no 2 GiB Node Buffer cap, no main-process middleman.
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::fs;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::path::PathBuf;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
+#[cfg(feature = "gui")]
 use tauri::{ipc::Response, State};
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::error::{AppError, AppResult};
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::state::{AppState, CloudHandle};
 
 #[derive(Debug, Serialize)]
@@ -49,6 +57,7 @@ pub struct CloudListItem {
     pub size: u64,
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn new_cloud_id() -> String {
     use std::time::SystemTime;
     let ms = SystemTime::now()
@@ -82,6 +91,7 @@ const MAX_CLOUD_HEADER: usize = 1024 * 1024;
 /// outside the directory the join was supposed to confine it to. The
 /// `.tcloud` suffix limited what could be reached but did not confine
 /// it, and "limited" is not the property wanted from a delete.
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn valid_cloud_id(id: &str) -> AppResult<()> {
     crate::fsgrant::safe_component(id).map_err(AppError::msg)
 }
@@ -119,6 +129,7 @@ pub fn parse_cloud_header(path: &std::path::Path) -> Option<(serde_json::Value, 
 ///
 /// The temp name carries the handle so two writers aimed at one path
 /// cannot stage over each other.
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn open_staged(dest: &std::path::Path, handle: u64) -> AppResult<(fs::File, PathBuf)> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
@@ -149,6 +160,7 @@ fn open_staged(dest: &std::path::Path, handle: u64) -> AppResult<(fs::File, Path
 /// A failed rename leaves the temp in place and says where it is — the
 /// data has been written, and deleting it because the last step failed
 /// would be the worse of the two outcomes.
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn commit_staged(file: fs::File, temp: &std::path::Path, dest: &std::path::Path) -> AppResult<()> {
     file.sync_all()?;
     drop(file);
@@ -161,7 +173,8 @@ fn commit_staged(file: fs::File, temp: &std::path::Path, dest: &std::path::Path)
     Ok(())
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_write_open(
     state: State<'_, AppState>,
     #[allow(non_snake_case)] existingId: Option<String>,
@@ -191,7 +204,8 @@ pub fn cloud_write_open(
 /// payloads (e.g. multi-GB TXT exports) directly to disk without going through
 /// a JS-side string accumulator. This is the export path that fixes the OOM
 /// crash in WebView2 when the user tried to dump a 90M-point cloud as TXT.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_write_open(
     state: State<'_, AppState>,
     path: String,
@@ -214,7 +228,8 @@ pub fn file_write_open(
     })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_write_append(
     state: State<'_, AppState>,
     handle: u64,
@@ -231,7 +246,8 @@ pub fn cloud_write_append(
 /// Raw binary append. Renderer sends an ArrayBuffer as the IPC body (no JSON
 /// number-array round trip) and passes the write handle via the `x-handle`
 /// header. This is the fast path used by the Tauri bridge.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_write_append_raw(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,
@@ -256,7 +272,8 @@ pub fn cloud_write_append_raw(
     Ok(true)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_write_commit(state: State<'_, AppState>, handle: u64) -> AppResult<bool> {
     let mut writes = state.cloud_writes.lock();
     let entry = writes
@@ -266,7 +283,8 @@ pub fn cloud_write_commit(state: State<'_, AppState>, handle: u64) -> AppResult<
     Ok(true)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_write_abort(state: State<'_, AppState>, handle: u64) -> AppResult<bool> {
     let mut writes = state.cloud_writes.lock();
     if let Some(entry) = writes.remove(&handle) {
@@ -280,7 +298,8 @@ pub fn cloud_write_abort(state: State<'_, AppState>, handle: u64) -> AppResult<b
     Ok(false)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_read_open(state: State<'_, AppState>, id: String) -> AppResult<CloudReadOpen> {
     let dir = state.clouds_dir()?;
     let file_path = dir.join(format!("{id}.tcloud"));
@@ -303,7 +322,8 @@ pub fn cloud_read_open(state: State<'_, AppState>, id: String) -> AppResult<Clou
     })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_read_chunk(
     state: State<'_, AppState>,
     handle: u64,
@@ -328,12 +348,14 @@ pub fn cloud_read_chunk(
     Ok(Response::new(buf))
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_read_close(state: State<'_, AppState>, handle: u64) -> bool {
     state.cloud_reads.lock().remove(&handle).is_some()
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_list(state: State<'_, AppState>) -> AppResult<Vec<CloudListItem>> {
     let dir = match state.clouds_dir() {
         Ok(d) => d,
@@ -386,7 +408,8 @@ pub fn cloud_list(state: State<'_, AppState>) -> AppResult<Vec<CloudListItem>> {
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_delete(state: State<'_, AppState>, id: String) -> bool {
     if valid_cloud_id(&id).is_err() { return false }
     let Ok(dir) = state.clouds_dir() else { return false };
@@ -394,7 +417,8 @@ pub fn cloud_delete(state: State<'_, AppState>, id: String) -> bool {
     fs::remove_file(&path).is_ok()
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn cloud_rename(state: State<'_, AppState>, id: String, name: String) -> AppResult<bool> {
     valid_cloud_id(&id)?;
     let dir = state.clouds_dir()?;

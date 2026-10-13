@@ -8,15 +8,22 @@
 // classification), and converts to LAS / LAZ the Editor can import as
 // an octree.
 //
-// Unlike Riegl / E57 / PTX, an ASCII cloud has no concept of "scan
+// Unlike E57 / PTX, an ASCII cloud has no concept of "scan
 // position" — it's one big bag of points. The Preprocessing UI still
 // keeps the per-file manifest pattern (one panel entry per imported
 // file with its column mapping cached) so re-opening the PointCloudLabeler project
 // re-lists every prepared file with its mapping ready.
 
+#[cfg(feature = "gui")]
+
 use tauri::State;
 
+#[cfg(feature = "gui")]
 use crate::state::AppState;
+use crate::progress::Progress;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
+use tauri::Window;
 use std::fs::{create_dir_all, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -24,7 +31,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::pointscale::{ColourScale, IntensityScale};
-use tauri::{Emitter, Window};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +79,11 @@ pub struct XyzMapping {
     pub g: Option<u32>,
     pub b: Option<u32>,
     pub classification: Option<u32>,
+    /// A per-point time column, written as the LAS GPS time (f64) so
+    /// the octree import carries it as its gps_time column. Absent in
+    /// manifests written before the role existed.
+    #[serde(default)]
+    pub gps_time: Option<u32>,
 }
 
 const MANIFEST_VERSION: u32 = 1;
@@ -84,19 +95,13 @@ struct Manifest {
     summary: XyzProjectSummary,
 }
 
-#[derive(Serialize, Clone, Copy)]
-struct ProgressMsg<'a> {
-    stage: &'a str,
-    pct: f32,
-}
-
-fn emit_progress(window: &Window, pct: f32) {
-    let _ = window.emit("xyz-progress", ProgressMsg { stage: "xyz", pct });
+fn emit_progress(progress: &Progress, pct: f32) {
+    progress.report("xyz", pct);
 }
 
 // --- public commands ------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn xyz_list_projects(project_folder: String) -> Result<Vec<XyzProjectSummary>, String> {
     let dir = Path::new(&project_folder).join("preprocessing").join("xyz");
     if !dir.is_dir() {
@@ -116,7 +121,7 @@ pub fn xyz_list_projects(project_folder: String) -> Result<Vec<XyzProjectSummary
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn xyz_import_project(
     project_folder: String,
     source_path: String,
@@ -198,6 +203,7 @@ pub fn xyz_import_project(
                 "g" | "green" => mapping.g = Some(i as u32),
                 "b" | "blue" => mapping.b = Some(i as u32),
                 "class" | "classification" => mapping.classification = Some(i as u32),
+                "t" | "time" | "gps_time" | "gpstime" | "timestamp" => mapping.gps_time = Some(i as u32),
                 _ => {}
             }
         }
@@ -228,7 +234,7 @@ pub fn xyz_import_project(
     Ok(summary)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn xyz_set_mapping(
     project_folder: String,
     xyz_id: String,
@@ -251,7 +257,7 @@ pub fn xyz_set_mapping(
     Ok(m.summary)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn xyz_remove_project(project_folder: String, xyz_id: String) -> Result<(), String> {
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
@@ -289,7 +295,8 @@ pub struct XyzExportResult {
     pub point_count: u64,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn xyz_export(
     state: State<'_, AppState>,
     window: Window,
@@ -298,6 +305,7 @@ pub async fn xyz_export(
     bbox: XyzExportBbox,
     out_path: String,
 ) -> Result<XyzExportResult, String> {
+    let progress = Progress::window(window, "xyz-progress");
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
     // See fsgrant::safe_component.
@@ -318,15 +326,15 @@ pub async fn xyz_export(
     let bytes = std::fs::read(&manifest_path).map_err(|e| format!("read manifest: {e}"))?;
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| format!("parse manifest: {e}"))?;
     let summary = manifest.summary;
-    tauri::async_runtime::spawn_blocking(move || {
-        run_xyz_export(&window, &summary, &bbox, &out_path)
+    crate::rt::spawn_blocking(move || {
+        run_xyz_export(&progress, &summary, &bbox, &out_path)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_xyz_export(
-    window: &Window,
+pub fn run_xyz_export(
+    progress: &Progress,
     summary: &XyzProjectSummary,
     bbox: &XyzExportBbox,
     out_path: &str,
@@ -334,7 +342,7 @@ fn run_xyz_export(
     use las::{Builder, Color as LasColor, Point as LasPoint, Transform as LasTransform, Vector, Writer};
     use las::point::Format;
 
-    emit_progress(window, 0.0);
+    emit_progress(progress, 0.0);
 
     let delim = name_to_delim(&summary.delimiter);
     let m = &summary.mapping;
@@ -392,7 +400,7 @@ fn run_xyz_export(
         seen += 1;
         if seen & 0x3FFFF == 0 {
             bbox_total = bbox_total.max(seen);
-            emit_progress(window, 0.45 * (seen as f32 / bbox_total as f32).clamp(0.0, 1.0));
+            emit_progress(progress, 0.45 * (seen as f32 / bbox_total as f32).clamp(0.0, 1.0));
         }
     }
     let iscale = IntensityScale::from_range(imin, imax);
@@ -406,14 +414,21 @@ fn run_xyz_export(
     let total_points = seen;
 
     // -- Pass 2: write LAS / LAZ. --
+    // Point format by what the mapping names: colour columns ask for a
+    // colour format (the las crate refuses a colourless point in one),
+    // a time column for a GPS-time format — 0, 1 (time), 2 (colour) or
+    // 3 (both).
+    let any_color = matches!((m.r, m.g, m.b), (Some(_), Some(_), Some(_)));
+    let any_time = m.gps_time.is_some();
     let mut builder = Builder::from((1, 4));
-    builder.point_format = Format::new(2).map_err(|e| format!("las format: {e}"))?;
+    let fmt = (if any_time { 1 } else { 0 }) + (if any_color { 2 } else { 0 });
+    builder.point_format = Format::new(fmt).map_err(|e| format!("las format: {e}"))?;
     builder.transforms = Vector {
         x: LasTransform { scale: 0.001, offset: ox },
         y: LasTransform { scale: 0.001, offset: oy },
         z: LasTransform { scale: 0.001, offset: oz },
     };
-    builder.generating_software = "PointCloudLabeler — XYZ/CSV preprocessing".to_string();
+    builder.generating_software = "PointCloudLabeler XYZ export".to_string();
     let header = builder.into_header().map_err(|e| format!("build las header: {e}"))?;
     let mut writer = Writer::from_path(out_path, header)
         .map_err(|e| format!("create {out_path}: {e}"))?;
@@ -436,7 +451,7 @@ fn run_xyz_export(
         read += 1;
         if read & 0x3FFFF == 0 && total_points > 0 {
             let pct = 0.5 + 0.49 * (read as f32 / total_points as f32).clamp(0.0, 1.0);
-            emit_progress(window, pct);
+            emit_progress(progress, pct);
         }
         let cells: Vec<&str> = split_cells(trimmed, delim);
         if cells.len() <= need_cols as usize { continue; }
@@ -479,7 +494,13 @@ fn run_xyz_export(
             number_of_returns: 1,
             ..Default::default()
         };
-        lp.color = color;
+        lp.color = if any_color { color.or(Some(LasColor { red: 0, green: 0, blue: 0 })) } else { None };
+        // A time column goes out as the GPS time, exactly as the file had
+        // it (f64); a cell that is not a number is a zero, not a skipped
+        // point.
+        lp.gps_time = if any_time {
+            Some(m.gps_time.and_then(|c| parse_f64(cells.get(c as usize))).filter(|v| v.is_finite()).unwrap_or(0.0))
+        } else { None };
         lp.classification = las::point::Classification::new(classification)
             .unwrap_or(las::point::Classification::Unclassified);
         writer.write_point(lp).map_err(|e| format!("write point: {e}"))?;
@@ -487,7 +508,7 @@ fn run_xyz_export(
     }
 
     writer.close().map_err(|e| format!("close las/laz: {e}"))?;
-    emit_progress(window, 1.0);
+    emit_progress(progress, 1.0);
     Ok(XyzExportResult {
         out_path: out_path.to_string(),
         point_count: written,
@@ -500,7 +521,7 @@ fn run_xyz_export(
 /// of the head slice; pick whichever is most consistent (i.e. has the
 /// same count on every line). Falls back to whitespace if no
 /// single-char delimiter dominates.
-fn sniff_delimiter<'a>(head_lines: &'a [&'a str]) -> (char, &'static str) {
+pub(crate) fn sniff_delimiter<'a>(head_lines: &'a [&'a str]) -> (char, &'static str) {
     let candidates: &[(char, &'static str)] = &[
         (',', "comma"),
         ('\t', "tab"),
@@ -543,7 +564,7 @@ fn sniff_delimiter<'a>(head_lines: &'a [&'a str]) -> (char, &'static str) {
 /// real column with a missing value. Filtering those, which the sniff
 /// did, counted `1.0,,3.0` as two columns where there are three, so the
 /// user's mapping was offset from what the parser indexed.
-fn split_cells(line: &str, delim: char) -> Vec<&str> {
+pub(crate) fn split_cells(line: &str, delim: char) -> Vec<&str> {
     if delim == ' ' {
         line.split_ascii_whitespace().collect()
     } else {
@@ -569,11 +590,11 @@ fn count_columns(line: &str, delim: char) -> u32 {
 /// headerless one it made "123.45" fail to parse, so `sniff_header`
 /// concluded the data row was a header — and the first point of the
 /// cloud silently never arrived.
-fn strip_bom(s: &str) -> &str {
+pub(crate) fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
-fn sniff_header(first_line: &str, delim: char, column_count: u32) -> (bool, Vec<String>) {
+pub(crate) fn sniff_header(first_line: &str, delim: char, column_count: u32) -> (bool, Vec<String>) {
     let cells: Vec<&str> = split_cells(first_line, delim).into_iter().map(|s| s.trim()).collect();
     if cells.is_empty() { return (false, vec![]); }
     // If ANY cell on the first line fails to parse as a float, treat it
@@ -591,7 +612,7 @@ fn sniff_header(first_line: &str, delim: char, column_count: u32) -> (bool, Vec<
     }
 }
 
-fn name_to_delim(name: &str) -> char {
+pub(crate) fn name_to_delim(name: &str) -> char {
     match name {
         "comma" => ',',
         "tab" => '\t',
@@ -600,13 +621,13 @@ fn name_to_delim(name: &str) -> char {
     }
 }
 
-fn parse_f64(s: Option<&&str>) -> Option<f64> {
+pub(crate) fn parse_f64(s: Option<&&str>) -> Option<f64> {
     s.and_then(|t| t.trim().parse::<f64>().ok())
 }
 
 fn max_index(m: &XyzMapping) -> u32 {
     let mut max = m.x.max(m.y).max(m.z);
-    for opt in [m.intensity, m.r, m.g, m.b, m.classification].iter().copied().flatten() {
+    for opt in [m.intensity, m.r, m.g, m.b, m.classification, m.gps_time].iter().copied().flatten() {
         if opt > max { max = opt; }
     }
     max
@@ -808,7 +829,7 @@ mod xyz_tests {
     /// importer read past the end of short lines.
     #[test]
     fn the_required_column_count_covers_every_mapped_column() {
-        let base = XyzMapping { x: 0, y: 1, z: 2, intensity: None, r: None, g: None, b: None, classification: None };
+        let base = XyzMapping { x: 0, y: 1, z: 2, intensity: None, r: None, g: None, b: None, classification: None, gps_time: None };
         assert_eq!(max_index(&base), 2);
         assert_eq!(max_index(&XyzMapping { intensity: Some(7), ..base }), 7);
         assert_eq!(max_index(&XyzMapping { r: Some(4), g: Some(5), b: Some(9), ..base }), 9);

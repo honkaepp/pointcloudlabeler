@@ -46,14 +46,21 @@ release, with credit in the commit.
 2. Make your changes. Keep the commit focused — one logical change
    per PR is easier to review.
 3. Add or update tests:
-   - Rust: `cd src-tauri && cargo test --lib`
+   - Rust, desktop build: `cd src-tauri && cargo test --lib`
+   - Rust, headless build: `cargo test --no-default-features --features headless`
+     (the same tests without the Tauri runtime, plus the command line,
+     console, API and MCP tests)
    - TypeScript: `npx tsc --noEmit` and `npm test`
 4. Run the linters:
    - `cd src-tauri && cargo clippy --lib`
    - The TypeScript build is the type check.
-5. Update the README's feature list if the change adds or removes a
+5. If the change adds or alters an operation of the catalogue
+   (`src-tauri/src/ops`), regenerate the reference:
+   `cargo run -p pointcloudlabeler -- ops docs > ../docs/OPERATIONS.md`
+   (a test fails while it is stale).
+6. Update the README's feature list if the change adds or removes a
    feature.
-6. Push and open a PR. Describe what changed and why, and link any
+7. Push and open a PR. Describe what changed and why, and link any
    relevant issue.
 
 ## Scientific contributions

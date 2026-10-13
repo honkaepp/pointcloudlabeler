@@ -2,7 +2,7 @@
 //
 // One backend pass produces both:
 //   • A spherical-panorama RGBA image rendered from a viewpoint
-//     (canvas display) — RiSCAN PRO's "Single Projection" view.
+//     (canvas display) — the scanner suites' "single projection" view.
 //   • A per-bin depth map (closest range per angular bin) — feeds the
 //     viewport's per-point Hidden Point Removal (HPR) filter, hiding
 //     points the viewpoint can't physically see.

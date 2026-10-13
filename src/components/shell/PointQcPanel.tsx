@@ -47,6 +47,10 @@ interface PointQcSummary {
   reflectanceNote: string | null;
   scanSource: string | null;
   windNote: string | null;
+  /** What was evaluated: the segmented trees, or the whole cloud as one tree. */
+  scope: string;
+  /** Set when heights came from each tree's lowest point rather than a DTM. */
+  heightNote: string | null;
   columnWritten: string | null;
 }
 
@@ -177,7 +181,8 @@ export default function PointQcPanel() {
       <div style={{ lineHeight: 1.55, color: 'var(--text-mute)' }}>
         Labels every segmented tree's points in three stages — reflectance band, sparse-neighbourhood
         outliers, and wind points a single scan position saw — with radii that widen with height
-        inside each tree. Writes <span style={{ color: 'var(--text-dim)' }}>point_quality</span>:
+        inside each tree. A cloud with no tree ids is taken as one tree. Writes{' '}
+        <span style={{ color: 'var(--text-dim)' }}>point_quality</span>:
         1 kept · 2 reflectance · 3 outlier · 4 wind.
       </div>
 
@@ -187,7 +192,7 @@ export default function PointQcPanel() {
           <NumberField label="max" value={p.reflMax} onChange={(v) => setP({ ...p, reflMax: v })} />
         </Row>
         <Field
-          label="column (blank = intensity)"
+          label="column (blank = a column named reflectance, else intensity)"
           value={p.reflColumn}
           onChange={(v) => setP({ ...p, reflColumn: v })}
           wide
@@ -330,14 +335,16 @@ export default function PointQcPanel() {
             {summary.treesSkippedSmall > 0 && (
               <div style={{ color: 'var(--text-mute)' }}>{summary.treesSkippedSmall} tree(s) below the size floor</div>
             )}
+            {summary.scope && <div style={{ color: 'var(--text-mute)' }}>evaluated: {summary.scope}</div>}
             <div style={{ color: 'var(--text-mute)' }}>reflectance from {summary.reflectanceSource}</div>
             {summary.scanSource && <div style={{ color: 'var(--text-mute)' }}>scan id from {summary.scanSource}</div>}
           </div>
 
-          {(summary.reflectanceNote || summary.windNote) && (
+          {(summary.reflectanceNote || summary.windNote || summary.heightNote) && (
             <div className="rounded-sm px-2 py-1.5" style={{ color: 'var(--text-dim)', border: '1px solid var(--line)', lineHeight: 1.55 }}>
-              {summary.reflectanceNote && <div>{summary.reflectanceNote}</div>}
-              {summary.windNote && <div style={{ marginTop: summary.reflectanceNote ? 6 : 0 }}>{summary.windNote}</div>}
+              {[summary.heightNote, summary.reflectanceNote, summary.windNote]
+                .filter((n): n is string => !!n)
+                .map((n, i) => <div key={i} style={{ marginTop: i > 0 ? 6 : 0 }}>{n}</div>)}
             </div>
           )}
 

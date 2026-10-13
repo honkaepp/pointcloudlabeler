@@ -1,15 +1,9 @@
 // Preprocessing module — sensor-native preprocessing that happens BEFORE
 // a cloud lands in the Editor.
 //
-// Importers: E57 (every major TLS / MLS vendor exports it), PTX / PTS,
-// XYZ / ASCII, and — in the development edition only — a RIEGL project
-// panel that reads a RiSCAN PRO project's scan positions and poses. The
-// RIEGL panel is not in the release: a RiSCAN PRO project's points
-// (.rdbx, .rxp) are read only through RIEGL's own libraries, which no
-// published build can carry, so offering the panel would offer an
-// importer that cannot give the user their points. Which edition this
-// is, and everything that follows from it, is decided in
-// src/build/edition.ts and nowhere else.
+// Importers: E57 (every major TLS / MLS vendor exports it), PTX / PTS
+// and XYZ / ASCII. Which edition this is, and everything that follows
+// from it, is decided in src/build/edition.ts and nowhere else.
 //
 // Future home for other sensor-side preprocessing (ULS trajectories,
 // FARO SCENE…) — anything that gates the raw scanner data into
@@ -18,16 +12,14 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useProject } from '../context/ProjectContext';
-import RieglProjectPanel, { type RieglProjectSummary } from '../components/preprocessing/RieglProjectPanel';
 import E57ProjectPanel, { type E57ProjectSummary } from '../components/preprocessing/E57ProjectPanel';
 import PtxProjectPanel, { type PtxProjectSummary } from '../components/preprocessing/PtxProjectPanel';
 import XyzProjectPanel, { type XyzProjectSummary } from '../components/preprocessing/XyzProjectPanel';
 import CoregisterPanel from '../components/preprocessing/CoregisterPanel';
-import { EDITION, showsRieglPanel, preprocessingSources } from '../build/edition';
+import { EDITION, preprocessingSources } from '../build/edition';
 
 export default function PreprocessingModule() {
   const { project } = useProject();
-  const [rieglProjects, setRieglProjects] = useState<RieglProjectSummary[]>([]);
   const [e57Projects, setE57Projects] = useState<E57ProjectSummary[]>([]);
   const [ptxProjects, setPtxProjects] = useState<PtxProjectSummary[]>([]);
   const [xyzProjects, setXyzProjects] = useState<XyzProjectSummary[]>([]);
@@ -39,23 +31,13 @@ export default function PreprocessingModule() {
   // folder), so a failure on one doesn't blank the others.
   const refresh = useCallback(async () => {
     if (!project?.folder) {
-      setRieglProjects([]); setE57Projects([]); setPtxProjects([]); setXyzProjects([]); return;
+      setE57Projects([]); setPtxProjects([]); setXyzProjects([]); return;
     }
     const api = (window as unknown as Record<string, unknown>).desktop as {
-      rieglListProjects?: (projectFolder: string) => Promise<RieglProjectSummary[]>;
       e57ListProjects?: (projectFolder: string) => Promise<E57ProjectSummary[]>;
       ptxListProjects?: (projectFolder: string) => Promise<PtxProjectSummary[]>;
       xyzListProjects?: (projectFolder: string) => Promise<XyzProjectSummary[]>;
     } | undefined;
-    // The release edition does not show the RIEGL panel, so it does not
-    // list RIEGL projects either — a registration a development build
-    // left in the project folder stays on disk and out of sight.
-    if (showsRieglPanel(EDITION) && api?.rieglListProjects) {
-      try { setRieglProjects(await api.rieglListProjects(project.folder)); }
-      catch (e) { console.warn('riegl_list_projects failed', e); setRieglProjects([]); }
-    } else {
-      setRieglProjects([]);
-    }
     if (api?.e57ListProjects) {
       try { setE57Projects(await api.e57ListProjects(project.folder)); }
       catch (e) { console.warn('e57_list_projects failed', e); setE57Projects([]); }
@@ -113,13 +95,6 @@ export default function PreprocessingModule() {
 
       <div className="flex-1 min-h-0 overflow-y-auto scroll-thin p-5">
         <div className="max-w-[1100px] mx-auto flex flex-col gap-5">
-          {showsRieglPanel(EDITION) && (
-            <RieglProjectPanel
-              projects={rieglProjects}
-              onChange={refresh}
-              onStatus={setStatus}
-            />
-          )}
 
           <E57ProjectPanel
             projects={e57Projects}

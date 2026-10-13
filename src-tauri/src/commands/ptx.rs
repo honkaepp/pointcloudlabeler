@@ -14,9 +14,8 @@
 //                (4 lines of 3 floats — redundant with the matrix
 //                below, used for cross-checking the parse)
 //   lines 7-10:  4×4 transformation matrix, COLUMN-MAJOR
-//                (4 lines of 4 floats — same convention as RIEGL's
-//                project.rsp SOP; we transpose into row-major to match
-//                the rest of the codebase)
+//                (4 lines of 4 floats; we transpose into row-major to
+//                match the rest of the codebase)
 //   then:        ncols×nrows lines of point data
 //                  - 3 cols: x y z
 //                  - 4 cols: x y z intensity
@@ -37,15 +36,21 @@
 //    section's pose, optionally crop to a world-coord bbox, write
 //    LAS / LAZ via the same las + laz crates the Editor exporter uses.
 
+#[cfg(feature = "gui")]
+
 use tauri::State;
 
+#[cfg(feature = "gui")]
 use crate::state::AppState;
+use crate::progress::Progress;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
+use tauri::Window;
 use std::fs::{create_dir_all, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Window};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -68,7 +73,7 @@ pub struct PtxScanPosition {
     pub point_count: u64,
     /// 4×4 SOP-equivalent (per-scan local → world), row-major. Identity
     /// for PTS files which carry no transform. Matches the same shape
-    /// the Riegl / E57 panels render.
+    /// the E57 panel renders.
     pub pose: Vec<f64>,
     /// Whether the section carries intensity and/or RGB. Read off the
     /// first data line of the section.
@@ -92,19 +97,13 @@ struct Manifest {
     summary: PtxProjectSummary,
 }
 
-#[derive(Serialize, Clone, Copy)]
-struct ProgressMsg<'a> {
-    stage: &'a str,
-    pct: f32,
-}
-
-fn emit_progress(window: &Window, pct: f32) {
-    let _ = window.emit("ptx-progress", ProgressMsg { stage: "ptx", pct });
+fn emit_progress(progress: &Progress, pct: f32) {
+    progress.report("ptx", pct);
 }
 
 // --- public commands ------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn ptx_list_projects(project_folder: String) -> Result<Vec<PtxProjectSummary>, String> {
     let dir = Path::new(&project_folder).join("preprocessing").join("ptx");
     if !dir.is_dir() {
@@ -126,25 +125,27 @@ pub fn ptx_list_projects(project_folder: String) -> Result<Vec<PtxProjectSummary
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn ptx_import_project(
     window: Window,
     project_folder: String,
     source_path: String,
     name: String,
 ) -> Result<PtxProjectSummary, String> {
+    let progress = Progress::window(window, "ptx-progress");
     // The import walks the entire file (one scan = at most one full
     // sweep over its point lines so we can find where the next section
     // starts), so it can take a moment for big files. Run on the
     // blocking pool so we don't stall the UI thread.
-    tauri::async_runtime::spawn_blocking(move || {
-        run_ptx_import(&window, &project_folder, &source_path, &name)
+    crate::rt::spawn_blocking(move || {
+        run_ptx_import(&progress, &project_folder, &source_path, &name)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn ptx_remove_project(project_folder: String, ptx_id: String) -> Result<(), String> {
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
@@ -182,7 +183,8 @@ pub struct PtxExportResult {
     pub point_count: u64,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn ptx_export_region(
     state: State<'_, AppState>,
@@ -193,6 +195,7 @@ pub async fn ptx_export_region(
     bbox: PtxExportBbox,
     out_path: String,
 ) -> Result<PtxExportResult, String> {
+    let progress = Progress::window(window, "ptx-progress");
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
     // See fsgrant::safe_component.
@@ -226,8 +229,8 @@ pub async fn ptx_export_region(
     }
     let source_path = manifest.summary.source_path.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
-        run_ptx_export(&window, &source_path, &want, &bbox, &out_path)
+    crate::rt::spawn_blocking(move || {
+        run_ptx_export(&progress, &source_path, &want, &bbox, &out_path)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -235,8 +238,8 @@ pub async fn ptx_export_region(
 
 // --- implementation -------------------------------------------------
 
-fn run_ptx_import(
-    window: &Window,
+pub fn run_ptx_import(
+    progress: &Progress,
     project_folder: &str,
     source_path: &str,
     display_name: &str,
@@ -260,11 +263,11 @@ fn run_ptx_import(
     let raw = File::open(src).map_err(|e| format!("open {source_path}: {e}"))?;
     let mut file = BufReader::with_capacity(1 << 16, raw);
     let scan_positions = if kind == "ptx" {
-        scan_ptx(window, &mut file, file_size)?
+        scan_ptx(progress, &mut file, file_size)?
     } else {
         scan_pts(&mut file, file_size, display_name)?
     };
-    emit_progress(window, 1.0);
+    emit_progress(progress, 1.0);
 
     let id = safe_folder_name(display_name);
     let target = Path::new(project_folder)
@@ -290,7 +293,7 @@ fn run_ptx_import(
 /// lines forward (without parsing them as numbers — just consuming
 /// newlines) and the next bytes are either EOF or the next section's
 /// `ncols` line.
-fn scan_ptx<R: BufRead + Seek>(window: &Window, file: &mut R, file_size: u64) -> Result<Vec<PtxScanPosition>, String> {
+fn scan_ptx<R: BufRead + Seek>(progress: &Progress, file: &mut R, file_size: u64) -> Result<Vec<PtxScanPosition>, String> {
     let mut out: Vec<PtxScanPosition> = Vec::new();
     // Use our own line-reading loop instead of BufRead::lines() so we
     // can track byte positions exactly (lines() owns the iterator).
@@ -320,8 +323,8 @@ fn scan_ptx<R: BufRead + Seek>(window: &Window, file: &mut R, file_size: u64) ->
         let mat_row_b = read_vec4_line(file, "matrix row 1")?;
         let mat_row_c = read_vec4_line(file, "matrix row 2")?;
         let mat_row_d = read_vec4_line(file, "matrix row 3")?;
-        // PTX writes the matrix as 4 rows of 4 values, column-major
-        // (same convention as RIEGL's project.rsp SOP). We transpose
+        // PTX writes the matrix as 4 rows of 4 values, column-major.
+        // We transpose
         // into row-major for the rest of the codebase to consume.
         let raw_matrix = [
             mat_row_a[0], mat_row_a[1], mat_row_a[2], mat_row_a[3],
@@ -346,7 +349,7 @@ fn scan_ptx<R: BufRead + Seek>(window: &Window, file: &mut R, file_size: u64) ->
             let alt_tr = [raw_matrix[3], raw_matrix[7], raw_matrix[11]];
             if (alt_tr[0] - position[0]).abs() + (alt_tr[1] - position[1]).abs() + (alt_tr[2] - position[2]).abs() < 1e-3 {
                 // raw_matrix is already row-major; use it as-is.
-                return scan_ptx_with_pose_layout(window, file, file_size, /* column_major = */ false);
+                return scan_ptx_with_pose_layout(progress, file, file_size, /* column_major = */ false);
             }
         }
         // Sniff the first data line to detect columns_per_point + the
@@ -381,7 +384,7 @@ fn scan_ptx<R: BufRead + Seek>(window: &Window, file: &mut R, file_size: u64) ->
         // Progress: rough — based on current byte position over total.
         let pos = file.stream_position().unwrap_or(0);
         if file_size > 0 {
-            emit_progress(window, (pos as f32 / file_size as f32).clamp(0.0, 0.99));
+            emit_progress(progress, (pos as f32 / file_size as f32).clamp(0.0, 0.99));
         }
     }
     Ok(out)
@@ -391,7 +394,7 @@ fn scan_ptx<R: BufRead + Seek>(window: &Window, file: &mut R, file_size: u64) ->
 /// the file is using row-major storage. Called when the first attempt
 /// detects the (rare) row-major variant.
 fn scan_ptx_with_pose_layout<R: BufRead + Seek>(
-    window: &Window,
+    progress: &Progress,
     file: &mut R,
     file_size: u64,
     column_major: bool,
@@ -439,7 +442,7 @@ fn scan_ptx_with_pose_layout<R: BufRead + Seek>(
         });
         let pos = file.stream_position().unwrap_or(0);
         if file_size > 0 {
-            emit_progress(window, (pos as f32 / file_size as f32).clamp(0.0, 0.99));
+            emit_progress(progress, (pos as f32 / file_size as f32).clamp(0.0, 0.99));
         }
     }
     Ok(out)
@@ -475,8 +478,8 @@ fn scan_pts<R: BufRead + Seek>(file: &mut R, _file_size: u64, display_name: &str
     }])
 }
 
-fn run_ptx_export(
-    window: &Window,
+pub fn run_ptx_export(
+    progress: &Progress,
     source_path: &str,
     scans: &[PtxScanPosition],
     bbox: &PtxExportBbox,
@@ -485,7 +488,7 @@ fn run_ptx_export(
     use las::{Builder, Color as LasColor, Point as LasPoint, Transform as LasTransform, Vector, Writer};
     use las::point::Format;
 
-    emit_progress(window, 0.0);
+    emit_progress(progress, 0.0);
 
     // Pick a LAS offset near the data center. The pose translations
     // (column 3 of the row-major matrix) are the scanner positions in
@@ -505,14 +508,20 @@ fn run_ptx_export(
         (0.0, 0.0, 0.0)
     };
 
+    // Point format 2 (colour + intensity) only when a selected scan
+    // carries colour: the las crate refuses a colourless point in a
+    // colour format, so a plain x y z file could not be exported at
+    // all. Format 0 otherwise; a colourless scan beside a coloured one
+    // is written black.
+    let any_color = scans.iter().any(|s| s.has_color);
     let mut builder = Builder::from((1, 4));
-    builder.point_format = Format::new(2).map_err(|e| format!("las format: {e}"))?;
+    builder.point_format = Format::new(if any_color { 2 } else { 0 }).map_err(|e| format!("las format: {e}"))?;
     builder.transforms = Vector {
         x: LasTransform { scale: 0.001, offset: ox },
         y: LasTransform { scale: 0.001, offset: oy },
         z: LasTransform { scale: 0.001, offset: oz },
     };
-    builder.generating_software = "PointCloudLabeler — PTX/PTS preprocessing".to_string();
+    builder.generating_software = "PointCloudLabeler PTX export".to_string();
     let header = builder.into_header().map_err(|e| format!("build las header: {e}"))?;
     let mut writer = Writer::from_path(out_path, header)
         .map_err(|e| format!("create {out_path}: {e}"))?;
@@ -539,7 +548,7 @@ fn run_ptx_export(
             if read_bytes == 0 { break; }
             read += 1;
             if read & 0xFFFF == 0 && total > 0 {
-                emit_progress(window, (read as f32 / total as f32).clamp(0.0, 0.99));
+                emit_progress(progress, (read as f32 / total as f32).clamp(0.0, 0.99));
             }
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
@@ -601,14 +610,18 @@ fn run_ptx_export(
             number_of_returns: 1,
             ..Default::default()
             };
-            lp.color = color.map(|(r, g, b)| LasColor { red: r, green: g, blue: b });
+            lp.color = if any_color {
+                Some(color.map(|(r, g, b)| LasColor { red: r, green: g, blue: b }).unwrap_or(LasColor { red: 0, green: 0, blue: 0 }))
+            } else {
+                None
+            };
             writer.write_point(lp).map_err(|e| format!("write point: {e}"))?;
             written += 1;
         }
     }
 
     writer.close().map_err(|e| format!("close las/laz: {e}"))?;
-    emit_progress(window, 1.0);
+    emit_progress(progress, 1.0);
     Ok(PtxExportResult {
         out_path: out_path.to_string(),
         point_count: written,

@@ -19,9 +19,10 @@ use tauri::menu::{
     AboutMetadataBuilder, Menu, MenuBuilder, MenuEvent, MenuItem, MenuItemBuilder,
     PredefinedMenuItem, SubmenuBuilder,
 };
+#[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use crate::commands::project::load_recent_public;
+use crate::commands::project::recent_projects;
 use crate::error::AppResult;
 use crate::state::AppState;
 
@@ -37,7 +38,7 @@ fn item<R: Runtime>(app: &AppHandle<R>, label: &str, id: &str) -> tauri::Result<
 
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
     let has_proj = has_project(app);
-    let recent = load_recent_public(app);
+    let recent = recent_projects();
 
     // ---- File ---- (needs an open project; rebuilt by the project
     // commands, so these enable the moment one is opened)
@@ -157,6 +158,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         .separator()
         .item(&item(app, "Tree Skeleton Transfer…", "panel-tst")?)
         .item(&item(app, "Cloud Registration…", "panel-register")?)
+        .item(&item(app, "Fine Registration…", "panel-finereg")?)
         .item(&item(app, "Tree Growth…", "panel-growth")?)
         .item(&item(app, "M3C2 Change Detection…", "panel-m3c2")?)
         .separator()

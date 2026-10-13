@@ -600,7 +600,7 @@ fn explain_proj_error(what: &str, proj_str: &str, e: impl std::fmt::Debug) -> St
 /// front end's CRS picker (LayersPanel.tsx) never hardcodes a second
 /// copy of the list. Building it is pure in-memory string formatting —
 /// nothing here can fail.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crs_list() -> Vec<CrsEntry> {
     curated_table()
 }
@@ -635,7 +635,7 @@ pub fn display_name_for_epsg(code: u32) -> Option<String> {
 /// `crs_list`'s ~190-entry shortlist to any of the ~8000 real EPSG
 /// codes. Errors clearly when the code isn't a real EPSG entry at all,
 /// distinct from any other failure mode.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crs_lookup(code: u32) -> Result<EpsgLookupEntry, String> {
     let name = display_name_for_epsg(code).ok_or_else(|| format!("unknown EPSG code: {code}"))?;
     let proj4 = proj_string_for_epsg(code).ok_or_else(|| format!("unknown EPSG code: {code}"))?;
@@ -655,7 +655,7 @@ pub fn crs_lookup(code: u32) -> Result<EpsgLookupEntry, String> {
 /// `proj_string_for_epsg`. Results are sorted by code and capped at
 /// `limit` (the search box's page size, not a registry limit); an empty
 /// query returns no results rather than the entire registry.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crs_search(query: String, limit: usize) -> Vec<EpsgLookupEntry> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -786,7 +786,7 @@ impl CrsTransformer {
 /// the module doc comment for why getting this backwards is dangerous:
 /// proj4rs never raises an error for it, it just silently computes a
 /// wrong answer that still looks like a coordinate.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn crs_transform(points: Vec<[f64; 3]>, from: String, to: String) -> Result<Vec<[f64; 3]>, String> {
     let src = resolve_proj(&from)?;
     let dst = resolve_proj(&to)?;

@@ -188,18 +188,57 @@ export async function detectLasSource(file: File | FileLike): Promise<LasSourceI
   return { extraNames: names, pointFormat };
 }
 
-/** Standard LAS fields present in `pointFormat` that PointCloudLabeler's octree does
- *  not carry, named as a user would recognise them. Empty when the
+/** A standard LAS point field the base record does not keep, importable
+ *  as a column under its reserved name (src-tauri octree.rs's StdField)
+ *  and written back into the record on export. `on` is whether the
+ *  import dialog ticks it by default: the fields that are data (time,
+ *  colour, the scan position) are; the flags and the scan angle, which
+ *  cost 4 bytes a point and are rarely looked at, are not. */
+export interface StandardLasField {
+  name: string;
+  label: string;
+  on: boolean;
+}
+
+const STANDARD_LAS_FIELDS: Array<{ name: string; label: string; on: boolean; formats: (f: number) => boolean }> = [
+  { name: 'gps_time', label: 'GPS time (f64)', on: true, formats: f => [1, 3, 4, 5, 6, 7, 8, 9, 10].includes(f) },
+  { name: 'red', label: 'colour red', on: true, formats: f => [2, 3, 5, 7, 8, 10].includes(f) },
+  { name: 'green', label: 'colour green', on: true, formats: f => [2, 3, 5, 7, 8, 10].includes(f) },
+  { name: 'blue', label: 'colour blue', on: true, formats: f => [2, 3, 5, 7, 8, 10].includes(f) },
+  { name: 'nir', label: 'near-infrared', on: true, formats: f => [8, 10].includes(f) },
+  { name: 'point_source_id', label: 'point source id (scan position / flight line)', on: true, formats: f => f <= 10 },
+  { name: 'scan_angle', label: 'scan angle (°)', on: false, formats: f => f <= 10 },
+  { name: 'user_data', label: 'user data', on: false, formats: f => f <= 10 },
+  { name: 'scan_direction', label: 'scan direction flag', on: false, formats: f => f <= 10 },
+  { name: 'edge_of_flight_line', label: 'edge of flight line', on: false, formats: f => f <= 10 },
+  { name: 'synthetic', label: 'synthetic flag', on: false, formats: f => f <= 10 },
+  { name: 'key_point', label: 'key-point flag', on: false, formats: f => f <= 10 },
+  { name: 'withheld', label: 'withheld flag', on: false, formats: f => f <= 10 },
+  { name: 'overlap', label: 'overlap flag', on: false, formats: f => f >= 6 && f <= 10 },
+  { name: 'scanner_channel', label: 'scanner channel', on: false, formats: f => f >= 6 && f <= 10 },
+];
+
+/** The standard fields point format `pointFormat` carries, in the order
+ *  the import dialog offers them. Empty when the format is unknown. */
+export function standardLasFields(pointFormat: number | null): StandardLasField[] {
+  if (pointFormat === null) return [];
+  return STANDARD_LAS_FIELDS.filter(f => f.formats(pointFormat)).map(({ name, label, on }) => ({ name, label, on }));
+}
+
+/** Whether a column name is one of the standard fields' reserved names. */
+export function isStandardLasField(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  return STANDARD_LAS_FIELDS.some(f => f.name === n) || n === 'pointsourceid' || n === 'gpstime';
+}
+
+/** Standard LAS fields present in `pointFormat` that PointCloudLabeler's octree
+ *  cannot carry, named as a user would recognise them. Only the waveform
+ *  packets are left: every other field is a column now. Empty when the
  *  format has none, or when the header could not be read. */
 export function unsupportedLasFields(pointFormat: number | null): string[] {
   if (pointFormat === null) return [];
   const out: string[] = [];
-  if ([2, 3, 5, 7, 8, 10].includes(pointFormat)) out.push('colour (RGB)');
-  if ([8, 10].includes(pointFormat)) out.push('near-infrared');
-  if ([1, 3, 4, 5, 6, 7, 8, 9, 10].includes(pointFormat)) out.push('GPS time');
   if ([4, 5, 9, 10].includes(pointFormat)) out.push('waveform data');
-  // Every format has these; they are simply not stored.
-  out.push('scan angle', 'user data', 'point source ID');
   return out;
 }
 

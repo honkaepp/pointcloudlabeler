@@ -2,16 +2,14 @@
 //
 // There are two, and they differ in ONE line — this file's EDITION.
 //
-//   development  — every panel, including the RIEGL project panel in
-//                  Preprocessing: a RiSCAN PRO project lists its scan
-//                  positions and poses, but its points (.rdbx, .rxp)
-//                  are read only through RIEGL's own libraries, which
-//                  no published build can carry — see
-//                  src-tauri/src/commands/riegl_rdbx.rs.
+//   development  — every panel, including the ones the release does
+//                  not carry (the dev-only regions of the source, which
+//                  the release transform strips out: see
+//                  scripts/merge-into-release.sh).
 //
-//   release      — the same program with that panel not shown, so a
-//                  user is never offered an importer that cannot give
-//                  them their points. Published builds are this edition.
+//   release      — the same program without them, so a user is never
+//                  offered an importer that cannot give them their
+//                  points. Published builds are this edition.
 //
 // Everything that differs between the editions is decided HERE, by
 // functions of EDITION, and nowhere else, so a grep for EDITION finds
@@ -21,10 +19,6 @@ export type Edition = 'development' | 'release';
 
 export const EDITION: Edition = 'release';
 
-/** Whether the Preprocessing module shows the RIEGL project panel. */
-export function showsRieglPanel(edition: Edition): boolean {
-  return edition === 'development';
-}
 
 /** The importers the Preprocessing header names, in the order the
  *  panels appear. */
@@ -34,15 +28,18 @@ export function preprocessingSources(edition: Edition): string[] {
     'PTX / PTS (Leica Cyclone, Topcon)',
     'XYZ / ASCII',
   ];
-  return showsRieglPanel(edition) ? ['Riegl RiSCAN / RiPROCESS / scanner .PROJ', ...sources] : sources;
+  const named = [...sources];
+  return edition === 'release' ? sources : named;
 }
 
 /** The importers a co-registration can draw scan positions from. */
 export function coregisterSources(edition: Edition): string {
-  return showsRieglPanel(edition) ? 'Riegl / E57 / PTX' : 'E57 / PTX';
+  let named = 'E57 / PTX';
+  return edition === 'release' ? 'E57 / PTX' : named;
 }
 
 /** The Preprocessing tab's one-line sub-label. */
 export function preprocessingTabSub(edition: Edition): string {
-  return showsRieglPanel(edition) ? 'Riegl · register · export' : 'E57 · PTX · register · export';
+  let named = 'E57 · PTX · register · export';
+  return edition === 'release' ? 'E57 · PTX · register · export' : named;
 }

@@ -6,12 +6,16 @@
 // labels, accent-lit controls, keyboard hints).
 
 import { useEffect, useMemo, useState } from 'react';
+import { isStandardLasField } from '../io/parseLasStream';
 import { isDeadwoodExtra } from '../persistence/octreeReader';
 import type { CrsListEntry, EpsgLookupEntry, GeoidStatus, OctreeCrs, VerticalCrs } from '../persistence/octreeReader';
 import type { FilterConfig } from './shell/OctreeShellContext';
+import type { CloudExportFormat } from '../io/pointFile';
 
 export interface OctreeExportOptions {
-  format: 'las' | 'laz';
+  /** LAS and LAZ are written directly; text, PLY and E57 are transcoded
+   *  from the same export, every option honoured. */
+  format: CloudExportFormat;
   /** Write Z as height above ground (point Z − DTM); X/Y stay loss-less. */
   normalize: boolean;
   /** DTM cell size (m) for the normalise pass. */
@@ -49,6 +53,16 @@ export interface OctreeExportOptions {
   geoid?: string;
   /** LAS 1.4 / point format 6 instead of LAS 1.2 / format 0. */
   las14?: boolean;
+  /** Text export: "space", "tab", "comma" or "semicolon". */
+  delimiter?: string;
+  /** Text export: a first line naming the columns. */
+  header?: boolean;
+  /** PLY export as ascii rather than binary. */
+  plyAscii?: boolean;
+  /** The standard fields the dataset carries as columns (GPS time,
+   *  colour, scan angle, …) written back into the LAS record, with a
+   *  point format that has room for them. Default true. */
+  standardFields?: boolean;
 }
 
 /** Mirrors src-tauri's `SubsetFilter` (commands/octree.rs) — the same
@@ -246,11 +260,21 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
       setAligning(false);
     }
   };
-  const [format, setFormat] = useState<'las' | 'laz'>('las');
+  const [format, setFormat] = useState<CloudExportFormat>('las');
+  // Text layout and PLY encoding, used only by those formats.
+  const [delimiter, setDelimiter] = useState('space');
+  const [header, setHeader] = useState(true);
+  const [plyAscii, setPlyAscii] = useState(false);
+  const isLas = format === 'las' || format === 'laz';
   // LAS 1.2 stays the default: it is what every older tool reads, and
   // silently changing an existing workflow's output format would be its
   // own surprise. 1.4 is offered, with what it costs stated.
   const [las14, setLas14] = useState(false);
+  // The standard fields back into the record — GPS time where GPS time
+  // goes, the colour where the colour goes — rather than as Extra Bytes
+  // under the same names. On by default: that is what "as imported"
+  // means.
+  const [standardFields, setStandardFields] = useState(true);
   const [precision, setPrecision] = useState('native');
   const [includeTreeId, setIncludeTreeId] = useState(true);
   const [includeSemantic, setIncludeSemantic] = useState(true);
@@ -347,7 +371,8 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
   const [includeStandingDeadwood, setIncludeStandingDeadwood] = useState(true);
   const [includeLayingDeadwood, setIncludeLayingDeadwood] = useState(true);
   // Generic numeric extras = everything except the deadwood channels.
-  const numericExtras = availableExtras.filter(e => !isDeadwoodExtra(e.name));
+  const standardCarried = availableExtras.filter(e => isStandardLasField(e.name));
+  const numericExtras = availableExtras.filter(e => !isDeadwoodExtra(e.name) && !(standardFields && isStandardLasField(e.name)));
   // Default every available numeric extra to "on" so a height-above-ground
   // column, once computed, rides along by default — that's the common case
   // ("I want my LAZ to carry the hag I just made"). The user can untick
@@ -417,6 +442,10 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
       targetCrs: resolvedTargetCrs ?? undefined,
       geoid: canPickGeoid && geoid ? geoid : undefined,
       las14,
+      standardFields,
+      delimiter: format === 'txt' ? delimiter : undefined,
+      header: format === 'txt' ? header : undefined,
+      plyAscii: format === 'ply' ? plyAscii : undefined,
     });
   };
 
@@ -429,7 +458,7 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [format, precision, includeTreeId, includeSemantic, includeStandingDeadwood, includeLayingDeadwood, keepClassification, keepIntensity, normalize, cellSize, extraOn, applyFilters, filters, canSubmit, resolvedTargetCrs]);
+  }, [format, precision, includeTreeId, includeSemantic, includeStandingDeadwood, includeLayingDeadwood, keepClassification, keepIntensity, normalize, cellSize, extraOn, applyFilters, filters, canSubmit, resolvedTargetCrs, standardFields, delimiter, header, plyAscii]);
 
   return (
     <div
@@ -458,6 +487,9 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
               {([
                 { v: 'las', label: 'LAS', sub: 'uncompressed' },
                 { v: 'laz', label: 'LAZ', sub: 'compressed' },
+                { v: 'txt', label: 'TXT', sub: 'text columns' },
+                { v: 'ply', label: 'PLY', sub: 'binary / ascii' },
+                { v: 'e57', label: 'E57', sub: 'ASTM E2807' },
               ] as const).map(o => {
                 const active = format === o.v;
                 return (
@@ -476,7 +508,7 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
                 );
               })}
             </div>
-            <div className="flex gap-1 p-0.5 rounded-md mt-1.5" style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--line)' }}>
+            {isLas && <div className="flex gap-1 p-0.5 rounded-md mt-1.5" style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--line)' }}>
               {([
                 { v: false, label: 'LAS 1.2', sub: 'widest compatibility' },
                 { v: true, label: 'LAS 1.4', sub: 'full classification' },
@@ -497,12 +529,46 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
                   </button>
                 );
               })}
-            </div>
-            <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+            </div>}
+            {format === 'txt' && (
+              <div className="flex items-center gap-2 mt-1.5">
+                <span className="mono text-[10.5px]" style={{ color: 'var(--text-dim)' }}>delimiter</span>
+                <select
+                  value={delimiter}
+                  onChange={e => setDelimiter(e.target.value)}
+                  className="px-2 py-1 mono text-[11px] rounded-md outline-none"
+                  style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--line)', color: 'var(--text)' }}
+                >
+                  <option value="space">space</option>
+                  <option value="tab">tab</option>
+                  <option value="comma">comma</option>
+                  <option value="semicolon">semicolon</option>
+                </select>
+                <label className="flex items-center gap-1.5 ml-2 cursor-pointer select-none mono text-[10.5px]" style={{ color: 'var(--text-dim)' }}>
+                  <Checkbox checked={header} onChange={setHeader} /> header line
+                </label>
+              </div>
+            )}
+            {format === 'ply' && (
+              <label className="flex items-center gap-1.5 mt-1.5 cursor-pointer select-none mono text-[10.5px]" style={{ color: 'var(--text-dim)' }}>
+                <Checkbox checked={plyAscii} onChange={setPlyAscii} /> ascii (readable, larger) instead of binary little-endian
+              </label>
+            )}
+            {!isLas && (
+              <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+                {format === 'txt'
+                  ? 'One row per point: x y z, intensity, return number and count, classification, then every column the dataset carries — GPS time, colour, scan angle and the rest where it has them, tree_id, semantic and every numeric extra — under its own name, each value written exactly.'
+                  : format === 'ply'
+                    ? 'A vertex element with one typed property per column: x y z as doubles, the record\'s fields in their own widths, every extra as it is stored.'
+                    : 'One point cloud with x y z, intensity, colour, the time stamp and the returns as standard E57 attributes, and every other column under a "pcl" extension namespace, so an E57 reader that knows no extensions still gets the geometry.'}
+                {' '}Filters, normalisation, reprojection and the attribute choices below apply the same way.
+              </div>
+            )}
+            {isLas && <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
               {las14
-                ? 'Point format 6: classification keeps its full 0–255 range and returns go to 15. PointCloudLabeler stores no per-point GPS time, so that field — part of this record format — is written as zero.'
-                : 'Point format 0: classification is five bits, so a code above 31 (the ASPRS user-definable range) cannot be written and becomes 0. Choose LAS 1.4 to keep it.'}
-            </div>
+                ? `Point format 6${standardCarried.some(e => e.name.toLowerCase() === 'nir') ? ', 7 or 8' : standardCarried.some(e => ['red', 'green', 'blue'].includes(e.name.toLowerCase())) ? ' or 7' : ''}: classification keeps its full 0–255 range and returns go to 15. GPS time is part of the record: the dataset's gps_time column when it has one, zero otherwise.`
+                : `Point format 0${standardCarried.length > 0 ? ' — 1 with GPS time, 2 with colour, 3 with both —' : ':'} classification is five bits, so a code above 31 (the ASPRS user-definable range) cannot be written and becomes 0. Choose LAS 1.4 to keep it.`}
+            </div>}
           </Field>
 
           <Field label="Attributes">
@@ -517,7 +583,17 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
               {hasLayingDeadwood && (
                 <Check label="laying_deadwood" sub="fallen dead trees" checked={includeLayingDeadwood} onChange={setIncludeLayingDeadwood} />
               )}
+              {standardCarried.length > 0 && (
+                <Check label="standard fields" sub={`${standardCarried.map(e => e.name).join(', ')} → the LAS record`} checked={standardFields} onChange={setStandardFields} />
+              )}
             </div>
+            {standardCarried.length > 0 && (
+              <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+                {standardFields
+                  ? 'The standard fields this dataset carries as columns go back where the record keeps them — GPS time, colour, scan angle, user data, the scan position, the flags — exactly as imported, and the point format is chosen to hold them. Unticked, they are written as zero and offered as Extra Bytes below instead.'
+                  : 'Unticked: the standard fields are written as zero in the record; each can still go out as an Extra Bytes column below.'}
+              </div>
+            )}
             <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
               X / Y / Z and return number are always written. tree_id, semantic and the deadwood id channels ride in Extra-Bytes; unchecked fields are written as zero.
             </div>

@@ -15,6 +15,9 @@ export interface XyzMapping {
   g: number | null;
   b: number | null;
   classification: number | null;
+  /** A per-point time column, written as the LAS GPS time (f64) so the
+   *  octree import carries it as gps_time. */
+  gpsTime?: number | null;
 }
 
 export interface XyzProjectSummary {

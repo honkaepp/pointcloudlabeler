@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decodeNodePoints, decodeExtraColumn, isDeadwoodExtra } from './octreeReader';
+import { decodeNodePoints, decodeExtraColumn, isDeadwoodExtra, extraLayout, layoutStride } from './octreeReader';
 
 /** Build a node block in the on-disk layout:
  *  i32 X, i32 Y, i32 Z, i32 tree_id, u16 intensity, u8 class,
@@ -108,6 +108,36 @@ describe('decodeNodePoints', () => {
       const d = decodeNodePoints(bytes(), SCALE, OFFSET, PB, NAMES);
       expect([...d.extras.reflectance]).toEqual([-12.5, -8.25]);
       expect([...d.extras.deviation]).toEqual([3, 7]);
+    });
+
+    /** GPS time is about 1e9 s; an f32 steps by 64 s there. The column
+     *  is eight bytes on disk, declared by its type, and comes back as
+     *  a Float64Array with every digit. */
+    it('decodes an f64 column at its own width, after an f32 one', () => {
+      const t0 = 1_234_567_890.123456;
+      const t1 = 1_234_567_890.123457;
+      const pb = 21 + 4 + 8;
+      const buf = new ArrayBuffer(2 * pb);
+      const dv = new DataView(buf);
+      [t0, t1].forEach((t, i) => {
+        const o = i * pb;
+        dv.setInt32(o + 12, i + 1, true);
+        dv.setFloat32(o + 21, 0.5 + i, true);
+        dv.setFloat64(o + 25, t, true);
+      });
+      const extras = [{ name: 'reflectance', min: 0, max: 1 }, { name: 'gps_time', min: t0, max: t1, type: 'float64' as const }];
+      const d = decodeNodePoints(buf, SCALE, OFFSET, pb, extras);
+      expect(d.extras.gps_time).toBeInstanceOf(Float64Array);
+      expect([...d.extras.gps_time]).toEqual([t0, t1]);
+      expect([...d.extras.reflectance]).toEqual([0.5, 1.5]);
+      expect(extraLayout(extras)).toEqual([
+        { name: 'reflectance', offset: 21, width: 4, f64: false },
+        { name: 'gps_time', offset: 25, width: 8, f64: true },
+      ]);
+      expect(layoutStride(extras)).toBe(33);
+      // The lone-column decoder takes the layout too.
+      expect([...decodeExtraColumn(buf, pb, 1, extras)]).toEqual([t0, t1]);
+      expect(decodeExtraColumn(buf, pb, 1, extras)).toBeInstanceOf(Float64Array);
     });
 
     /** Lazy extras: a cloud with many columns should not materialise a

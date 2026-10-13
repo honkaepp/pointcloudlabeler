@@ -132,6 +132,9 @@ export default function ActivityBar({ onOpenFile, disabled }: Props) {
       <PanelToggle id="register" label="Cloud registration — put two clouds of one plot on each other: skeletons → target trees, lossless georeference shift" disabled={disabled} active={visiblePanels.has('register')} onClick={() => togglePanel('register')}>
         <IconRegister />
       </PanelToggle>
+      <PanelToggle id="finereg" label="Fine registration — two datasets on each other in six degrees of freedom: symmetric ICP with error bars, written as a moved copy" disabled={disabled} active={visiblePanels.has('finereg')} onClick={() => togglePanel('finereg')}>
+        <IconFineRegister />
+      </PanelToggle>
       <PanelToggle id="segment" label="Auto-segment (trees + deadwood)" disabled={disabled} active={visiblePanels.has('segment')} onClick={() => togglePanel('segment')}>
         <IconSegment />
       </PanelToggle>
@@ -557,6 +560,19 @@ function IconRegister() {
       <rect x="3" y="8" width="11" height="11" rx="1.5" strokeDasharray="2.5 2" />
       <rect x="10" y="4" width="11" height="11" rx="1.5" />
       <path d="M8.5 13.5 L13 9.5 M10.5 9.5 H13 V12" />
+    </svg>
+  );
+}
+
+function IconFineRegister() {
+  // Two stems a hair apart under one crosshair — the fit that closes
+  // the gap, and the error bar it comes with.
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 20 V8 M11.5 20 V8" strokeDasharray="2.5 2" />
+      <path d="M13 20 V8 M15.5 20 V8" />
+      <circle cx="12" cy="6" r="3.2" />
+      <path d="M12 1.5 V3 M12 9 V10.5 M7.5 6 H9 M15 6 H16.5" />
     </svg>
   );
 }

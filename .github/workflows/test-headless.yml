@@ -1,0 +1,70 @@
+name: Headless build and tests
+
+# The second binary: PointCloudLabeler without its window — the
+# command line, the console interface, the HTTP API and the MCP server
+# over the operation catalogue. Built with no Tauri, GTK or WebKit, on
+# a runner that has none of them installed, which is the point: the
+# job proves the build needs nothing a compute server lacks.
+#
+# MANUAL ONLY, like every workflow here: the account is out of Actions
+# minutes, and the checks are run on the machine doing the work before
+# the commit (see test-rust.yml). Start it from the Actions tab before a
+# release, or after touching src-tauri/src/ops or src-tauri/src/headless.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: headless
+
+      # No apt step: the headless build must not need libwebkit2gtk,
+      # libgtk-3 or libappindicator. If this job ever needs them, the
+      # feature gating has leaked.
+      - name: Build the headless binary
+        working-directory: src-tauri
+        run: cargo build --release -p pointcloudlabeler
+
+      - name: The binary links no GTK or WebKit
+        working-directory: src-tauri
+        run: |
+          set -e
+          ldd target/release/pointcloudlabeler > ldd.txt
+          cat ldd.txt
+          ! grep -i -E 'gtk|webkit|soup|javascriptcore' ldd.txt
+
+      - name: cargo test, headless
+        working-directory: src-tauri
+        run: cargo test --no-default-features --features headless
+
+      - name: The operation reference is current
+        working-directory: src-tauri
+        run: |
+          ./target/release/pointcloudlabeler ops docs > /tmp/OPERATIONS.md
+          diff -u ../docs/OPERATIONS.md /tmp/OPERATIONS.md
+
+      - name: Smoke-test the surfaces
+        working-directory: src-tauri
+        run: |
+          set -e
+          B=./target/release/pointcloudlabeler
+          $B --version
+          $B ops list --compact | python3 -c 'import sys, json; ops = json.load(sys.stdin); assert len(ops) >= 40, len(ops); print(len(ops), "operations")'
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' | $B mcp | python3 -c 'import sys, json; r = json.loads(sys.stdin.readline()); assert r["result"]["serverInfo"]["name"] == "pointcloudlabeler", r'
+          $B serve --bind 127.0.0.1:7878 & sleep 2
+          curl -fsS http://127.0.0.1:7878/api/health
+          kill %1

@@ -1,5 +1,5 @@
 // Co-registration panel — align scan positions across all imported
-// Preprocessing projects (Riegl / E57 / PTX) into a shared frame.
+// Preprocessing projects (every importer's scan positions) into a shared frame.
 //
 // Workflow:
 //  1. Pick a "source" scan (the one being moved) and a "target" scan
@@ -11,7 +11,7 @@
 //     source scan + per-tie residuals + RMSE so the user can spot a
 //     bad correspondence and remove it.
 //  4. Click Apply → the new pose is written into the source scan's
-//     manifest (Riegl / E57 / PTX importer's preprocessing folder).
+//     manifest (the importer's preprocessing folder).
 //     The original importer files on disk stay untouched — only our
 //     cached pose changes.
 
@@ -23,7 +23,8 @@ import CoregisterParams, { COREG_DEFAULTS, coregPayload, type CoregParams } from
 import { confirmDialog } from '../../ui/dialogs';
 
 export interface UnifiedScan {
-  importer: 'riegl' | 'e57' | 'ptx';
+  importer: 'e57' | 'ptx'
+  ;
   projectId: string;
   projectName: string;
   scanId: string;
@@ -59,7 +60,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
   const [icpMaxDist, setIcpMaxDist] = useState('0.5');
   // Standard ICP variants. point-to-point is Besl & McKay 1992 (the
   // existing path, default for backward-compat). point-to-plane is
-  // Chen & Medioni 1991 — what RiSCAN PRO's MSA refine + Cyclone
+  // Chen & Medioni 1991 — what the vendors' MSA refine + Cyclone
   // REGISTER 360's "Visual Alignment ICP" use; converges ~3× faster
   // and fits tighter on locally-planar surfaces (stems, walls,
   // floors, water).
@@ -71,7 +72,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
   // Every threshold these stages use. They were literals at the call
   // sites below — good defaults, and unreachable from the UI, which is
   // no use on a plot the defaults were not chosen on. See
-  // CoregisterParams for what each one is and which are RIEGL's.
+  // CoregisterParams for what each one is and where it came from.
   const [cp, setCp] = useState<CoregParams>(COREG_DEFAULTS);
   const [msaResult, setMsaResult] = useState<{
     perScan: Array<{ key: string; label: string; nSpheres: number; deltaT: number; deltaR: number; pose: number[] }>;
@@ -219,6 +220,12 @@ export default function CoregisterPanel({ onStatus }: Props) {
 
   // --- ICP fine-refinement ---
   const icpReadable = (s: UnifiedScan | null) => !!s && (s.importer === 'e57' || s.importer === 'ptx');
+  // Why ICP cannot read a scan, for the one importer whose points this
+  // build does not read.
+  const unreadableHint = (s: UnifiedScan): string => {
+    return `ICP can't read importer "${s.importer}".`;
+  };
+  let msaScanCount = scans.length;
   const canIcp = !icpBusy && !!source && !!target && source.scanId !== target.scanId
     && icpReadable(source) && icpReadable(target);
 
@@ -282,20 +289,16 @@ export default function CoregisterPanel({ onStatus }: Props) {
     try {
       const cpv = coregPayload(cp);
       const detectParams = cpv.sphereDetect;
-      // Skip Riegl scans — the build that ships reads no RDB 2 points
-      // (see src-tauri riegl_rdbx.rs), so a manifest-only project has
-      // nothing to detect spheres in.
-      const usable = scans.filter(s => s.importer !== 'riegl');
+      let usable = scans;
       if (usable.length < 2) {
         onStatus({ kind: 'err', msg: 'MSA needs at least 2 E57 / PTX scans whose points this build can read.' });
         setMsaBusy(false);
         return;
       }
-      // RIEGL's own numbers where the quantity is a length or an
-      // angle (from a RiSCAN PRO project's regsettings.json); the
-      // point-count thresholds stay ours because this runs on a 200 k
-      // subsample and RIEGL's run on the full scan. The reasoning is
-      // in commands/coregister.rs, above PlaneExtractParams.
+      // The vendor's own numbers where the quantity is a length or an
+      // angle; the point-count thresholds stay ours because this runs
+      // on a 200 k subsample and the vendor's run on the full scan. The
+      // reasoning is in commands/coregister.rs, above PlaneExtractParams.
       const planeParams = cpv.planeExtract;
       const [perScanSpheres, perScanPlanes] = await Promise.all([
         Promise.all(usable.map(s => api.coregisterDetectSpheres!({
@@ -702,7 +705,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
 
       {scans.length === 0 ? (
         <div className="p-6 text-center mono text-[11px]" style={{ color: 'var(--text-mute)' }}>
-          No scan positions found. Import {coregisterSources(EDITION) === 'E57 / PTX' ? 'an E57 or PTX' : 'a Riegl / E57 / PTX'} file first.
+          No scan positions found. Import a scanner project ({coregisterSources(EDITION)}) first.
         </div>
       ) : (
         <div className="p-4 flex flex-col gap-4">
@@ -784,7 +787,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
                 className="btn !h-7 !px-2 mono text-[10.5px]"
                 onClick={() => void doAutoMatch()}
                 disabled={!source || !target || source?.scanId === target?.scanId || autoMatchBusy}
-                title="Auto-detect retroreflective sphere targets in both scans + match them via RANSAC. Fills the tie-point list with the matched centres. Requires sphere targets in the scene (RIEGL 7.5 cm or 14.5 cm radius)."
+                title="Auto-detect retroreflective sphere targets in both scans + match them via RANSAC. Fills the tie-point list with the matched centres. Requires sphere targets in the scene (7.5 cm or 14.5 cm radius)."
                 style={{
                   background: autoMatchBusy ? 'var(--wash-2)' : undefined,
                   borderColor: autoMatchBusy ? 'var(--accent)' : undefined,
@@ -871,7 +874,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
                   border: `1px solid ${icpMethod === 'pointToPlane' ? 'var(--accent)' : 'var(--line)'}`,
                   cursor: 'pointer',
                 }}
-                title="Chen & Medioni 1991 — minimises Σ ((R·p + t − q)·n_q)². RiSCAN PRO + Cyclone REGISTER 360 use this; ~3× faster convergence + tight fits on planar / cylindrical surfaces (stems, walls, floors, water)."
+                title="Chen & Medioni 1991 — minimises Σ ((R·p + t − q)·n_q)². The vendor suites and Cyclone REGISTER 360 use this; ~3× faster convergence + tight fits on planar / cylindrical surfaces (stems, walls, floors, water)."
               >Point-to-plane</button>
               {icpMethod === 'pointToPlane' && (
                 <span className="mono text-[9.5px]" style={{ color: 'var(--text-mute)' }}>
@@ -881,9 +884,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
             </div>
             {!icpReadable(source) && source ? (
               <div className="mono text-[10px] mb-2" style={{ color: '#ffd9a0' }}>
-                {source.importer === 'riegl'
-                  ? 'ICP cannot read this scan\'s points: RIEGL RDB 2 is read only through rdblib. Export it from RiSCAN PRO as E57 first, or use the manual solve.'
-                  : `ICP can't read importer "${source.importer}".`}
+                {unreadableHint(source)}
               </div>
             ) : null}
             <div className="flex items-end gap-3 mb-2">
@@ -945,7 +946,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
         <div className="flex items-baseline gap-2">
           <span className="mono text-[11px]" style={{ color: 'var(--text)' }}>3 · Multi-Station Adjustment</span>
           <span className="mono text-[9.5px]" style={{ color: 'var(--text-mute)' }}>
-            sphere targets + RANSAC + LM bundle · global pose-graph fit · RiSCAN PRO MSA equivalent
+            sphere targets + RANSAC + LM bundle · global pose-graph fit · the vendor suites' MSA equivalent
           </span>
         </div>
         <div className="mono text-[10px] mt-1.5" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
@@ -953,7 +954,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
         </div>
         <label className="flex items-center gap-2 mt-2 mono text-[10px] cursor-pointer"
                style={{ color: 'var(--text-dim)' }}
-               title="RIEGL's preserveRollAndPitch. The scanner's inclination sensors measure roll and pitch to ~0.01°, better than a plane or sphere fit recovers them — so the adjustment solves yaw and translation only and leaves the levelling alone. Turn it off for a full 6-DoF fit (e.g. a scan whose levelling is not trustworthy).">
+               title="The vendor's preserveRollAndPitch. The scanner's inclination sensors measure roll and pitch to ~0.01°, better than a plane or sphere fit recovers them — so the adjustment solves yaw and translation only and leaves the levelling alone. Turn it off for a full 6-DoF fit (e.g. a scan whose levelling is not trustworthy).">
           <input
             type="checkbox"
             checked={cp.msaPreserveRollPitch}
@@ -968,7 +969,7 @@ export default function CoregisterPanel({ onStatus }: Props) {
             onClick={() => void doMsa()}
             disabled={msaBusy || scans.length < 2}
           >
-            {msaBusy ? 'Running MSA…' : `Run MSA over ${scans.filter(s => s.importer !== 'riegl').length} scans`}
+            {msaBusy ? 'Running MSA…' : `Run MSA over ${msaScanCount} scans`}
           </button>
           {msaResult && (
             <button

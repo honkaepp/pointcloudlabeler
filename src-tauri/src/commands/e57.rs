@@ -7,14 +7,13 @@
 // from their processing software, so one importer covers a wide swath
 // of the Preprocessing module without per-vendor SDKs.
 //
-// Unlike the Riegl importer (which is metadata-only until rdblib lands),
 // E57 is fully pure-Rust here: we read both metadata AND point bytes via
 // the `e57` crate (MIT, no FFI, no unsafe). `e57_export_region` actually
 // produces a LAS / LAZ.
 //
 // What's here:
 //  ✓ List + import — parse the per-scan metadata (name, guid, point
-//    count, pose) and persist a manifest mirroring the Riegl shape so
+//    count, pose) and persist a manifest in the scan-position shape so
 //    the same Preprocessing scan-position UI can render it.
 //  ✓ Export region — read points from selected scans, apply each scan's
 //    pose to put them in a shared world frame, optionally crop to a
@@ -26,16 +25,22 @@
 //    a follow-up once we have multiple registered scan positions to
 //    operate on; lives in its own commands.
 
+#[cfg(feature = "gui")]
+
 use tauri::State;
 
+#[cfg(feature = "gui")]
 use crate::state::AppState;
+use crate::progress::Progress;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
+use tauri::Window;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use e57::{CartesianCoordinate, E57Reader, Transform};
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Window};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -93,19 +98,13 @@ struct Manifest {
 
 // --- progress channel ------------------------------------------------
 
-#[derive(Serialize, Clone, Copy)]
-struct ProgressMsg<'a> {
-    stage: &'a str,
-    pct: f32,
-}
-
-fn emit_progress(window: &Window, pct: f32) {
-    let _ = window.emit("e57-progress", ProgressMsg { stage: "e57", pct });
+fn emit_progress(progress: &Progress, pct: f32) {
+    progress.report("e57", pct);
 }
 
 // --- public commands ------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn e57_list_projects(project_folder: String) -> Result<Vec<E57ProjectSummary>, String> {
     let dir = Path::new(&project_folder).join("preprocessing").join("e57");
     if !dir.is_dir() {
@@ -127,7 +126,7 @@ pub fn e57_list_projects(project_folder: String) -> Result<Vec<E57ProjectSummary
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn e57_import_project(
     project_folder: String,
     source_path: String,
@@ -207,7 +206,7 @@ pub fn e57_import_project(
     Ok(summary)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn e57_remove_project(project_folder: String, e57_id: String) -> Result<(), String> {
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
@@ -246,7 +245,8 @@ pub struct E57ExportResult {
     pub point_count: u64,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 #[allow(clippy::too_many_arguments)]
 pub async fn e57_export_region(
     state: State<'_, AppState>,
@@ -257,6 +257,7 @@ pub async fn e57_export_region(
     bbox: E57ExportBbox,
     out_path: String,
 ) -> Result<E57ExportResult, String> {
+    let progress = Progress::window(window, "e57-progress");
     // One path component, not a path: this is joined onto the
     // preprocessing directory, and a join confines nothing.
     // See fsgrant::safe_component.
@@ -294,15 +295,15 @@ pub async fn e57_export_region(
     }
     let source_path = manifest.summary.source_path.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
-        run_e57_export(&window, &source_path, &want, &bbox, &out_path)
+    crate::rt::spawn_blocking(move || {
+        run_e57_export(&progress, &source_path, &want, &bbox, &out_path)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn run_e57_export(
-    window: &Window,
+pub fn run_e57_export(
+    progress: &Progress,
     source_path: &str,
     scan_indices: &[usize],
     bbox: &E57ExportBbox,
@@ -311,7 +312,7 @@ fn run_e57_export(
     use las::{Builder, Color as LasColor, Point as LasPoint, Transform as LasTransform, Vector, Writer};
     use las::point::Format;
 
-    emit_progress(window, 0.0);
+    emit_progress(progress, 0.0);
 
     let mut reader = E57Reader::from_file(Path::new(source_path))
         .map_err(|e| format!("open {source_path}: {e}"))?;
@@ -367,14 +368,18 @@ fn run_e57_export(
     // -- Build the LAS / LAZ writer. --
     // Point format 2 = legacy color + intensity, no GPS time — the right
     // fit for static TLS scans where time of acquisition isn't useful.
+    // …when a selected scan carries colour. The las crate refuses a
+    // colourless point in a colour format, so an E57 without colour
+    // could not be exported at all; format 0 for those.
+    let any_color = scan_indices.iter().any(|&i| pointclouds.get(i).is_some_and(|pc| pc.has_color()));
     let mut builder = Builder::from((1, 4));
-    builder.point_format = Format::new(2).map_err(|e| format!("las format: {e}"))?;
+    builder.point_format = Format::new(if any_color { 2 } else { 0 }).map_err(|e| format!("las format: {e}"))?;
     builder.transforms = Vector {
         x: LasTransform { scale: 0.001, offset: ox },
         y: LasTransform { scale: 0.001, offset: oy },
         z: LasTransform { scale: 0.001, offset: oz },
     };
-    builder.generating_software = "PointCloudLabeler — E57 preprocessing".to_string();
+    builder.generating_software = "PointCloudLabeler E57 export".to_string();
     // The E57 header often states its coordinate system as WKT. It was
     // read, shown in the scan list, and then discarded — so the octree
     // built from this LAS arrived with no CRS and the user had to
@@ -406,7 +411,7 @@ fn run_e57_export(
         if approx_total == 0 { return; }
         let pct = (read as f32 / approx_total as f32).clamp(0.0, 0.99);
         if pct - last_pct_emit.get() >= 0.01 {
-            emit_progress(window, pct);
+            emit_progress(progress, pct);
             last_pct_emit.set(pct);
         }
     };
@@ -465,14 +470,14 @@ fn run_e57_export(
             number_of_returns: 1,
             ..Default::default()
             };
-            lp.color = color;
+            lp.color = if any_color { color.or(Some(LasColor { red: 0, green: 0, blue: 0 })) } else { None };
             writer.write_point(lp).map_err(|e| format!("write point: {e}"))?;
             written += 1;
         }
     }
 
     writer.close().map_err(|e| format!("close las/laz: {e}"))?;
-    emit_progress(window, 1.0);
+    emit_progress(progress, 1.0);
     Ok(E57ExportResult {
         out_path: out_path.to_string(),
         point_count: written,
@@ -482,9 +487,9 @@ fn run_e57_export(
 // --- helpers --------------------------------------------------------
 
 /// Convert E57's pose (quaternion + translation) into a 4×4 row-major
-/// transform compatible with our existing scan-position UI (which already
-/// renders Riegl SOPs in the same shape).
-fn transform_to_row_major(t: Option<&Transform>) -> Vec<f64> {
+/// transform compatible with our existing scan-position UI (every
+/// importer's poses are rendered in the same shape).
+pub(crate) fn transform_to_row_major(t: Option<&Transform>) -> Vec<f64> {
     let Some(t) = t else { return identity_4x4(); };
     let q = &t.rotation;
     let tr = &t.translation;
@@ -549,7 +554,7 @@ fn identity_4x4() -> Vec<f64> {
     ]
 }
 
-fn apply_pose_4x4(m: &[f64], p: [f64; 3]) -> [f64; 3] {
+pub(crate) fn apply_pose_4x4(m: &[f64], p: [f64; 3]) -> [f64; 3] {
     if m.len() != 16 { return p; }
     [
         m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],

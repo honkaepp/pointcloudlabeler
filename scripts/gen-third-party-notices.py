@@ -183,8 +183,8 @@ def main():
             'Crates marked *not built on this platform* are in `Cargo.lock` '
             'for a target this file was not generated on — the macOS '
             '(`core-graphics`, `objc2`, `dispatch2`), Windows, Android and '
-            'wasm backends Tauri carries, plus the build-only `bindgen` / '
-            '`clang-sys` behind the off-by-default `rdblib` feature. They '
+            'wasm backends Tauri carries, plus build-only tools behind '
+            'off-by-default features. They '
             'are not in the binary this file ships beside. Cargo only '
             'fetches what the target needs, so regenerating on each release '
             "platform resolves that platform's own set; `notices.test.ts` "

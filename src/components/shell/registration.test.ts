@@ -74,7 +74,7 @@ describe('the Cloud registration panel', () => {
     expect(rust).toMatch(/cancel::try_begin\("align"\)/);
     expect(rust).toMatch(/cancel::token\("align"\)/);
     const run = rust.slice(rust.indexOf('fn run_skeleton_align('), rust.indexOf('fn chrono_like_now('));
-    expect((run.match(/emit_progress\(window, "align",/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    expect((run.match(/emit_progress\(progress, "align",/g) ?? []).length).toBeGreaterThanOrEqual(5);
     expect((run.match(/if crate::commands::cancel::stopped\(&cancel\) \{ return Err\("Stopped — nothing was changed\."\.to_string\(\)\); \}/g) ?? []).length).toBe(2);
     expect(run.indexOf('write_file_atomic(&t_dir.join(ALIGNMENT_FILE)')).toBeGreaterThan(run.lastIndexOf('cancel::stopped'));
   });

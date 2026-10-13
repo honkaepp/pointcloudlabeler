@@ -64,6 +64,7 @@ import StemTaperPanel from './StemTaperPanel';
 import TreeGrowthPanel from './TreeGrowthPanel';
 import CrossSensorPanel from './CrossSensorPanel';
 import RegistrationPanel from './RegistrationPanel';
+import FineRegistrationPanel from './FineRegistrationPanel';
 import SegmentPanel from './SegmentPanel';
 import GroundPanel from './GroundPanel';
 import PointQcPanel from './PointQcPanel';
@@ -171,6 +172,7 @@ export default function EditorShell({
   const [validationSummary, setValidationSummary] = useState<OctreeShellState['validationSummary']>(null);
   const [growthSummary, setGrowthSummary] = useState<OctreeShellState['growthSummary']>(null);
   const [m3c2Summary, setM3c2Summary] = useState<OctreeShellState['m3c2Summary']>(null);
+  const [registrationError, setRegistrationError] = useState<OctreeShellState['registrationError']>(null);
   const [taperMeasurements, setTaperMeasurements] = useState<OctreeShellState['taperMeasurements']>(null);
   const [secondaryClouds, setSecondaryClouds] = useState<SecondaryCloud[]>([]);
   const [editMode, setEditMode] = useState(false);
@@ -490,6 +492,7 @@ export default function EditorShell({
     validationSummary, setValidationSummary,
     growthSummary, setGrowthSummary,
     m3c2Summary, setM3c2Summary,
+    registrationError, setRegistrationError,
     taperMeasurements, setTaperMeasurements,
     secondaryClouds, addSecondary, removeSecondary, toggleSecondary, updateSecondary,
     selectedCount, dirty, stats,
@@ -501,7 +504,7 @@ export default function EditorShell({
     overlayError, clearOverlayError: () => setOverlayError(null),
     refreshDatasets: onDatasetsChanged,
     reloadActiveOctree: onReloadActiveOctree,
-  }), [visiblePanels, togglePanel, editMode, measuring, display, setDisplay, tools, setTools, filters, setFilters, rasterLayers, cloudVisible, subsetPreview, worldPicker, plotBoundary, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, saveAnalysisLayer, saveRasterLayer, desktop, stemCenterlines, skeletonOverlay, setSkeletonOverlay, m3c2Overlay, compare, compareApi, validationSummary, growthSummary, m3c2Summary, taperMeasurements, secondaryClouds, addSecondary, removeSecondary, toggleSecondary, updateSecondary, selectedCount, dirty, stats, saveStatus, lastSavedAt, saveError, autosaveEnabled, setAutosaveEnabled, octree, octreeList, api, paletteOpen, datasetBusy, withDatasetBusy, overlayError, onDatasetsChanged, onReloadActiveOctree]);
+  }), [visiblePanels, togglePanel, editMode, measuring, display, setDisplay, tools, setTools, filters, setFilters, rasterLayers, cloudVisible, subsetPreview, worldPicker, plotBoundary, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, saveAnalysisLayer, saveRasterLayer, desktop, stemCenterlines, skeletonOverlay, setSkeletonOverlay, m3c2Overlay, compare, compareApi, validationSummary, growthSummary, m3c2Summary, registrationError, taperMeasurements, secondaryClouds, addSecondary, removeSecondary, toggleSecondary, updateSecondary, selectedCount, dirty, stats, saveStatus, lastSavedAt, saveError, autosaveEnabled, setAutosaveEnabled, octree, octreeList, api, paletteOpen, datasetBusy, withDatasetBusy, overlayError, onDatasetsChanged, onReloadActiveOctree]);
 
   // Reset save indicators when the dataset changes — a "saved 4 min ago"
   // from the previous cloud shouldn't be claimed on the new one.
@@ -663,8 +666,8 @@ export default function EditorShell({
       cmds.push({ id: `panel.${id}`, group: 'Panels', title, run: () => togglePanel(id) });
     // Live shortcut hints from the binding map (reflect any customization).
     const hk = (id: KeyActionId) => formatChordOrEmpty(bindings[id]);
-    cmds.push({ id: 'file.import', group: 'File', title: 'Import LAS / LAZ…', hint: hk('file.import'), run: onImport });
-    cmds.push({ id: 'file.export', group: 'File', title: 'Export to LAS', hint: hk('file.export'), disabled: !api, run: () => api?.exportLas() });
+    cmds.push({ id: 'file.import', group: 'File', title: 'Import point cloud (LAS / LAZ / TXT / PLY / E57)…', hint: hk('file.import'), run: onImport });
+    cmds.push({ id: 'file.export', group: 'File', title: 'Export cloud (LAS / LAZ / TXT / PLY / E57)…', hint: hk('file.export'), disabled: !api, run: () => api?.exportLas() });
     cmds.push({ id: 'file.save', group: 'File', title: 'Save edits', hint: hk('file.save'), disabled: !api, run: () => api?.save() });
     cmds.push({ id: 'edit.undo', group: 'Edit', title: 'Undo', hint: hk('edit.undo'), disabled: !api, run: () => api?.undo() });
     cmds.push({ id: 'edit.redo', group: 'Edit', title: 'Redo', hint: hk('edit.redo'), disabled: !api, run: () => api?.redo() });
@@ -704,6 +707,7 @@ export default function EditorShell({
     panel('growth', 'Toggle Tree growth panel');
     panel('crosssensor', 'Toggle ALS ↔ TLS join panel');
     panel('register', 'Toggle Cloud registration panel');
+    panel('finereg', 'Toggle Fine registration panel');
     panel('segment', 'Toggle Auto-segment panel');
     panel('ground', 'Toggle Terrain panel');
     panel('history', 'Toggle History panel');
@@ -883,6 +887,9 @@ export default function EditorShell({
               </FloatingPanel>
               <FloatingPanel id="register" title="Cloud registration" width={452} initial={{ x: 1030, y: 260 }} open={visiblePanels.has('register')} onClose={() => togglePanel('register')}>
                 <RegistrationPanel />
+              </FloatingPanel>
+              <FloatingPanel id="finereg" title="Fine registration" width={492} initial={{ x: 1000, y: 240 }} open={visiblePanels.has('finereg')} onClose={() => togglePanel('finereg')}>
+                <FineRegistrationPanel />
               </FloatingPanel>
               <FloatingPanel id="segment" title="Auto-segment" width={300} initial={{ x: 600, y: 16 }} open={visiblePanels.has('segment')} onClose={() => togglePanel('segment')}>
                 <SegmentPanel />

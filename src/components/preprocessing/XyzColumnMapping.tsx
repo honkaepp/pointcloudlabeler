@@ -1,5 +1,5 @@
-// Column-role mapping for an imported ASCII file. Unlike the Riegl /
-// E57 / PTX panels (which list per-scan positions), an ASCII cloud is
+// Column-role mapping for an imported ASCII file. Unlike the E57 /
+// PTX panels (which list per-scan positions), an ASCII cloud is
 // one bag of points — the right pane is a column-mapping editor + a
 // preview table + an Export button.
 //
@@ -19,13 +19,14 @@ interface Props {
   onStatus: (s: { kind: 'ok' | 'err' | 'info'; msg: string } | null) => void;
 }
 
-type OptionRole = 'intensity' | 'r' | 'g' | 'b' | 'classification';
+type OptionRole = 'intensity' | 'r' | 'g' | 'b' | 'classification' | 'gpsTime';
 const OPTION_LABELS: Record<OptionRole, string> = {
   intensity: 'Intensity',
   r: 'Red',
   g: 'Green',
   b: 'Blue',
   classification: 'Classification',
+  gpsTime: 'Time (GPS time)',
 };
 
 export default function XyzColumnMapping({ project, onChange, onStatus }: Props) {
@@ -178,7 +179,7 @@ export default function XyzColumnMapping({ project, onChange, onStatus }: Props)
             <OptionalRow
               key={role}
               label={OPTION_LABELS[role]}
-              col={mapping[role]}
+              col={mapping[role] ?? null}
               cols={cols}
               colLabel={colLabel}
               onSet={(c) => setOptional(role, c)}

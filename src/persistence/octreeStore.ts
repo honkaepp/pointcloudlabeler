@@ -10,6 +10,8 @@
 // — see octree.rs for the format spec. The runtime reader + LOD renderer
 // that streams nodes on demand lives in octreeReader.ts + OctreeView.tsx.
 
+import type { PointFileMapping } from '../io/pointFile';
+
 /** Result returned by the Rust converter. Mirrors OctreeImportResult in
  *  octree.rs (camelCased through serde). */
 export interface OctreeImportResult {
@@ -75,6 +77,9 @@ export interface OctreeImportOptions {
    *  "Enable deadwood labelling" affordance. Missing / true keeps the
    *  legacy behaviour (channels always created). */
   includeDeadwood?: boolean;
+  /** A text, PLY or E57 source: which of its columns fills which field
+   *  (io/pointFile.ts). Ignored for LAS/LAZ. */
+  mapping?: PointFileMapping;
 }
 
 type DesktopApi = {

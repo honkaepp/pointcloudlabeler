@@ -8,49 +8,66 @@ vi.mock('laz-perf/lib/web/laz-perf.wasm?url', () => ({
   default: join(process.cwd(), 'node_modules/laz-perf/lib/web/laz-perf.wasm'),
 }));
 import { readFileSync } from 'node:fs';
-import { unsupportedLasFields, parseLasStream } from './parseLasStream';
+import { unsupportedLasFields, standardLasFields, isStandardLasField, parseLasStream } from './parseLasStream';
 import { buildLas, fileLikeOf, type LasPoint } from './lasFixture';
 
-/** Which standard LAS fields the octree cannot carry, per point format.
- *
- *  This is disclosure, not capability: PointCloudLabeler stores XYZ, intensity,
- *  classification and return number, and nothing else. Naming what IS
- *  read never told anyone their colourised MLS delivery would arrive
- *  grey — and they only found out after the import. */
-describe('unsupportedLasFields', () => {
-  it('names colour for every format that carries it', () => {
+/** Which standard LAS fields a point format carries, offered as columns
+ *  by the import dialog — and the one thing the octree still cannot
+ *  carry. GPS time, colour, the scan angle, user data, the scan position
+ *  and the flags used to be dropped with a footnote saying so; now each
+ *  is a column under its reserved name (src-tauri octree.rs's StdField,
+ *  whose availability table this mirrors). */
+describe('standardLasFields', () => {
+  const names = (f: number) => standardLasFields(f).map(x => x.name);
+
+  it('offers colour for every format that carries it', () => {
     for (const fmt of [2, 3, 5, 7, 8, 10]) {
-      expect(unsupportedLasFields(fmt), `format ${fmt} has RGB`).toContain('colour (RGB)');
+      expect(names(fmt), `format ${fmt} has RGB`).toEqual(expect.arrayContaining(['red', 'green', 'blue']));
     }
     for (const fmt of [0, 1, 4, 6, 9]) {
-      expect(unsupportedLasFields(fmt), `format ${fmt} has no RGB`).not.toContain('colour (RGB)');
+      expect(names(fmt), `format ${fmt} has no RGB`).not.toContain('red');
     }
   });
 
-  it('names GPS time for every format that carries it', () => {
+  it('offers GPS time for every format that carries it, as the first and on by default', () => {
     for (const fmt of [1, 3, 4, 5, 6, 7, 8, 9, 10]) {
-      expect(unsupportedLasFields(fmt), `format ${fmt} has GPS time`).toContain('GPS time');
+      const f = standardLasFields(fmt);
+      expect(f[0], `format ${fmt}`).toMatchObject({ name: 'gps_time', on: true });
     }
-    // Format 0 and 2 are the only ones without it.
-    expect(unsupportedLasFields(0)).not.toContain('GPS time');
-    expect(unsupportedLasFields(2)).not.toContain('GPS time');
+    expect(names(0)).not.toContain('gps_time');
+    expect(names(2)).not.toContain('gps_time');
   });
 
-  it('names near-infrared and waveform only where they exist', () => {
-    expect(unsupportedLasFields(8)).toContain('near-infrared');
-    expect(unsupportedLasFields(3)).not.toContain('near-infrared');
-    expect(unsupportedLasFields(4)).toContain('waveform data');
-    expect(unsupportedLasFields(6)).not.toContain('waveform data');
+  it('offers near-infrared, overlap and the scanner channel only where they exist', () => {
+    expect(names(8)).toContain('nir');
+    expect(names(3)).not.toContain('nir');
+    expect(names(6)).toEqual(expect.arrayContaining(['overlap', 'scanner_channel']));
+    expect(names(3)).not.toContain('overlap');
   });
 
-  /** Every format has these; they are simply never stored. */
-  it('always names the fields no format survives', () => {
+  it('offers the fields every format has, the flags unticked', () => {
     for (const fmt of [0, 1, 2, 3, 6, 7]) {
-      const f = unsupportedLasFields(fmt);
-      expect(f).toContain('scan angle');
-      expect(f).toContain('user data');
-      expect(f).toContain('point source ID');
+      const f = standardLasFields(fmt);
+      expect(f.map(x => x.name)).toEqual(expect.arrayContaining(['scan_angle', 'user_data', 'point_source_id', 'scan_direction', 'edge_of_flight_line', 'synthetic', 'key_point', 'withheld']));
+      expect(f.find(x => x.name === 'point_source_id')?.on).toBe(true);
+      expect(f.find(x => x.name === 'scan_angle')?.on).toBe(false);
+      expect(f.find(x => x.name === 'withheld')?.on).toBe(false);
     }
+    expect(isStandardLasField('GPS_Time')).toBe(true);
+    expect(isStandardLasField('reflectance')).toBe(false);
+  });
+
+  it('says nothing when the format is unknown', () => {
+    expect(standardLasFields(null)).toEqual([]);
+  });
+});
+
+/** Only the waveform packets are left out now. */
+describe('unsupportedLasFields', () => {
+  it('names waveform data where it exists, and nothing else', () => {
+    expect(unsupportedLasFields(4)).toEqual(['waveform data']);
+    expect(unsupportedLasFields(10)).toEqual(['waveform data']);
+    for (const fmt of [0, 1, 2, 3, 6, 7, 8]) expect(unsupportedLasFields(fmt)).toEqual([]);
   });
 
   /** An unreadable header must produce silence, not a guess about what

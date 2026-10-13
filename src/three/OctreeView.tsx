@@ -17,6 +17,7 @@ import {
   readNodePoints,
   readExtraColumn,
   readNodeSelectData,
+  type ExtraArray,
   STANDING_DEADWOOD_EXTRA,
   LAYING_DEADWOOD_EXTRA,
   NO_RECORD,
@@ -180,10 +181,11 @@ interface LoadedNode {
    *  moment the user panned. Summed over the resident nodes per frame. */
   filterPass: number;
   semantic: Uint8Array | null;
-  /** Per-extra-column data, decoded from the trailing f32 region of each
-   *  point's bytes. Keys match metadata.extras[i].name; empty object
-   *  when the file has no extras (v1 / v2 / un-extended v3 imports). */
-  extras: Record<string, Float32Array>;
+  /** Per-extra-column data, decoded from the trailing region of each
+   *  point's bytes (Float64Array for an f64 column such as gps_time).
+   *  Keys match metadata.extras[i].name; empty object when the file has
+   *  no extras (v1 / v2 / un-extended v3 imports). */
+  extras: Record<string, ExtraArray>;
   deleted: Uint8Array | null;
   selection: Uint8Array | null;
   /** Per-point filter visibility (1 = drawn, 0 = hidden). Backs the
@@ -271,7 +273,7 @@ const FADE_OUT_MS = 120;
 // Predictive prefetch: when the camera is moving, also plan from its
 // extrapolated position this far ahead and queue those loads at reduced
 // priority — tiles start arriving BEFORE the camera gets there (the
-// RiSCAN-style "it's already loaded when you stop" feel).
+// the scanner suites' "it's already loaded when you stop" feel).
 const PREFETCH_LOOKAHEAD_S = 0.3;
 const PREFETCH_MIN_SPEED = 0.5;          // scene units (m) per second
 const PREFETCH_MAX_NODES = 32;           // cap per plan so prefetch can't starve real loads
@@ -498,7 +500,7 @@ void main() {
   }
   gl_Position = projectionMatrix * viewPos;
   // Fixed pixel-size points — crisp dots, the same small size at every
-  // distance / LOD level (RiSCAN-Pro-style dots, not distance-scaled
+  // distance / LOD level (scanner-suite-style dots, not distance-scaled
   // splats). An earlier attempt at spacing-adaptive sizing to hide LOD
   // density seams blew the points up into huge boxes, so we keep the
   // fixed-size look the cloud reads best with; uSize is an absolute
@@ -2839,7 +2841,7 @@ export function NodeStreamer({
         try {
           const r = octree.records[ln.recIdx];
           ln.extras[name] = await readExtraColumn(
-            octree.dir, r.byteOffset, r.byteSize, octree.meta.pointBytes, k,
+            octree.dir, r.byteOffset, r.byteSize, octree.meta.pointBytes, k, octree.meta.extras ?? [],
           );
           after(ln);
         } catch (e) {
@@ -4338,7 +4340,7 @@ function planAndStream(
   // visible set is untouched — these tiles just start their disk reads
   // early so they're resident by the time the camera arrives, instead of
   // popping in after every stop (the biggest perceived-latency gap vs
-  // native viewers like RiSCAN Pro).
+  // the scanners' native viewers).
   const speed = camVel ? camVel.length() : 0;
   if (camVel && speed >= PREFETCH_MIN_SPEED) {
     const dx = camVel.x * PREFETCH_LOOKAHEAD_S;
@@ -4512,7 +4514,8 @@ async function loadNode(
     // which is most of why a many-extras dataset used to stream slower
     // than a plain one. A column needed later (user switches colour mode)
     // hydrates via a ranged column read — see hydrateExtraColumn.
-    const allExtraNames = (octree.meta.extras ?? []).map(e => e.name);
+    const allExtras = octree.meta.extras ?? [];
+    const allExtraNames = allExtras.map(e => e.name);
     const wanted = new Set<string>();
     for (const n of allExtraNames) {
       if (n === STANDING_DEADWOOD_EXTRA || n === LAYING_DEADWOOD_EXTRA) wanted.add(n);
@@ -4537,7 +4540,7 @@ async function loadNode(
     const decoded = await readNodePoints(
       octree.dir, byteOffset, byteSize,
       octree.meta.scale, octree.meta.offset, octree.meta.pointBytes,
-      allExtraNames, wanted,
+      allExtras, wanted,
     );
     if (decoded.count === 0) return;
 
@@ -4559,8 +4562,9 @@ async function loadNode(
     // the columns (legacy v3 import predating the deadwood feature).
     const sdExtra = decoded.extras[STANDING_DEADWOOD_EXTRA];
     const ldExtra = decoded.extras[LAYING_DEADWOOD_EXTRA];
-    const standingDeadwood = sdExtra ? f32ToI32(sdExtra) : null;
-    const layingDeadwood = ldExtra ? f32ToI32(ldExtra) : null;
+    // The deadwood channels are f32 columns by construction.
+    const standingDeadwood = sdExtra ? f32ToI32(sdExtra as Float32Array) : null;
+    const layingDeadwood = ldExtra ? f32ToI32(ldExtra as Float32Array) : null;
     const originalStandingDeadwood = standingDeadwood ? new Int32Array(standingDeadwood) : null;
     const originalLayingDeadwood = layingDeadwood ? new Int32Array(layingDeadwood) : null;
     // The Int32 copies above are the editable source of truth for the
@@ -4832,6 +4836,21 @@ function refreshNodeColors(
       const v = arr[i];
       const t = Number.isFinite(v) ? (v - eLo) / eSpan : 0;
       rampColor(ramp, t, rgb);
+      colors[i * 3] = rgb[0]; colors[i * 3 + 1] = rgb[1]; colors[i * 3 + 2] = rgb[2];
+    }
+    return;
+  }
+  // The return number (low nibble of byte 19) and the number of returns
+  // per pulse (high nibble), ramped over 1…5: the first return the low
+  // end, a fifth or later the high end. A zero — a scan that never
+  // recorded returns — paints the low end too, which is what it is.
+  if (mode === 'return_number' || mode === 'number_of_returns') {
+    const ret = ln.returnNumber;
+    for (let i = 0; i < count; i++) {
+      if (ln.selection && ln.selection[i]) { colors[i * 3] = 230; colors[i * 3 + 1] = 30; colors[i * 3 + 2] = 50; continue; }
+      const packed = ret ? ret[i] : 0;
+      const v = mode === 'return_number' ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
+      rampColor(ramp, Math.min(1, Math.max(0, (v - 1) / 4)), rgb);
       colors[i * 3] = rgb[0]; colors[i * 3 + 1] = rgb[1]; colors[i * 3 + 2] = rgb[2];
     }
     return;

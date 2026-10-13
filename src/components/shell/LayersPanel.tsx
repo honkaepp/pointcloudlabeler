@@ -707,7 +707,7 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
       <div>
         <div className="chip mb-1.5">Datasets</div>
         <button className="btn !h-8 w-full justify-center gap-1.5 mono text-[11.5px] mb-1.5" onClick={onImport}>
-          <PlusIcon /> Import LAS / LAZ
+          <PlusIcon /> Import point cloud
         </button>
         {overlayError && (
           <div

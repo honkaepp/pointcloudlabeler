@@ -94,13 +94,34 @@ describe('the application has no network egress', () => {
 
   /** The Rust half has no HTTP client either, and that is what keeps
    *  the rule above from being only half a rule: a command could fetch
-   *  on the renderer's behalf and no frontend scan would see it. */
+   *  on the renderer's behalf and no frontend scan would see it.
+   *
+   *  The headless binary's API SERVER is the one HTTP crate in the
+   *  manifest, and it is the opposite of egress: this process listens,
+   *  on the loopback interface unless told otherwise, and never
+   *  connects anywhere. So hyper may appear, on three conditions this
+   *  test holds it to: optional; built with its server features and
+   *  without `client`; and behind the `api` feature, which no default
+   *  build — not `default`, not `gui` — turns on. The desktop
+   *  application therefore carries no HTTP stack of its own at all. */
   it('links no HTTP client into the binary', () => {
     const cargo = readFileSync(
       new URL('../../src-tauri/Cargo.toml', import.meta.url), 'utf8');
-    for (const crate of ['reqwest', 'ureq', 'hyper', 'isahc', 'attohttpc', 'curl']) {
+    for (const crate of ['reqwest', 'ureq', 'isahc', 'attohttpc', 'curl']) {
       expect(cargo, `${crate} is a dependency`).not.toMatch(
         new RegExp(`^\\s*${crate}\\s*=`, 'm'));
+    }
+    const hyper = cargo.match(/^hyper\s*=\s*\{([^}]*)\}/m);
+    if (hyper) {
+      const spec = hyper[1];
+      expect(spec, 'hyper must be optional').toMatch(/optional\s*=\s*true/);
+      expect(spec, 'hyper must be built as a server').toMatch(/"server"/);
+      expect(spec, 'hyper must not be built as a client').not.toMatch(/"client"/);
+      const features = cargo.split(/^\[features\]$/m)[1]?.split(/^\[/m)[0] ?? '';
+      const line = (name: string) => features.match(new RegExp(`^${name}\\s*=\\s*\\[([^\\]]*)\\]`, 'm'))?.[1] ?? '';
+      expect(line('api'), 'hyper must be behind the api feature').toMatch(/"dep:hyper"/);
+      expect(line('default'), 'the default build must not carry the API').not.toMatch(/"api/);
+      expect(line('gui'), 'the desktop build must not carry the API').not.toMatch(/"api/);
     }
   });
 });

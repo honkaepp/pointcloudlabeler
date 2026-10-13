@@ -15,7 +15,7 @@ import { onOctreeProgress } from '../../persistence/octreeStore';
 import { percentile } from '../../metrics/stats';
 
 export default function M3C2Panel() {
-  const { octree, octreeList, api, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, setM3c2Summary } = useOctreeShell();
+  const { octree, octreeList, api, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, setM3c2Summary, registrationError } = useOctreeShell();
   // The change map is a layer in the Layers panel — hidden, shown, saved
   // with the dataset or removed there as well as here. Each run makes a
   // new one, named after the epochs and the core spacing.
@@ -164,6 +164,13 @@ export default function M3C2Panel() {
         <SliderRow label="Projection scale" unit="cm" value={projCm}   min={5}  max={200}  step={5} setValue={setProjCm}   disabled={busy} />
         <SliderRow label="Max depth"        unit="cm" value={depthCm}  min={50} max={1000} step={10} setValue={setDepthCm} disabled={busy} />
         <SliderRow label="Reg. error"       unit="mm" value={regMm}    min={0}  max={100}  step={1} setValue={setRegMm}    disabled={busy} />
+        {registrationError && (
+          <button className="btn !h-6 mono text-[10px] justify-center" disabled={busy}
+            onClick={() => setRegMm(Math.min(100, Math.max(0, Math.round(registrationError.metres * 1000))))}
+            title={`The Fine registration panel's last measurement: ${registrationError.movingName} onto ${registrationError.referenceName}, a moved point's uncertainty at the plot's radius. Rounded to the millimetre, at least 0.`}>
+            Use the registration's error: {(registrationError.metres * 1000).toFixed(2)} mm
+          </button>
+        )}
         <SliderRow label="Core spacing"     unit="cm" value={coreCm}   min={10} max={200}  step={5} setValue={setCoreCm}   disabled={busy} />
         <div className="mono text-[8.5px]" style={{ color: 'var(--text-mute)', lineHeight: 1.4 }}>
           Core spacing is where the change is evaluated — a subsample, as in Lague et al. Finer than the

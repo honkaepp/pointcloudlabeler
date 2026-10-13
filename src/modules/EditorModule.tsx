@@ -23,6 +23,10 @@ import {
 } from '../persistence/octreeStore';
 import { suggestMapping, type ColumnMapping } from '../io/columnMapping';
 import { detectLasSource, isLasLikeName } from '../io/parseLasStream';
+import {
+  CLOUD_OPEN_FILTERS, cloudSaveFilter, pointFileKindOf, withExportExtension,
+  type PointFileKind, type PointFileMapping, type PointFileProbe,
+} from '../io/pointFile';
 import type { ScannerType } from '../state/multiCloud';
 import { invalidateTreeMetrics } from '../metrics/loadMetrics';
 import { confirmDialog } from '../ui/dialogs';
@@ -38,6 +42,8 @@ interface PendingImport {
    *  standard fields the octree will not carry. null = not a LAS. */
   pointFormat: number | null;
   suggested: ColumnMapping;
+  /** A text, PLY or E57 file: what the probe found. null = LAS/LAZ. */
+  pointFile: { kind: PointFileKind; probe: PointFileProbe } | null;
 }
 
 export default function EditorModule() {
@@ -94,19 +100,44 @@ export default function EditorModule() {
     }
     const d = (window as unknown as Record<string, unknown>).desktop as {
       openFileDialog?: (opts?: Record<string, unknown>) => Promise<FileLike | null>;
+      pointfileProbe?: (path: string) => Promise<PointFileProbe>;
     } | undefined;
     if (!d?.openFileDialog) {
       setStatus({ kind: 'err', msg: 'Native file picker not available (desktop build needed).' });
       return;
     }
-    const picked = await d.openFileDialog({ filters: [{ name: 'LAS / LAZ', extensions: ['las', 'laz'] }] });
+    const picked = await d.openFileDialog({ filters: CLOUD_OPEN_FILTERS });
     if (!picked) return;
-    if (!isLasLikeName(picked.name)) {
-      setStatus({ kind: 'err', msg: 'Pick a .las or .laz file (octree converter only handles those).' });
+    const fileKind = pointFileKindOf(picked.name);
+    if (!isLasLikeName(picked.name) && !fileKind) {
+      setStatus({ kind: 'err', msg: 'Pick a .las / .laz, a text (.txt / .xyz / .csv), a .ply or an .e57 file.' });
       return;
     }
     if (!picked.path) {
       setStatus({ kind: 'err', msg: 'Selected file has no native path — drag-drop is not yet supported here.' });
+      return;
+    }
+    // A text, PLY or E57 file: the Rust probe reads its columns and a
+    // few rows, and guesses the mapping; the dialog shows both.
+    if (fileKind) {
+      if (!d.pointfileProbe) {
+        setStatus({ kind: 'err', msg: 'Text / PLY / E57 import needs the desktop build.' });
+        return;
+      }
+      try {
+        const probe = await d.pointfileProbe(picked.path);
+        setPendingImport({
+          fileName: picked.name,
+          pointFormat: null,
+          srcPath: picked.path,
+          sizeBytes: picked.size,
+          columns: probe.columns,
+          suggested: suggestMapping(probe.columns),
+          pointFile: { kind: fileKind, probe },
+        });
+      } catch (e) {
+        setStatus({ kind: 'err', msg: `Could not read ${picked.name}: ${e instanceof Error ? e.message : String(e)}` });
+      }
       return;
     }
     // Probe the LAS header for its columns so the dialog can show every
@@ -142,6 +173,7 @@ export default function EditorModule() {
       sizeBytes: picked.size,
       columns,
       suggested: suggestMapping(columns),
+      pointFile: null,
     });
   }, [project?.folder]);
 
@@ -153,6 +185,7 @@ export default function EditorModule() {
     preSegmented?: { treeIdExtra: string; semanticExtra: string; standingDeadwoodExtra: string; layingDeadwoodExtra: string },
     extraNames?: string[],
     includeDeadwood?: boolean,
+    mapping?: PointFileMapping,
   ) => {
     if (!project?.folder) return;
     const outDir = `${project.folder}/octrees/${safeOutputName(p.fileName)}`;
@@ -177,6 +210,7 @@ export default function EditorModule() {
         layingDeadwoodExtraName: preSegmented?.layingDeadwoodExtra || undefined,
         extraNames: extraNames && extraNames.length > 0 ? extraNames : undefined,
         includeDeadwood,
+        mapping,
       });
       const sec = (res.durationMs / 1000).toFixed(1);
       // Surface the observed tree_id range when a source column was
@@ -214,7 +248,7 @@ export default function EditorModule() {
   // Export the active octree via the dialog → save-file picker → Rust.
   const handleExport = useCallback(async (octreeDir: string, name: string, opts: OctreeExportOptions) => {
     const api = (window as unknown as Record<string, unknown>).desktop as {
-      saveLasDialog?: (n: string) => Promise<string | null>;
+      saveCloudDialog?: (n: string, filter: { name: string; extensions: string[] }) => Promise<string | null>;
       cloudExportOctreeLas?: (
         dir: string, out: string, normalize?: boolean, cellSize?: number,
         o?: {
@@ -226,20 +260,24 @@ export default function EditorModule() {
           targetCrs?: string;
           geoid?: string;
           las14?: boolean;
+          standardFields?: boolean;
+          delimiter?: string;
+          header?: boolean;
+          plyAscii?: boolean;
         },
       ) => Promise<ExportReport>;
     } | undefined;
-    if (!api?.saveLasDialog || !api?.cloudExportOctreeLas) {
+    if (!api?.saveCloudDialog || !api?.cloudExportOctreeLas) {
       setStatus({ kind: 'err', msg: 'Octree export needs the desktop build.' });
       return;
     }
     const ext = opts.format;
-    const picked = await api.saveLasDialog(`${safeOutputName(name) || 'octree'}.${ext}`);
+    const picked = await api.saveCloudDialog(`${safeOutputName(name) || 'octree'}.${ext}`, cloudSaveFilter(ext));
     if (!picked) return;
-    // The Rust writer dispatches LAS vs LAZ on the path's extension; honour
-    // the dialog's container choice even if the save sheet kept a different
-    // one.
-    const target = picked.replace(/\.(las|laz)$/i, '') + `.${ext}`;
+    // The Rust writer dispatches on the path's extension — LAS, LAZ,
+    // text, PLY, E57 — so the dialog's choice wins over whatever the
+    // save sheet kept.
+    const target = withExportExtension(picked, ext);
     let unlisten: (() => void) | null = null;
     try {
       setOperation('Exporting');
@@ -276,6 +314,10 @@ export default function EditorModule() {
         targetCrs: opts.targetCrs?.spec,
         geoid: opts.geoid,
         las14: opts.las14,
+        standardFields: opts.standardFields,
+        delimiter: opts.delimiter,
+        header: opts.header,
+        plyAscii: opts.plyAscii,
       });
       // A normalised export leaves out any point with no ground beneath
       // it — it has no height above ground, and LAS cannot store a NaN Z.
@@ -430,16 +472,17 @@ export default function EditorModule() {
       {pendingImport && (
         <ImportMappingDialog
           fileName={pendingImport.fileName}
-          isLas
+          isLas={pendingImport.pointFile === null}
           columns={pendingImport.columns}
           pointFormat={pendingImport.pointFormat}
           suggested={pendingImport.suggested}
-          mode="scannerOnly"
+          mode={pendingImport.pointFile ? 'pointFile' : 'scannerOnly'}
+          pointFile={pendingImport.pointFile ?? undefined}
           onCancel={() => setPendingImport(null)}
-          onConfirm={(scannerType, _mapping, _verticalAxis, preSegmented, extraNames, includeDeadwood) => {
+          onConfirm={(scannerType, _mapping, _verticalAxis, preSegmented, extraNames, includeDeadwood, fileMapping) => {
             const p = pendingImport;
             setPendingImport(null);
-            void runConvert(p, scannerType, preSegmented, extraNames, includeDeadwood);
+            void runConvert(p, scannerType, preSegmented, extraNames, includeDeadwood, fileMapping);
           }}
         />
       )}

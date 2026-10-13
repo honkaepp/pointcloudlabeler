@@ -387,7 +387,7 @@ fn timing_save_5m_points_under_ten_seconds() {
     // 5 M points (15 M f32 = 60 MB) + 5 M i32 ids (20 MB).
     // Validates the raw fs::write path is at disk-bandwidth speed: should
     // complete in well under a second on any modern SSD, comfortably below
-    // the RiScan-style "tens of seconds" goal even after 10x scaling.
+    // the commercial suites' "tens of seconds" goal even after 10x scaling.
     let dir = tmp_dir("timing");
     let path = dir.join("perf.tcloud");
 
@@ -414,7 +414,7 @@ fn timing_save_5m_points_under_ten_seconds() {
     );
     assert!(
         dt.as_secs_f64() < 10.0,
-        "save took {dt:?} — well over the RiScan-style budget"
+        "save took {dt:?} — well over the commercial suites' budget"
     );
 }
 

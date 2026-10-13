@@ -1,5 +1,5 @@
 // Co-registration: align scan positions across the imported
-// Preprocessing projects (Riegl / E57 / PTX) into a shared frame.
+// Preprocessing projects (every importer's scan positions) into a shared frame.
 //
 // What's here (v1):
 //  ✓ list_scans — flat list of every scan position across all
@@ -23,9 +23,8 @@
 //    into the shared frame, then iterates closest-point correspondence
 //    + Kabsch until convergence. Returns the refined source pose plus
 //    the per-iteration RMSE history so the UI can show the curve.
-//    Reuses the same Kabsch core as the manual solve. Riegl scans need
-//    rdblib (phase 2) before ICP can read their points — until then
-//    ICP rejects a Riegl source/target with a clear message.
+//    Reuses the same Kabsch core as the manual solve. A scan whose
+//    points this build cannot read is rejected with a clear message.
 //
 // Not yet implemented (deliberate, follow-up commits):
 //  - Target-based registration with sphere / chessboard detection
@@ -38,22 +37,24 @@ use std::path::{Path, PathBuf};
 use e57::{CartesianCoordinate, E57Reader};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Window};
+use crate::progress::Progress;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
+use tauri::Window;
 
 // --- types ----------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UnifiedScan {
-    /// "riegl" | "e57" | "ptx" — which importer owns this scan.
+    /// "e57" | "ptx" — which importer owns this scan.
     pub importer: String,
     pub project_id: String,
     pub project_name: String,
     pub scan_id: String,
     pub scan_name: String,
-    /// Current 4×4 pose, row-major. For Riegl this is the SOP
-    /// (SOCS → PRCS); for E57 it's the per-Data3D pose; for PTX it's
-    /// the per-section matrix.
+    /// Current 4×4 pose, row-major. For E57 it's the per-Data3D pose;
+    /// for PTX it's the per-section matrix.
     pub pose: Vec<f64>,
     /// World-frame translation read off the pose (column 3 of the
     /// 4×4). The UI uses this for the "current position" hint per
@@ -84,10 +85,9 @@ pub struct CoregisterResult {
 
 // --- public commands ------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_list_scans(project_folder: String) -> Result<Vec<UnifiedScan>, String> {
     let mut out: Vec<UnifiedScan> = Vec::new();
-    collect_riegl(&project_folder, &mut out)?;
     collect_e57(&project_folder, &mut out)?;
     collect_ptx(&project_folder, &mut out)?;
     // Stable ordering: importer name, then project, then scan name.
@@ -97,7 +97,7 @@ pub fn coregister_list_scans(project_folder: String) -> Result<Vec<UnifiedScan>,
     Ok(out)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_solve(ties: Vec<TiePoint>) -> Result<CoregisterResult, String> {
     if ties.len() < 3 {
         return Err(format!("Need at least 3 tie points (got {}).", ties.len()));
@@ -154,7 +154,7 @@ pub fn coregister_solve(ties: Vec<TiePoint>) -> Result<CoregisterResult, String>
 /// A singular or mirroring rotation block is refused for the same
 /// reason: it is not a pose, and writing it would silently distort every
 /// coordinate the scan contributes downstream.
-fn validate_pose(pose: &[f64], what: &str) -> Result<(), String> {
+pub fn validate_pose(pose: &[f64], what: &str) -> Result<(), String> {
     if pose.len() != 16 {
         return Err(format!("{what} must be 16 floats (got {}).", pose.len()));
     }
@@ -182,7 +182,7 @@ fn validate_pose(pose: &[f64], what: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_apply_delta(
     project_folder: String,
     importer: String,
@@ -197,7 +197,7 @@ pub fn coregister_apply_delta(
     coregister_apply(project_folder, importer, project_id, scan_id, composed)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_apply(
     project_folder: String,
     importer: String,
@@ -207,7 +207,6 @@ pub fn coregister_apply(
 ) -> Result<(), String> {
     validate_pose(&pose, "Pose")?;
     match importer.as_str() {
-        "riegl" => apply_riegl(&project_folder, &project_id, &scan_id, &pose),
         "e57" => apply_e57(&project_folder, &project_id, &scan_id, &pose),
         "ptx" => apply_ptx(&project_folder, &project_id, &scan_id, &pose),
         other => Err(format!("Unknown importer: {other}")),
@@ -237,7 +236,7 @@ pub struct IcpParams {
     pub sample_points: u32,
     /// "pointToPoint" (Besl & McKay 1992, default — fast, robust on
     /// blob-like targets) or "pointToPlane" (Chen & Medioni 1991 — what
-    /// RiSCAN PRO's MSA / Cyclone REGISTER 360's ICP refine uses; ~3×
+    /// the vendor's registration software's MSA / Cyclone REGISTER 360's ICP refine uses; ~3×
     /// faster convergence + tight fits on locally-planar surfaces like
     /// stems, trunks, walls, floors, water surfaces). Default keeps
     /// existing behaviour.
@@ -270,7 +269,8 @@ pub struct IcpResult {
     pub converged: bool,
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn coregister_icp(
     window: Window,
     project_folder: String,
@@ -278,25 +278,20 @@ pub async fn coregister_icp(
     target: IcpScanRef,
     params: IcpParams,
 ) -> Result<IcpResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run_icp(&window, &project_folder, &source, &target, &params)
+    let progress = Progress::window(window, "icp-progress");
+    crate::rt::spawn_blocking(move || {
+        run_icp(&progress, &project_folder, &source, &target, &params)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-#[derive(Serialize, Clone, Copy)]
-struct ProgressMsg<'a> {
-    stage: &'a str,
-    pct: f32,
+fn emit_progress(progress: &Progress, pct: f32) {
+    progress.report("icp", pct);
 }
 
-fn emit_progress(window: &Window, pct: f32) {
-    let _ = window.emit("icp-progress", ProgressMsg { stage: "icp", pct });
-}
-
-fn run_icp(
-    window: &Window,
+pub fn run_icp(
+    progress: &Progress,
     project_folder: &str,
     source: &IcpScanRef,
     target: &IcpScanRef,
@@ -306,7 +301,7 @@ fn run_icp(
         return Err("max_corr_dist must be > 0".into());
     }
     let sample = params.sample_points.max(1000) as usize;
-    emit_progress(window, 0.0);
+    emit_progress(progress, 0.0);
 
     // Read both clouds in WORLD coords (current manifest pose applied).
     // We deliberately apply the manifest pose ourselves rather than the
@@ -314,10 +309,10 @@ fn run_icp(
     // manifest, not the file) is respected.
     let src_world = read_scan_world(project_folder, source, sample)
         .map_err(|e| format!("read source: {e}"))?;
-    emit_progress(window, 0.25);
+    emit_progress(progress, 0.25);
     let tgt_world = read_scan_world(project_folder, target, sample)
         .map_err(|e| format!("read target: {e}"))?;
-    emit_progress(window, 0.4);
+    emit_progress(progress, 0.4);
 
     if src_world.len() < 3 || tgt_world.len() < 3 {
         return Err(format!(
@@ -464,7 +459,7 @@ fn run_icp(
         r_total = r_new;
         t_total = t_new;
 
-        emit_progress(window, 0.4 + 0.55 * (iter as f32 + 1.0) / params.max_iters as f32);
+        emit_progress(progress, 0.4 + 0.55 * (iter as f32 + 1.0) / params.max_iters as f32);
 
         // 4. Convergence: RMSE-delta below 0.1 mm.
         if (last_rmse - rmse).abs() < 1e-4 {
@@ -487,7 +482,7 @@ fn run_icp(
     let delta = rt_to_mat4(&r_total, &t_total);
     let new_pose = mat4_mul(&delta, &src_pose);
 
-    emit_progress(window, 1.0);
+    emit_progress(progress, 1.0);
     Ok(IcpResult {
         pose: new_pose,
         rmse: *rmse_history.last().unwrap_or(&0.0),
@@ -502,17 +497,14 @@ fn run_icp(
 // --- point readers (world frame, current manifest pose applied) ------
 
 /// Read a scan's points into world coords using its CURRENT manifest
-/// pose. Dispatches by importer. Riegl is rejected here (needs rdblib
-/// — phase 2). XYZ isn't a scan position so it never reaches here.
-fn read_scan_world(project_folder: &str, scan: &IcpScanRef, max_points: usize) -> Result<Vec<[f64; 3]>, String> {
+/// pose. Dispatches by importer; an importer whose points this build
+/// cannot read is rejected here. XYZ isn't a scan position so it never
+/// reaches here.
+pub fn read_scan_world(project_folder: &str, scan: &IcpScanRef, max_points: usize) -> Result<Vec<[f64; 3]>, String> {
     let pose = read_scan_pose(project_folder, scan)?;
     let local = match scan.importer.as_str() {
         "e57" => read_e57_local(project_folder, scan, max_points)?,
         "ptx" => read_ptx_local(project_folder, scan, max_points)?,
-        "riegl" => return Err(
-            "ICP can't read Riegl points yet — that needs rdblib (Riegl phase 2). Export the \
-             Riegl scan to LAS first, or use the manual tie-point solve.".into()
-        ),
         other => return Err(format!("ICP doesn't support importer '{other}'.")),
     };
     Ok(local.into_iter().map(|p| {
@@ -521,9 +513,8 @@ fn read_scan_world(project_folder: &str, scan: &IcpScanRef, max_points: usize) -
     }).collect())
 }
 
-fn read_scan_pose(project_folder: &str, scan: &IcpScanRef) -> Result<Vec<f64>, String> {
+pub fn read_scan_pose(project_folder: &str, scan: &IcpScanRef) -> Result<Vec<f64>, String> {
     let (sub, field) = match scan.importer.as_str() {
-        "riegl" => ("riegl", "sop"),
         "e57" => ("e57", "pose"),
         "ptx" => ("ptx", "pose"),
         other => return Err(format!("unknown importer '{other}'")),
@@ -733,7 +724,7 @@ fn rt_to_mat4(r: &[[f64; 3]; 3], t: &[f64; 3]) -> Vec<f64> {
 }
 
 /// Row-major 4×4 multiply, a·b.
-fn mat4_mul(a: &[f64], b: &[f64]) -> Vec<f64> {
+pub fn mat4_mul(a: &[f64], b: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0f64; 16];
     for i in 0..4 {
         for j in 0..4 {
@@ -747,34 +738,6 @@ fn mat4_mul(a: &[f64], b: &[f64]) -> Vec<f64> {
 
 // --- listing: walk every importer's manifests ------------------------
 
-fn collect_riegl(project_folder: &str, out: &mut Vec<UnifiedScan>) -> Result<(), String> {
-    let dir = Path::new(project_folder).join("preprocessing").join("riegl");
-    if !dir.is_dir() { return Ok(()); }
-    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read riegl dir: {e}"))?.flatten() {
-        let manifest = entry.path().join("manifest.json");
-        let Ok(bytes) = std::fs::read(&manifest) else { continue; };
-        let Ok(v): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else { continue; };
-        let s = v.get("summary").unwrap_or(&serde_json::Value::Null);
-        let project_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let project_name = s.get("name").and_then(|v| v.as_str()).unwrap_or(&project_id).to_string();
-        let scans = s.get("scanPositions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        for sp in scans {
-            let scan_id = sp.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let scan_name = sp.get("name").and_then(|v| v.as_str()).unwrap_or(&scan_id).to_string();
-            let pose: Vec<f64> = sp.get("sop").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
-            let pose = if pose.len() == 16 { pose } else { identity_4x4() };
-            let world_translation = [pose[3], pose[7], pose[11]];
-            out.push(UnifiedScan {
-                importer: "riegl".to_string(),
-                project_id: project_id.clone(),
-                project_name: project_name.clone(),
-                scan_id, scan_name, pose, world_translation,
-            });
-        }
-    }
-    Ok(())
-}
 
 fn collect_e57(project_folder: &str, out: &mut Vec<UnifiedScan>) -> Result<(), String> {
     let dir = Path::new(project_folder).join("preprocessing").join("e57");
@@ -836,12 +799,6 @@ fn collect_ptx(project_folder: &str, out: &mut Vec<UnifiedScan>) -> Result<(), S
 
 // --- apply: overwrite the named scan's pose in its manifest ----------
 
-fn apply_riegl(project_folder: &str, project_id: &str, scan_id: &str, pose: &[f64]) -> Result<(), String> {
-    let manifest_path = Path::new(project_folder).join("preprocessing").join("riegl").join(project_id).join("manifest.json");
-    let mut v = read_manifest_json(&manifest_path)?;
-    set_pose_in_scan(&mut v, scan_id, "sop", pose, false)?;
-    write_manifest_atomic(&manifest_path, &v)
-}
 
 fn apply_e57(project_folder: &str, project_id: &str, scan_id: &str, pose: &[f64]) -> Result<(), String> {
     let manifest_path = Path::new(project_folder).join("preprocessing").join("e57").join(project_id).join("manifest.json");
@@ -864,8 +821,8 @@ fn read_manifest_json(path: &Path) -> Result<serde_json::Value, String> {
 
 /// Find the scanPosition with the given id, set its pose field, also
 /// update the world-centre derived from the new pose if the manifest
-/// caches one (E57). The field name differs by importer: "sop" for
-/// Riegl, "pose" for E57 + PTX.
+/// caches one (E57). The field name differs by importer: "pose" for
+/// E57 and PTX, "sop" for a scanner project's SOP.
 fn set_pose_in_scan(
     v: &mut serde_json::Value,
     scan_id: &str,
@@ -1482,7 +1439,7 @@ fn identity_4x4() -> Vec<f64> {
 }
 
 // =====================================================================
-// Plane patch extraction (RiSCAN PRO MSA-style)
+// Plane patch extraction (the vendor's registration software MSA-style)
 //
 // Region-growing over voxels. Per voxel we run a 3×3 PCA: planarity =
 // λ_min / Σλ. A "planar" voxel has λ_min ≪ λ_mid ≈ λ_max — the points
@@ -1498,7 +1455,7 @@ fn identity_4x4() -> Vec<f64> {
 //   • planarity (0..1)        — λ_min / Σλ (smaller = flatter)
 //   • n_points
 //
-// Same primitive RiSCAN PRO's plane-patch extractor produces; same role
+// Same primitive the vendor's registration software's plane-patch extractor produces; same role
 // in MSA: each patch becomes a registration feature that can match a
 // patch on another scan via centroid + normal alignment.
 // =====================================================================
@@ -1515,83 +1472,21 @@ pub struct PlanePatch {
     pub n_points: u32,
 }
 
-// --- where these defaults come from ---------------------------------
-//
-// The plane, matcher and adjustment defaults below are RIEGL's own,
-// read out of a `regsettings.json` in a RiSCAN PRO project rather than
-// picked by taste. The point is that a forester who registers a plot
-// in RiSCAN PRO and then in PointCloudLabeler should not be comparing
-// two different sets of thresholds while trying to compare two
-// registrations.
-//
-// The rule that decides what to take: **physical parameters transfer,
-// counts do not.** A length or an angle means the same thing in both
-// programs, so 0.03 m, 0.125 m, 5 m, 0.5 m, 0.25 m and 2.5° are
-// RIEGL's numbers now, as are its iteration cap and tolerance. A
-// minimum point count is a statement about sampling density, and this
-// extractor is not fed the same density: `coregister_extract_planes`
-// reads a 200 000-point subsample of a scan, while RIEGL's runs on the
-// whole thing. Ten points there is a small patch; ten points here is
-// noise — `random_cloud_emits_no_patches` demonstrates it, yielding
-// four "patches" from a parametric curve the moment the counts were
-// lowered to RIEGL's. So `min_voxel_points` and `min_patch_points`
-// stay ours.
-//
-// Where RIEGL parameterises something differently, copying the number
-// over would be worse than useless, so it is left alone and said so
-// here:
-//
-//   • `planarity_max` (ours: λ_min / Σλ, dimensionless) is NOT
-//     RIEGL's `voxelExtractor.planeThreshold` = 0.25. Both gate "is
-//     this voxel planar", but they are different ratios of different
-//     quantities; 0.25 in our definition would pass almost anything.
-//     Ours stays at 0.015, and RIEGL's `maxStdDev` — a length, which
-//     transfers exactly — now does the physical thinness test.
-//
-//   • `normal_angle_tol_deg` (ours: region-growing tolerance between
-//     neighbouring voxels) is neither of RIEGL's two merge angles:
-//     `voxelMerger.planeMergeThreshold` = 45° merges voxel planes and
-//     `planeMerger.maxAngleDifference` = 1° merges finished patches.
-//     Ours does one job that RIEGL splits in two, so 10° stays.
-//
-//   • `minInclination` / `maxInclination` (0° / 90°) span the whole
-//     range at RIEGL's defaults, so implementing them would add a
-//     knob that does nothing until someone narrows it. Skipped.
-//
-//   • `minReflectance` = -25 dB, `maxDeviation` = 40 and
-//     `maxReflectanceDifference` = 100 filter on per-point attributes
-//     our plane patches do not carry (a patch here is geometry only).
-//     Skipped rather than faked.
-//
-//   • `cauchyParam` = 0 disables RIEGL's robust loss, so there is
-//     nothing to adopt: our least squares is already unweighted.
-//
-//   • `planePatchesMustOverlap` = true describes an overlap test our
-//     matcher does not have; its inlier test is angle + perpendicular
-//     distance. Not adopted, and not pretended.
-//
-//   • `planeExtractor.maxSize` = 5 m was adopted, then measured, then
-//     dropped — see `PlaneExtractParams::max_size`. It bounds the
-//     pieces RIEGL's extractor cuts a surface into; ours grows one
-//     patch per surface, so the same number deletes a 6 m ground
-//     plane instead of splitting it, and the ground is the best
-//     feature a forest plot has. `a_ground_plane_larger_than_riegls_
-//     max_size_survives` is the test that found it.
 
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaneExtractParams {
-    /// Voxel size for the per-voxel PCA. RIEGL's
+    /// Voxel size for the per-voxel PCA. the vendor's
     /// `voxelExtractor.voxelSize` = 0.50 m. Was 0.30 m here, which is
-    /// finer than RIEGL works at; the coarser cell holds more points
+    /// finer than the vendor works at; the coarser cell holds more points
     /// per PCA and reaches the same patches through region growing.
     pub voxel_size: f64,
     /// λ_min / Σλ above which a voxel is rejected as non-planar.
-    /// 0.015. Deliberately NOT RIEGL's `planeThreshold` — see the note
+    /// 0.015. Deliberately NOT the vendor's `planeThreshold` — see the note
     /// above.
     pub planarity_max: f64,
     /// Minimum points per voxel before PCA is meaningful. 16, ours:
-    /// RIEGL's `minPointsPerVoxel` = 5 counts points at full scan
+    /// the vendor's `minPointsPerVoxel` = 5 counts points at full scan
     /// density, and this runs on a 200 k subsample — see the note
     /// above.
     pub min_voxel_points: u32,
@@ -1599,30 +1494,30 @@ pub struct PlaneExtractParams {
     /// 10°, ours — see the note above.
     pub normal_angle_tol_deg: f64,
     /// Minimum points in a finished patch. 200, ours, for the same
-    /// density reason as `min_voxel_points` — RIEGL's `minPointCount`
+    /// density reason as `min_voxel_points` — the vendor's `minPointCount`
     /// is 10. The size and thinness tests below are the ones that
     /// decide what a patch IS; this one only keeps the subsample's
     /// noise out.
     pub min_patch_points: u32,
     /// Maximum RMS point-to-plane distance of a finished patch (m).
-    /// RIEGL's `planeExtractor.maxStdDev` = 0.03 m. This is the test
+    /// the vendor's `planeExtractor.maxStdDev` = 0.03 m. This is the test
     /// that makes a patch physically flat rather than merely
     /// eigenvalue-flat: a broad gentle curve can satisfy a ratio and
     /// still bulge three centimetres.
-    #[serde(default = "riegl_max_std_dev")]
+    #[serde(default = "vendor_max_std_dev")]
     pub max_std_dev: f64,
     /// Smallest patch accepted, measured as the longer side of its
-    /// in-plane bounding box (m). RIEGL's `planeExtractor.minSize` =
+    /// in-plane bounding box (m). the vendor's `planeExtractor.minSize` =
     /// 0.125 m.
     ///
     /// Note this is the longer SIDE, not `PlanePatch::extent`, which
     /// is that box's diagonal — the matcher's `min_extent` uses the
     /// diagonal and predates this. Two different lengths, kept apart
     /// on purpose.
-    #[serde(default = "riegl_min_size")]
+    #[serde(default = "vendor_min_size")]
     pub min_size: f64,
     /// Largest patch accepted (same measure), or 0 for no ceiling —
-    /// which is the default, and NOT RIEGL's `maxSize` of 5 m.
+    /// which is the default, and NOT the vendor's `maxSize` of 5 m.
     ///
     /// This one was adopted and then measured, and the measurement
     /// said no: a 6 m square of ground with 5 mm of noise is one
@@ -1630,7 +1525,7 @@ pub struct PlaneExtractParams {
     /// ground is the most reliable registration feature there is.
     ///
     /// The reason it does not transfer is that it is not really a
-    /// filter in RIEGL's extractor — that one tiles a surface into
+    /// filter in the vendor's extractor — that one tiles a surface into
     /// patches of at most `maxSize`, so the ceiling bounds the size of
     /// the pieces it produces. Ours grows one patch per surface and
     /// stops, so the same number becomes a delete instead of a split.
@@ -1642,8 +1537,8 @@ pub struct PlaneExtractParams {
     pub max_size: f64,
 }
 
-fn riegl_max_std_dev() -> f64 { 0.03 }
-fn riegl_min_size() -> f64 { 0.125 }
+fn vendor_max_std_dev() -> f64 { 0.03 }
+fn vendor_min_size() -> f64 { 0.125 }
 fn no_max_size() -> f64 { 0.0 }
 
 impl Default for PlaneExtractParams {
@@ -1651,20 +1546,20 @@ impl Default for PlaneExtractParams {
         Self {
             voxel_size: 0.50, planarity_max: 0.015, min_voxel_points: 16,
             normal_angle_tol_deg: 10.0, min_patch_points: 200,
-            max_std_dev: riegl_max_std_dev(),
-            min_size: riegl_min_size(),
+            max_std_dev: vendor_max_std_dev(),
+            min_size: vendor_min_size(),
             max_size: no_max_size(),
         }
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn coregister_extract_planes(
     project_folder: String,
     scan: IcpScanRef,
     params: PlaneExtractParams,
 ) -> Result<Vec<PlanePatch>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         // Read in WORLD coords (manifest pose applied) so each patch's
         // centroid/normal is already in the same frame the MSA + ICP
         // operate in.
@@ -1828,7 +1723,7 @@ pub fn extract_plane_patches(pts: &[[f64; 3]], params: &PlaneExtractParams) -> V
         }
         let rmse = (sum_sq / nf).sqrt();
         let eu = mx[0] - mn[0]; let ev = mx[1] - mn[1];
-        // RIEGL's maxStdDev / minSize / maxSize, in RIEGL's units: the
+        // the vendor's maxStdDev / minSize / maxSize, in the vendor's units: the
         // RMS distance to the fitted plane, and the longer side of the
         // in-plane bounding box. Applied here rather than earlier
         // because both need the finished patch's own PCA.
@@ -2273,7 +2168,7 @@ mod plane_extract_tests {
             .collect()
     }
 
-    /// RIEGL's `planeExtractor.maxStdDev` = 0.03 m, and what it
+    /// the vendor's `planeExtractor.maxStdDev` = 0.03 m, and what it
     /// catches is a case the eigenvalue ratio structurally cannot:
     /// **two parallel surfaces merged into one patch.** Every voxel is
     /// flat, every normal agrees, so both the per-voxel ratio and the
@@ -2292,7 +2187,7 @@ mod plane_extract_tests {
     /// The two gates cover different failures, which is why both are
     /// worth having.)
     #[test]
-    fn two_surfaces_merged_into_one_patch_are_rejected_by_riegls_std_dev() {
+    fn two_surfaces_merged_into_one_patch_are_rejected_by_the_std_dev() {
         let p = PlaneExtractParams::default();
 
         let flat = extract_plane_patches(&slab(2.0, 0.01), &p);
@@ -2323,26 +2218,26 @@ mod plane_extract_tests {
         );
     }
 
-    /// RIEGL's `minSize` = 0.125 m, measured on the longer side of the
+    /// the vendor's `minSize` = 0.125 m, measured on the longer side of the
     /// patch: below it, a patch is a fragment whose normal is noise.
     #[test]
-    fn a_patch_below_riegls_min_size_is_rejected() {
+    fn a_patch_below_the_min_size_is_rejected() {
         let p = PlaneExtractParams::default();
         assert!(!extract_plane_patches(&slab(2.0, 0.005), &p).is_empty(), "2 m is in range");
         assert!(
             extract_plane_patches(&slab(0.10, 0.005), &p).is_empty(),
-            "0.10 m is below RIEGL's minSize of {} m", p.min_size,
+            "0.10 m is below the vendor's minSize of {} m", p.min_size,
         );
     }
 
     /// The counter-test, and the reason `max_size` defaults to off:
-    /// RIEGL's `maxSize` of 5 m bounds the pieces its extractor cuts a
+    /// the vendor's `maxSize` of 5 m bounds the pieces its extractor cuts a
     /// surface INTO, while ours grows one patch per surface. Adopting
     /// the number deleted a 6 m square of ground — the most reliable
     /// registration feature a forest plot has — instead of splitting
     /// it. The knob still works for anyone who wants the ceiling.
     #[test]
-    fn a_ground_plane_larger_than_riegls_max_size_survives() {
+    fn a_ground_plane_larger_than_the_vendors_max_size_survives() {
         let p = PlaneExtractParams::default();
         let ground = slab(6.0, 0.005);
         let kept = extract_plane_patches(&ground, &p);
@@ -2358,13 +2253,13 @@ mod plane_extract_tests {
         );
     }
 
-    /// The defaults are RIEGL's, read out of a RiSCAN PRO project's
-    /// `regsettings.json`. Pinned so that changing one is a decision
+    /// The defaults are the vendor's, read out of its settings
+    /// file. Pinned so that changing one is a decision
     /// somebody makes on purpose, with this test to update — and so
     /// the provenance cannot quietly drift away from the comment
     /// above that claims it.
     #[test]
-    fn the_physical_defaults_are_riegls_own() {
+    fn the_physical_defaults_are_the_vendors_own() {
         let p = PlaneExtractParams::default();
         assert_eq!(p.voxel_size, 0.50, "voxelExtractor.voxelSize");
         assert_eq!(p.max_std_dev, 0.03, "planeExtractor.maxStdDev");
@@ -2381,12 +2276,12 @@ mod plane_extract_tests {
         assert_eq!(a.rmse_eps, 1e-6, "lsqFitter.tolerance");
         assert!(a.preserve_roll_pitch, "lsqFitterPlanes.preserveRollAndPitch");
 
-        // And the ones deliberately NOT taken from RIEGL, so a future
+        // And the ones deliberately NOT taken from the vendor, so a future
         // "finish the job" edit has to read the reasoning first.
-        assert_eq!(p.min_voxel_points, 16, "ours: RIEGL's 5 is a full-density count");
-        assert_eq!(p.min_patch_points, 200, "ours: RIEGL's 10 is a full-density count");
-        assert_eq!(p.planarity_max, 0.015, "ours: not RIEGL's planeThreshold");
-        assert_eq!(p.normal_angle_tol_deg, 10.0, "ours: RIEGL splits this into two merges");
+        assert_eq!(p.min_voxel_points, 16, "ours: the vendor's 5 is a full-density count");
+        assert_eq!(p.min_patch_points, 200, "ours: the vendor's 10 is a full-density count");
+        assert_eq!(p.planarity_max, 0.015, "ours: not the vendor's planeThreshold");
+        assert_eq!(p.normal_angle_tol_deg, 10.0, "ours: the vendor splits this into two merges");
     }
 
     /// Random point clouds (no structure) should produce zero patches.
@@ -2407,9 +2302,9 @@ mod plane_extract_tests {
 }
 
 // =====================================================================
-// Sphere target auto-detection (RIEGL / Leica retro-targets)
+// Sphere target auto-detection (retroreflective targets)
 //
-// RIEGL VZ/VUX users place retroreflective sphere targets in the
+// TLS users place retroreflective sphere targets in the
 // scene; the SDK detects them via intensity filtering + cluster fit +
 // sphere LSQ. We do the same but with a geometry-only path so a scan
 // without intensity (the common PointCloudLabeler case) still works:
@@ -2421,7 +2316,7 @@ mod plane_extract_tests {
 //      Gauss–Newton on the GEOMETRIC distance. The seed alone is
 //      biased on a cap and these are always caps — see `fit_sphere`.
 //   4. Validate:
-//        • radius within search window (RIEGL std: 7.5 cm or 14.5 cm
+//        • radius within search window (the common sizes: 7.5 cm or 14.5 cm
 //          diameter spheres → radius 0.075 / 0.145 m; the params
 //          take min/max).
 //        • RMSE small compared to radius.
@@ -2471,13 +2366,13 @@ impl Default for SphereDetectParams {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn coregister_detect_spheres(
     project_folder: String,
     scan: IcpScanRef,
     params: SphereDetectParams,
 ) -> Result<Vec<SphereTarget>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let pts = read_scan_world(&project_folder, &scan, 200_000)?;
         Ok(detect_sphere_targets(&pts, &params))
     })
@@ -2804,12 +2699,12 @@ mod sphere_target_tests {
         assert!(fit_sphere(&[[1.0, 1.0, 1.0]; 8]).is_none());
     }
 
-    /// Full pipeline: synthetic scan with a planar floor + one RIEGL
+    /// Full pipeline: synthetic scan with a planar floor + one
     /// 7.5 cm target. The detector finds the sphere; the floor stays
     /// off the candidate list because its points span more than the
     /// target diameter in only 2 axes.
     #[test]
-    fn detect_one_riegl_target_among_floor_clutter() {
+    fn detect_one_sphere_target_among_floor_clutter() {
         let mut pts: Vec<[f64; 3]> = Vec::new();
         // Floor — 50 × 50 points at 5 cm spacing.
         for ix in 0..50 {
@@ -2817,7 +2712,7 @@ mod sphere_target_tests {
                 pts.push([ix as f64 * 0.05, iy as f64 * 0.05, 0.0]);
             }
         }
-        // RIEGL 7.5 cm radius sphere at (1.0, 1.0, 0.5).
+        // A 7.5 cm radius sphere at (1.0, 1.0, 0.5).
         let cx = 1.0; let cy = 1.0; let cz = 0.5; let r = 0.075;
         let n = 400usize;
         let golden = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
@@ -2860,7 +2755,7 @@ mod sphere_target_tests {
 // =====================================================================
 // Multi-Station Adjustment (MSA) — global pose graph optimisation
 //
-// RiSCAN PRO's MSA + Cyclone REGISTER 360's bundle adjustment + the
+// the vendor's registration software's MSA + Cyclone REGISTER 360's bundle adjustment + the
 // open-source g2o framework all do the same thing: given N scans with
 // current pose estimates T_0..T_{N-1} (from pairwise Kabsch / ICP)
 // and K correspondences each anchoring a pair of scans, find a
@@ -2899,17 +2794,17 @@ pub struct MsaCorrespondence {
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MsaParams {
-    /// Iteration cap. RIEGL's `lsqFitterPlanes.maxIterations` = 1000.
+    /// Iteration cap. the vendor's `lsqFitterPlanes.maxIterations` = 1000.
     /// A cap, not a target: the RMSE test below normally stops it in
     /// a handful of iterations, and each one costs one dense solve of
     /// a 6(N−1)-square system.
     pub max_iters: u32,
     pub lambda_init: f64,
     /// Stop when an accepted step improves the RMSE by less than this.
-    /// RIEGL's `lsqFitter*.tolerance` = 1e-6. Was 1e-5.
+    /// the vendor's `lsqFitter*.tolerance` = 1e-6. Was 1e-5.
     pub rmse_eps: f64,
     /// Solve for yaw and translation only, leaving each scan's roll and
-    /// pitch exactly as they are. RIEGL's
+    /// pitch exactly as they are. the vendor's
     /// `lsqFitterPlanes.preserveRollAndPitch`, on by default there and
     /// here.
     ///
@@ -2925,11 +2820,11 @@ pub struct MsaParams {
     /// parameters with no gradient and no update — an exact
     /// constraint, not a penalty. This assumes the project frame is
     /// Z-up, which is what PRCS is.
-    #[serde(default = "riegl_preserve_roll_pitch")]
+    #[serde(default = "vendor_preserve_roll_pitch")]
     pub preserve_roll_pitch: bool,
 }
 
-fn riegl_preserve_roll_pitch() -> bool { true }
+fn vendor_preserve_roll_pitch() -> bool { true }
 
 impl Default for MsaParams {
     fn default() -> Self {
@@ -2937,7 +2832,7 @@ impl Default for MsaParams {
             max_iters: 1000,
             lambda_init: 1e-4,
             rmse_eps: 1e-6,
-            preserve_roll_pitch: riegl_preserve_roll_pitch(),
+            preserve_roll_pitch: vendor_preserve_roll_pitch(),
         }
     }
 }
@@ -2952,13 +2847,13 @@ pub struct MsaResult {
     pub correspondences: u32,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn coregister_msa(
     poses: Vec<Vec<f64>>,
     correspondences: Vec<MsaCorrespondence>,
     params: MsaParams,
 ) -> Result<MsaResult, String> {
-    tauri::async_runtime::spawn_blocking(move || run_msa(&poses, &correspondences, &params))
+    crate::rt::spawn_blocking(move || run_msa(&poses, &correspondences, &params))
         .await
         .map_err(|e| format!("join error: {e}"))?
 }
@@ -3172,7 +3067,7 @@ mod msa_tests {
     ///
     /// Explicitly unconstrained: the perturbations include roll and
     /// pitch, and this test is about the full six-degree-of-freedom
-    /// solve. The default now preserves roll and pitch (RIEGL's
+    /// solve. The default now preserves roll and pitch (the vendor's
     /// `preserveRollAndPitch`), which by construction cannot undo a
     /// roll perturbation — `msa_preserving_roll_and_pitch_*` below
     /// test that behaviour instead.
@@ -3334,8 +3229,8 @@ mod msa_tests {
 // Given the sphere centres detected on two scans, find the assignment
 // (source_idx → target_idx) that maximises the inlier count under a
 // rigid 4×4 transform. This is the "automatic tie-point" step that
-// replaces hand-clicking corresponding spheres across scans in RiSCAN
-// PRO / Cyclone REGISTER 360.
+// replaces hand-clicking corresponding spheres across scans in the
+// vendor's registration software or Cyclone REGISTER 360.
 //
 // RANSAC:
 //   1. Candidate pairs = every (i, j) where |r_i − r_j| < radius_tol.
@@ -3385,7 +3280,7 @@ pub struct SphereMatchResult {
 #[serde(rename_all = "camelCase")]
 pub struct SphereMatchParams {
     /// Reject pairs whose radii differ by more than this (m). Default
-    /// 0.01 m (RIEGL standard sizes differ by 7 cm, so this is well
+    /// 0.01 m (the common target sizes differ by 7 cm, so this is well
     /// inside the gap).
     pub radius_tol: f64,
     /// Accept an inlier when a transformed source centre lands within
@@ -3399,7 +3294,7 @@ impl Default for SphereMatchParams {
     fn default() -> Self { Self { radius_tol: 0.01, inlier_tol: 0.05, iterations: 500 } }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_match_spheres(
     source: Vec<SphereTarget>,
     target: Vec<SphereTarget>,
@@ -3696,14 +3591,14 @@ pub struct PlaneMatchParams {
     /// Reject candidate planes with planarity above this. Default 0.01.
     pub max_planarity: f64,
     /// Reject candidate planes with extent below this (m). 0.125,
-    /// from RIEGL's `planeExtractor.minSize` — the same "smallest
+    /// from the vendor's `planeExtractor.minSize` — the same "smallest
     /// patch worth using" length, though measured on the diagonal
     /// here (see PlaneExtractParams::min_size). Was 0.30.
     pub min_extent: f64,
-    /// Inlier normal-alignment threshold (deg). RIEGL's
+    /// Inlier normal-alignment threshold (deg). the vendor's
     /// `planeMatcher.maxAngleDifference` = 2.5°. Was 5°.
     pub normal_angle_tol_deg: f64,
-    /// Inlier perpendicular distance threshold (m). RIEGL's
+    /// Inlier perpendicular distance threshold (m). the vendor's
     /// `planeMatcher.maxDistance` = 0.25 m. Was 0.05 m, which is
     /// tighter than the pose error a registration starts from —
     /// candidates that should have matched were being rejected for
@@ -3727,7 +3622,7 @@ impl Default for PlaneMatchParams {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn coregister_match_planes(
     source: Vec<PlanePatch>,
     target: Vec<PlanePatch>,

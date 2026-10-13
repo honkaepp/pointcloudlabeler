@@ -95,7 +95,7 @@ describe('every analysis panel can be stopped and its output taken back', () => 
  *  nothing. Rewrites that cannot pause half-way (adding columns) have
  *  no Cancel, on purpose. */
 describe('every long run can be stopped', () => {
-  const stages = ['segment', 'li2012', 'treeiso', 'leafwood', 'deadwood', 'qsm', 'pointqc', 'terrain', 'density', 'stemfit', 'classify_ground', 'export', 'subset', 'metrics', 'm3c2', 'centerlines', 'tst', 'align'];
+  const stages = ['segment', 'li2012', 'treeiso', 'leafwood', 'deadwood', 'qsm', 'pointqc', 'terrain', 'density', 'stemfit', 'classify_ground', 'export', 'subset', 'metrics', 'm3c2', 'centerlines', 'tst', 'align', 'register', 'transform'];
 
   it('takes a stop token in every stage that reports progress and runs for minutes', () => {
     for (const st of stages) {
@@ -120,6 +120,7 @@ describe('every long run can be stopped', () => {
       ['src/components/shell/SubsetPanel.tsx', ["cancelStage('subset')"]],
       ['src/components/shell/EditorShell.tsx', ["cancelStage('export')"]],
       ['src/components/shell/RegistrationPanel.tsx', ['cancelStage(ALIGN_STAGE)']],
+      ['src/components/shell/FineRegistrationPanel.tsx', ["cancelStage(busy === 'apply' ? TRANSFORM_STAGE : REGISTER_STAGE)"]],
     ];
     for (const [file, needles] of want) {
       const src = read(file);

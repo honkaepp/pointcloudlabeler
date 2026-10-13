@@ -647,7 +647,7 @@ describe('the long operations consult the cancellation flag', () => {
       .toBeGreaterThan(4000);
     const loop_ = build;
     expect(loop_, 'nothing reports progress while the giants run')
-      .toMatch(/thread::scope[\s\S]{0,400}?sleep[\s\S]{0,200}?emit_progress\(window, "tst"/);
+      .toMatch(/thread::scope[\s\S]{0,400}?sleep[\s\S]{0,200}?emit_progress\(progress, "tst"/);
     expect(loop_, 'the ticker is never asked to stop')
       .toMatch(/ticking\.store\(false/);
     // Weighted by the cost of each tree, taken from the counting pass
@@ -694,7 +694,7 @@ describe('the long operations consult the cancellation flag', () => {
     expect(cmd.slice(0, 6000), 'the result does not say how many trees remain')
       .toMatch(/trees_remaining: account\.trees_remaining/);
     expect(cmd.slice(0, 6000), 'a stopped run still announces 100 %')
-      .toMatch(/if data\.complete \{ emit_progress\(&window, "tst", 1\.0\); \}/);
+      .toMatch(/if data\.complete \{ emit_progress\(&?progress, "tst", 1\.0\); \}/);
     const build = octree.slice(octree.indexOf('fn build_skeleton_from_baseline('));
     expect(build.slice(0, 40000), 'the log does not account for a stop')
       .toMatch(/stopped_summary\(/);
@@ -1266,13 +1266,16 @@ describe('one skeleton run at a time, and a log that outlives a crash', () => {
     expect((octree.match(/cancel::try_begin\("tst"\)/g) ?? []).length,
       'every tst command must claim the stage').toBe(2);
     // The guard rides inside the blocking closure, so it is released
-    // when the run ends — however it ends. Five: the two tst commands,
-    // the alignment, the centreline extraction and M3C2, which claim
-    // their own stages the same way.
-    expect((octree.match(/spawn_blocking\(move \|\| \{\s*let _run = run;/g) ?? []).length).toBe(5);
+    // when the run ends — however it ends. Seven: the two tst commands,
+    // the alignment, the centreline extraction, M3C2, the fine
+    // registration and the moved copy it writes, which claim their own
+    // stages the same way.
+    expect((octree.match(/spawn_blocking\(move \|\| \{\s*let _run = run;/g) ?? []).length).toBe(7);
     expect(octree).toMatch(/cancel::try_begin\("align"\)/);
     expect(octree).toMatch(/cancel::try_begin\("centerlines"\)/);
     expect(octree).toMatch(/cancel::try_begin\("m3c2"\)/);
+    expect(octree).toMatch(/cancel::try_begin\("register"\)/);
+    expect(octree).toMatch(/cancel::try_begin\("transform"\)/);
   });
 
   it('appends to skeletons.log instead of truncating it', () => {

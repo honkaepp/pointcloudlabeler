@@ -13,16 +13,24 @@
 //! The renderer's API is unchanged: each dialog still returns the
 //! chosen path, or null when the user cancels.
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::fs;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::io::{Read, Seek, SeekFrom};
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "gui")]
 use tauri::ipc::Response;
+#[cfg(feature = "gui")]
 use tauri::State;
+#[cfg(feature = "gui")]
 use tauri_plugin_dialog::DialogExt;
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::error::{AppError, AppResult};
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::fsgrant::checked_read_len;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -47,6 +55,7 @@ pub struct PickedFile {
     pub path: String,
 }
 
+#[cfg(feature = "gui")]
 fn apply_filters(
     mut builder: tauri_plugin_dialog::FileDialogBuilder<tauri::Wry>,
     filters: &[DialogFilter],
@@ -60,7 +69,8 @@ fn apply_filters(
 
 /// Native open dialog. `async` deliberately: the blocking dialog calls
 /// must not run on the main thread, and an async command does not.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn dialog_pick_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -91,7 +101,8 @@ pub async fn dialog_pick_file(
 
 /// Native folder picker. Grants the folder and everything under it —
 /// picking a scan directory is consent to read the scans in it.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn dialog_pick_folder(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -114,7 +125,8 @@ pub async fn dialog_pick_folder(
 /// Native save dialog. Grants exactly the file the user named, not the
 /// folder it is in: naming one export is not consent to overwrite its
 /// neighbours.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn dialog_save_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -149,7 +161,8 @@ pub async fn dialog_save_file(
 /// the code after it ran, because a Promise is truthy. The question is
 /// now this command, awaited (src/ui/dialogs.ts), and the plugin's own
 /// command surface stays closed to the renderer as before.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn dialog_confirm(app: tauri::AppHandle, message: String, title: Option<String>) -> bool {
     use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
     let mut dialog = app
@@ -165,7 +178,8 @@ pub async fn dialog_confirm(app: tauri::AppHandle, message: String, title: Optio
 
 /// Tell the user something, in a native message box, and wait until it
 /// has been dismissed. The renderer's `window.alert` — see above.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub async fn dialog_message(app: tauri::AppHandle, message: String, title: Option<String>) {
     use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
     let mut dialog = app
@@ -179,7 +193,8 @@ pub async fn dialog_message(app: tauri::AppHandle, message: String, title: Optio
     let _ = dialog.blocking_show();
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_read(state: State<'_, AppState>, path: String) -> AppResult<Response> {
     let path = state.authorise_path(&path)?;
     // No length bound here, deliberately: the size read is the file's
@@ -191,7 +206,8 @@ pub fn file_read(state: State<'_, AppState>, path: String) -> AppResult<Response
     Ok(Response::new(bytes))
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_read_chunk(
     state: State<'_, AppState>,
     path: String,
@@ -214,7 +230,8 @@ pub fn file_read_chunk(
     Ok(Response::new(buf))
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_stat(state: State<'_, AppState>, path: String) -> AppResult<FileStat> {
     let path = state.authorise_path(&path)?;
     let stat = fs::metadata(&path)?;
@@ -229,7 +246,8 @@ pub fn file_stat(state: State<'_, AppState>, path: String) -> AppResult<FileStat
     })
 }
 
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_write(state: State<'_, AppState>, path: String, content: String) -> AppResult<bool> {
     let resolved = state.authorise_path(&path)?;
     fs::write(&resolved, content.as_bytes())
@@ -241,6 +259,7 @@ pub fn file_write(state: State<'_, AppState>, path: String, content: String) -> 
 /// a request header. A header value is Latin-1 at best and a Finnish
 /// path ("Työpöytä") is not, so the bridge encodes it and this decodes
 /// it. Only `%XX` escapes are undone; `+` stays `+`.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn percent_decode(s: &str) -> AppResult<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -270,7 +289,8 @@ pub(crate) fn percent_decode(s: &str) -> AppResult<String> {
 /// `x-path` header, percent-encoded (see percent_decode). Same
 /// authorisation as every other write: a granted folder or the
 /// project's own.
-#[tauri::command]
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn file_write_bytes(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,

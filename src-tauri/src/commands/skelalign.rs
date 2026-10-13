@@ -77,7 +77,7 @@ impl Rigid2 {
 
 /// The transform as the panel sends it back to the transfer, in the
 /// skeleton origin's frame.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AlignmentParam {
     pub dx: f64,

@@ -282,10 +282,13 @@ describe('what is reachable', () => {
     }
   });
 
-  it('opens the dialog in scannerOnly mode, which hides the role rows', () => {
+  it('opens the dialog in scannerOnly or pointFile mode, never full — which hides the role rows', () => {
     const editor = files[0];
     const uses = editor.split('<ImportMappingDialog').length - 1;
     expect(uses, 'more than one call site — check the mode of each').toBe(1);
-    expect(editor).toMatch(/mode="scannerOnly"/);
+    // LAS/LAZ opens scannerOnly; a text, PLY or E57 file opens the
+    // pointFile mode, whose mapping is the Rust probe's, not this one.
+    expect(editor).toMatch(/mode=\{pendingImport\.pointFile \? 'pointFile' : 'scannerOnly'\}/);
+    expect(editor).not.toMatch(/mode="full"|'full'/);
   });
 });

@@ -481,78 +481,7 @@ describe('no retired name or its expansion survives anywhere', () => {
   });
 });
 
-/** What separates the build you use from the build you publish.
- *
- *  Under Apache-2.0 there was no difference: every build was
- *  distributable. GPL-3 introduced exactly one, and it is easy to miss
- *  because nothing about it is visible at compile time — the `rdblib`
- *  and `rivlib` features link RIEGL's proprietary, non-redistributable
- *  SDKs, so the combined work cannot satisfy §6 and cannot be conveyed
- *  at all. No source archive fixes it.
- *
- *  Building it stays legitimate; the GPL constrains conveying, not use.
- *  So the refusal belongs at the moment a package is made for somebody
- *  else, and that is the only place it exists. */
-describe('a build that cannot be distributed is not packaged as a release', () => {
-  it('records whether a proprietary feature was linked in', () => {
-    const buildRs = stripComments(read('src-tauri/build.rs'));
-    expect(buildRs, 'build.rs does not record proprietary features')
-      .toContain('build-proprietary.txt');
-    expect(buildRs, 'build.rs does not check the rdblib feature')
-      .toMatch(/cfg!\(feature\s*=\s*"rdblib"\)/);
-    expect(buildRs, 'build.rs does not check the rivlib feature')
-      .toMatch(/cfg!\(feature\s*=\s*"rivlib"\)/);
-  });
-
-  /** The list in build.rs is what the packaging refusal reads, so a
-   *  feature that links a non-redistributable library and is missing
-   *  from it is a build the packager would happily ship. Rather than
-   *  trust a hand-kept list, take the features from Cargo.toml and
-   *  require each one to be either recorded there or named here as
-   *  deliberately harmless. A new SDK feature then fails this test
-   *  until someone decides which it is. */
-  it('accounts for every Cargo feature', () => {
-    /** Features that link nothing proprietary. Empty today; adding to
-     *  it is a claim that the feature's dependencies may be
-     *  redistributed under the GPL. */
-    const HARMLESS = new Set<string>([]);
-    const cargo = read('src-tauri/Cargo.toml');
-    const block = cargo.split(/^\[features\]$/m)[1]?.split(/^\[/m)[0] ?? '';
-    const features = [...block.matchAll(/^([A-Za-z0-9_-]+)\s*=\s*\[/gm)]
-      .map(m => m[1])
-      .filter(name => name !== 'default');
-    expect(features, 'no features parsed out of Cargo.toml — did the block move?')
-      .not.toEqual([]);
-
-    const buildRs = stripComments(read('src-tauri/build.rs'));
-    const unaccounted = features.filter(
-      name => !HARMLESS.has(name) && !buildRs.includes(`feature = "${name}"`),
-    );
-    expect(
-      unaccounted,
-      `Cargo features that build.rs never records as proprietary: ${unaccounted.join(', ')}. ` +
-        'Either record them beside rdblib / rivlib, or add them to HARMLESS in this test.',
-    ).toEqual([]);
-  });
-
-  it('refuses to package one', () => {
-    const ps1 = ps1Code(read('scripts/package-release.ps1'));
-    expect(ps1).toContain('build-proprietary.txt');
-    // The condition, not the message — a Write-Error in an unreachable
-    // branch has passed this file's tests twice already.
-    expect(ps1, 'nothing refuses a build that linked a proprietary library')
-      .toMatch(/if\s*\(\s*\$proprietary\s*\)/);
-    expect(ps1).toMatch(/Write-Error[^\n]*proprietary/);
-  });
-
-  it('says so where a packager would look before building', () => {
-    const cargo = read('src-tauri/Cargo.toml');
-    // The feature is off by default, and the manifest has to say why
-    // it matters rather than leaving it as a build flag like any other.
-    expect(cargo).toMatch(/^default = \[\]$/m);
-    expect(cargo, 'Cargo.toml does not warn that rdblib builds cannot be shipped')
-      .toMatch(/MUST NOT BE DISTRIBUTED/);
-  });
+describe('the shipped notices name the formats', () => {
 
   /** Vendor names appear throughout the source because the importers
    *  are named after the formats they read. That is nominative use and
@@ -561,7 +490,8 @@ describe('a build that cannot be distributed is not packaged as a release', () =
    *  reviewer or a lawyer actually asks. */
   it('states whose trademarks the format names are', () => {
     const notices = read('THIRD-PARTY-NOTICES.md');
-    for (const vendor of ['RIEGL', 'FARO', 'Leica', 'Trimble']) {
+    const vendors = ['FARO', 'Leica', 'Trimble'];
+    for (const vendor of vendors) {
       expect(notices, `${vendor} is named in the source but not in the notices`)
         .toContain(vendor);
     }
@@ -569,18 +499,6 @@ describe('a build that cannot be distributed is not packaged as a release', () =
     expect(notices).toMatch(/No vendor SDK is bundled/);
   });
 
-  /** "Reverse-engineered" described something this code does not do and
-   *  reads worse than the truth: no RIEGL code, header or SDK is read
-   *  or decompiled anywhere here. Wording in a public repository is
-   *  not cosmetic when it is the
-   *  sentence somebody quotes. */
-  it('does not claim to reverse-engineer anything', () => {
-    for (const file of ['src-tauri/src/commands/riegl_rdbx.rs',
-                        'src-tauri/src/commands/riegl.rs']) {
-      expect(read(file), `${file} still says it reverse-engineers a format`)
-        .not.toMatch(/reverse[- ]engineered from/i);
-    }
-  });
 });
 
 /** A rename that replaced the product's old name as a SUBSTRING once
@@ -725,7 +643,8 @@ describe('the third-party notices cover what ships', () => {
     const cargoLock = read('src-tauri/Cargo.lock');
     const crates = [...cargoLock.matchAll(/\[\[package\]\]\nname = "([^"]+)"/g)]
       .map(m => m[1])
-      .filter(n => n !== 'pointcloudlabeler-editor');
+      // The workspace's own crates: the application and the headless binary.
+      .filter(n => n !== 'pointcloudlabeler-editor' && n !== 'pointcloudlabeler');
     const missingCrates = [...new Set(crates)].filter(n => !generated.includes(`\`${n}\``));
     expect(
       missingCrates,

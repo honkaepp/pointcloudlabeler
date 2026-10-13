@@ -38,12 +38,12 @@ export default function LandingView({ list, onImport, onOpen }: Props) {
         </h1>
         <p className="text-[13px] mb-7 text-center" style={{ color: 'var(--text-dim)', lineHeight: 1.6 }}>
           Out-of-core segmentation + labelling for TLS / MLS / ULS / ALS clouds.<br />
-          Import a LAS / LAZ to build a streaming octree and start editing.
+          Import a LAS / LAZ, text, PLY or E57 cloud to build a streaming octree and start editing.
         </p>
 
         <div className="flex gap-2.5 mb-8">
           <button className="btn btn-primary !h-10 !px-5 gap-2 text-[13px]" onClick={onImport}>
-            <PlusIcon /> Import LAS / LAZ
+            <PlusIcon /> Import point cloud
           </button>
           <button
             className="btn !h-10 !px-4 gap-2 text-[13px]"

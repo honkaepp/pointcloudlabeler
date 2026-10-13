@@ -38,6 +38,8 @@ const COLOR_MODES: { id: ColorMode; label: string; sw: string }[] = [
   { id: 'classification', label: 'Class', sw: 'linear-gradient(90deg,#8a5a2b,#46b45a,#3b82f6)' },
   { id: 'tree_id', label: 'Tree id', sw: 'conic-gradient(#e0506b,#7ee0a8,#5a9cf0,#e0b84a,#e0506b)' },
   { id: 'semantic', label: 'Semantic', sw: 'linear-gradient(90deg,#af6e3c,#46b45a)' },
+  { id: 'return_number', label: 'Return number', sw: 'linear-gradient(90deg,#3b528b,#5ec962,#fde725)' },
+  { id: 'number_of_returns', label: 'Returns per pulse', sw: 'linear-gradient(90deg,#3b528b,#5ec962,#fde725)' },
   { id: 'standing_deadwood', label: 'Standing dead', sw: 'linear-gradient(90deg,#e08a3c,#d6453a)' },
   { id: 'laying_deadwood', label: 'Laying dead', sw: 'linear-gradient(90deg,#3aa6d6,#3a63d6)' },
   { id: 'flat', label: 'Flat', sw: '#b4b4b4' },
@@ -47,7 +49,7 @@ const COLOR_MODES: { id: ColorMode; label: string; sw: string }[] = [
  *  is meaningful). The categorical / flat modes ignore the ramp. The
  *  `extra:<name>` modes are always ramp-driven. */
 function isRampMode(m: ColorMode): boolean {
-  if (m === 'height' || m === 'intensity' || m === 'x' || m === 'y') return true;
+  if (m === 'height' || m === 'intensity' || m === 'x' || m === 'y' || m === 'return_number' || m === 'number_of_returns') return true;
   return typeof m === 'string' && m.startsWith('extra:');
 }
 

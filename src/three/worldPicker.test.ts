@@ -59,7 +59,7 @@ describe('the panels that did nothing', () => {
     const rust = readFileSync(new URL('../../src-tauri/src/commands/octree.rs', import.meta.url), 'utf8');
     expect(rust).toMatch(/cancel::try_begin\("centerlines"\)/);
     expect(rust).toMatch(/cancel::token\("centerlines"\)/);
-    expect(rust).toMatch(/emit_progress\(window, "centerlines", 0\.35 \+ 0\.65 \* i as f32 \/ n_trees as f32\)/);
+    expect(rust).toMatch(/emit_progress\(progress, "centerlines", 0\.35 \+ 0\.65 \* i as f32 \/ n_trees as f32\)/);
     // A stop between trees returns the trees already fitted, flagged.
     expect(rust).toMatch(/if crate::commands::cancel::stopped\(&cancel\) \{ stopped = true; break; \}/);
     expect(rust).toMatch(/Ok\(StemCenterlineResult \{ trees: out, stopped \}\)/);

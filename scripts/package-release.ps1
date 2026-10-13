@@ -127,9 +127,9 @@ if (-not (Test-Path $commitFile)) {
 $revision = "$(Get-Content $commitFile -Raw)".Trim()
 
 # A build that linked a proprietary library cannot be conveyed under the
-# GPL at all, whatever the source archive says. `rdblib` is RIEGL's SDK:
-# non-redistributable, so §6's Corresponding Source is impossible, and
-# §1's System Libraries exception does not cover a vendor SDK.
+# GPL at all, whatever the source archive says: a scanner vendor's SDK
+# is non-redistributable, so §6's Corresponding Source is impossible,
+# and §1's System Libraries exception does not cover a vendor SDK.
 #
 # This is the one thing that separates "the build I use" from "the build
 # I publish", and nothing else in the repository enforces it. Building

@@ -174,9 +174,9 @@ export default function HistoryPanel() {
         className="btn !h-8 justify-center gap-1.5 mono text-[11.5px]"
         disabled={!ready}
         onClick={() => api?.exportLas()}
-        title="Save, then export to LAS (tree_id + semantic in Extra-Bytes)"
+        title="Save, then export the cloud as LAS, LAZ, TXT, PLY or E57 — every edit and column along"
       >
-        <ExportIcon /> Export LAS
+        <ExportIcon /> Export cloud
       </button>
     </div>
   );

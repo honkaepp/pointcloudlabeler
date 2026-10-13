@@ -8,7 +8,7 @@
 //! distorted — is up to a couple of metres in the legacy datums still in
 //! everyday use (NAD27, OSGB36, NTF, RD, the pre-EUREF national systems).
 //! National mapping agencies publish that residual as a grid of
-//! interpolated corrections in the NTv2 format, and QGIS / PROJ / RiSCAN
+//! interpolated corrections in the NTv2 format, and QGIS / PROJ / the scanner vendors' software
 //! PRO all reach centimetre agreement with the official values *only*
 //! when that grid is loaded. Without it you get the Helmert answer, which
 //! is a metre-level answer wearing a centimetre-level coordinate.
@@ -414,7 +414,7 @@ fn replay_failure(name: &str) -> String {
 // Commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn nadgrid_status() -> NadGridStatus {
     status()
 }
@@ -426,7 +426,7 @@ pub fn nadgrid_status() -> NadGridStatus {
 /// Rejects a path that is not a directory instead of accepting it and
 /// reporting an empty grid list: "no grids found" and "that path is not
 /// a folder" are different problems with different fixes.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn nadgrid_set_dir(dir: String) -> Result<NadGridStatus, String> {
     let trimmed = dir.trim();
     if trimmed.is_empty() {

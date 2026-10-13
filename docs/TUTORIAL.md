@@ -35,8 +35,6 @@ choose the importer for your file (ASTM E57, Leica Cyclone PTX / PTS,
 or generic ASCII XYZ / CSV / TXT). Pick the file or folder, list the
 scan positions, optionally crop to a bounding box, then export to a
 combined LAS / LAZ. Import that result in the Editor as in path A.
-RIEGL scans take the same road one step earlier: export them from
-RiSCAN PRO as E57 or LAS/LAZ first.
 
 For multi-position scans that need to be aligned across importers,
 use the **Co-registration** panel in Preprocessing: pick three or

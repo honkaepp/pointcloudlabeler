@@ -1,23 +1,33 @@
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::fs;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Manager, State};
+#[cfg(feature = "gui")]
 
+use tauri::State;
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::error::{AppError, AppResult};
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 use crate::state::AppState;
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 const RECENT_MAX: usize = 10;
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 const RECENT_FILE: &str = "recent.json";
 
-fn recent_path(app: &AppHandle) -> AppResult<PathBuf> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| AppError::msg(format!("app_config_dir: {e}")))?;
+/// The application's config directory — see `app_id::config_dir`; the
+/// same directory Tauri's `app_config_dir()` names.
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
+fn recent_path() -> AppResult<PathBuf> {
+    let dir = crate::app_id::config_dir()
+        .ok_or_else(|| AppError::msg("no application data directory"))?;
     fs::create_dir_all(&dir)?;
     Ok(dir.join(RECENT_FILE))
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn load_from_disk(path: &std::path::Path) -> Vec<String> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
@@ -36,46 +46,51 @@ fn load_from_disk(path: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 fn save_to_disk(path: &std::path::Path, list: &[String]) {
     if let Ok(text) = serde_json::to_string(list) {
         let _ = fs::write(path, text);
     }
 }
 
-fn ensure_loaded(app: &AppHandle, state: &State<'_, AppState>) -> AppResult<()> {
+#[cfg(feature = "gui")]
+fn ensure_loaded(state: &State<'_, AppState>) -> AppResult<()> {
     let mut current = state.recent_files.lock();
     if current.is_empty() {
-        let p = recent_path(app)?;
+        let p = recent_path()?;
         *current = load_from_disk(&p);
     }
     Ok(())
 }
 
-#[tauri::command]
-pub fn recent_add(app: AppHandle, state: State<'_, AppState>, path: String) -> AppResult<()> {
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn recent_add(state: State<'_, AppState>, path: String) -> AppResult<()> {
     if path.is_empty() {
         return Ok(());
     }
-    ensure_loaded(&app, &state)?;
+    ensure_loaded(&state)?;
     let mut list = state.recent_files.lock();
     list.retain(|p| p != &path);
     list.insert(0, path);
     list.truncate(RECENT_MAX);
-    let file = recent_path(&app)?;
+    let file = recent_path()?;
     save_to_disk(&file, &list);
     Ok(())
 }
 
-#[tauri::command]
-pub fn recent_get(app: AppHandle, state: State<'_, AppState>) -> AppResult<Vec<String>> {
-    ensure_loaded(&app, &state)?;
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn recent_get(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    ensure_loaded(&state)?;
     Ok(state.recent_files.lock().clone())
 }
 
-#[tauri::command]
-pub fn recent_clear(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn recent_clear(state: State<'_, AppState>) -> AppResult<()> {
     state.recent_files.lock().clear();
-    let file = recent_path(&app)?;
+    let file = recent_path()?;
     save_to_disk(&file, &[]);
     Ok(())
 }

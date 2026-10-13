@@ -67,6 +67,10 @@ async function loadTauri(): Promise<BridgeCtx | null> {
 
 /** skeleton_alignment.json as the Rust side writes it — see
  *  shell/OctreeShellContext.ts SkeletonAlignment. */
+/** What octree_register returns — DatasetRegistration, camelCased. The
+ *  panel's own type (fineRegistration.ts) spells the fields out. */
+export type FineRegistrationRecord = import('../components/shell/fineRegistration').FineRegistrationReport;
+
 interface SkeletonAlignmentRecord {
   format: string;
   baselineDir: string;
@@ -161,6 +165,13 @@ function installShim(ctx: BridgeCtx) {
         defaultName,
         filters: [{ name: 'Text', extensions: ['txt'] }],
       }),
+    // The save picker for a cloud export of one format: one filter, so
+    // the OS keeps the extension the export dialog chose.
+    saveCloudDialog: async (defaultName: string, filter: { name: string; extensions: string[] }) =>
+      ctx.invoke<string | null>('dialog_save_file', { defaultName, filters: [filter] }),
+    // What a text, PLY or E57 file has — its columns, a few rows, a
+    // mapping to start from — for the import dialog.
+    pointfileProbe: (path: string) => ctx.invoke<unknown>('pointfile_probe', { path }),
     saveLasDialog: async (defaultName: string) => {
       // Two filters → the OS dialog gets a format dropdown the user can
       // pick from. LAS is offered first (default), LAZ second.
@@ -277,6 +288,10 @@ function installShim(ctx: BridgeCtx) {
        *  Set false on big TLS imports the user doesn't plan to label
        *  deadwood on — the gain is measurable on multi-GB clouds. */
       includeDeadwood?: boolean;
+      /** A text, PLY or E57 file: which column fills which field (see
+       *  io/pointFile.ts). Ignored for LAS/LAZ; omitted, the probe's
+       *  guess by column name. */
+      mapping?: unknown;
     }) => ctx.invoke<unknown>('cloud_import_octree', args),
     onOctreeProgress: (cb: (e: { stage: string; pct: number }) => void) =>
       ctx.listen<{ stage: string; pct: number }>('octree-progress', (e) => cb(e.payload)),
@@ -432,6 +447,18 @@ function installShim(ctx: BridgeCtx) {
          *  be represented and is written as 0. Format 6 gives it a full
          *  byte, and widens the return number and count to four bits. */
         las14?: boolean;
+        /** The standard fields the dataset carries as columns (GPS time,
+         *  colour, scan angle, user data, point source id, flags) back
+         *  into the LAS record, in a point format with room for them.
+         *  Default true on the Rust side. */
+        standardFields?: boolean;
+        /** A text export's layout: "space", "tab", "comma" or
+         *  "semicolon", and whether the first line names the columns.
+         *  Only read when the path's extension is a text one. */
+        delimiter?: string;
+        header?: boolean;
+        /** A .ply export as ascii rather than binary little-endian. */
+        plyAscii?: boolean;
       } = {},
     ) =>
       ctx.invoke<ExportReport>('cloud_export_octree_las', {
@@ -448,6 +475,10 @@ function installShim(ctx: BridgeCtx) {
         targetCrs: opts.targetCrs,
         geoid: opts.geoid,
         las14: opts.las14,
+        standardFields: opts.standardFields,
+        delimiter: opts.delimiter,
+        header: opts.header,
+        plyAscii: opts.plyAscii,
       }),
     // Move a dataset's coordinates back onto its source file's grid.
     // A dataset imported before the offset was aligned to the file sits
@@ -813,6 +844,25 @@ function installShim(ctx: BridgeCtx) {
     // shift; recorded under metadata.georeferenceShifts.
     octreeShiftGeoreference: (octreeDir: string, dx: number, dy: number, note?: string) =>
       withDatasetBusy(() => ctx.invoke<{ dx: number; dy: number; offset: [number, number, number]; total: [number, number] }>('octree_shift_georeference', { octreeDir, dx, dy, note })),
+    // Fine registration of one dataset onto another (src-tauri
+    // commands/register.rs): the rigid transform, moving → reference, in
+    // world coordinates, with the standard error of every parameter and
+    // the observability of the fit. Reports; nothing moves.
+    octreeRegister: (
+      referenceDir: string, movingDir: string,
+      init: { mode: 'current' | 'auto' | 'skeleton' | 'manual' | 'features'; dx?: number; dy?: number; dz?: number; yawDeg?: number; searchRadius?: number; yawRangeDeg?: number; dtmCell?: number; featureVoxel?: number },
+      params: {
+        method: 'symmetric' | 'pointToPlane' | 'pointToPoint' | 'gicp'; kernel: 'welsch' | 'cauchy' | 'tukey' | 'none';
+        dof: 'full' | 'levelled' | 'translation'; voxel: number; levels: number; maxCorrDist: number;
+        maxIters: number; normalK: number; maxNormalAngleDeg: number; kernelFloor: number; maxPoints: number; jackknifeBlock?: number;
+      },
+    ) => withDatasetBusy(() => ctx.invoke<FineRegistrationRecord>('octree_register', { referenceDir, movingDir, init, params })),
+    // A dataset moved by a rigid transform (row-major 4 × 4, world
+    // coordinates), written as a NEW dataset with every edit baked in
+    // and every column kept; `record` goes under `registration` in its
+    // metadata.json beside the matrix. The source is never touched.
+    octreeTransformDataset: (octreeDir: string, outDir: string, name: string, matrix: number[], record?: Record<string, unknown>) =>
+      withDatasetBusy(() => ctx.invoke<{ outDir: string; pointCount: number; tileCount: number; durationMs: number }>('octree_transform_dataset', { octreeDir, outDir, name, matrix, record })),
     octreeStemCenterlines: (
       octreeDir: string,
       opts: { rCover?: number; onlyTreeId?: number; minTreePoints?: number; dtmCell?: number } = {},
@@ -970,33 +1020,10 @@ function installShim(ctx: BridgeCtx) {
     octreePointQc: (octreeDir: string, params: Record<string, unknown>) =>
       ctx.invoke<unknown>('octree_point_qc', { octreeDir, params }),
 
-    // ----- Riegl preprocessing -----
-    //
-    // The Preprocessing module's Riegl panel uses these. Only project.rsp
-    // (XML metadata) is read on the Rust side today — points stay where
-    // they live on disk. Point-bytes export needs RIEGL's rdblib (free
-    // but not redistributable); riegl_export_region returns a clear
-    // error in the meantime instead of writing a half-baked LAS.
-    rieglListProjects: (projectFolder: string) =>
-      ctx.invoke<unknown>('riegl_list_projects', { projectFolder }),
-    rieglImportProject: (args: { projectFolder: string; sourcePath: string; name: string }) =>
-      ctx.invoke<{ id: string }>('riegl_import_project', args),
-    rieglRemoveProject: (args: { projectFolder: string; rieglId: string }) =>
-      ctx.invoke<void>('riegl_remove_project', args),
-    // What this build can read. Not a manifest field: the same project
-    // folder is exportable from a build made with `--features rivlib`
-    // (RIEGL's RiVLib, for .rxp — not distributable) and not from the
-    // one that ships, so the UI has to ask the binary it is talking to.
-    rieglCapabilities: () => ctx.invoke<{ rdbx: boolean; rxp: boolean }>('riegl_capabilities'),
-    rieglExportRegion: (args: {
-      projectFolder: string; rieglId: string; scanPositionIds: string[];
-      bbox: { xMin: number | null; xMax: number | null; yMin: number | null; yMax: number | null; zMin: number | null; zMax: number | null };
-      outPath: string;
-    }) => ctx.invoke<{ outPath: string; pointCount: number }>('riegl_export_region', args),
 
     // ----- E57 preprocessing -----
     //
-    // ASTM E2807. Unlike Riegl, this is pure-Rust end-to-end (no SDK
+    // ASTM E2807. Pure-Rust end-to-end (no SDK
     // needed) — one importer covers FARO Focus / Orbis, Leica BLK360 /
     // RTC360 / Cyclone, Trimble X7 / X9, NavVis VLX, Emesent Hovermap,
     // XGRIDS Lixel, GreenValley LiDAR360 via their export paths. The
@@ -1066,7 +1093,8 @@ function installShim(ctx: BridgeCtx) {
       ctx.invoke<{ pose: number[]; rmse: number; residuals: number[] }>('coregister_solve', { ties }),
     coregisterApply: (args: {
       projectFolder: string;
-      importer: 'riegl' | 'e57' | 'ptx';
+      importer: 'e57' | 'ptx'
+      ;
       projectId: string;
       scanId: string;
       pose: number[];
@@ -1081,13 +1109,14 @@ function installShim(ctx: BridgeCtx) {
      *  meanings have separate commands so they cannot be confused. */
     coregisterApplyDelta: (args: {
       projectFolder: string;
-      importer: 'riegl' | 'e57' | 'ptx';
+      importer: 'e57' | 'ptx'
+      ;
       projectId: string;
       scanId: string;
       delta: number[];
     }) => ctx.invoke<void>('coregister_apply_delta', args),
     // ICP fine-refinement: reads sub-sampled points from both scans
-    // (E57 / PTX; Riegl needs rdblib first), iterates closest-point +
+    // (E57 / PTX), iterates closest-point +
     // Kabsch until convergence. Returns the refined source pose + the
     // per-iteration RMSE curve.
     coregisterIcp: (args: {
@@ -1104,7 +1133,7 @@ function installShim(ctx: BridgeCtx) {
       correspondences: number; sourcePoints: number; targetPoints: number; converged: boolean;
     }>('coregister_icp', args),
     // Plane patch extraction (region-growing voxel-PCA; same primitive
-    // RiSCAN PRO's plane-patch extractor produces for its MSA).
+    // a vendor suite's plane-patch extractor produces for its MSA).
     coregisterExtractPlanes: (args: {
       projectFolder: string;
       scan: { importer: string; projectId: string; scanId: string };
@@ -1117,9 +1146,8 @@ function installShim(ctx: BridgeCtx) {
       extent: number; areaEstimate: number; planarity: number; nPoints: number;
     }>>('coregister_extract_planes', args),
     // Retroreflective sphere target auto-detection (algebraic seed +
-    // Gauss–Newton on the geometric distance, then validation). RIEGL
-    // VZ/VUX users use 7.5 cm / 14.5 cm spheres as registration tie
-    // points.
+    // Gauss–Newton on the geometric distance, then validation). TLS
+    // users use 7.5 cm / 14.5 cm spheres as registration tie points.
     coregisterDetectSpheres: (args: {
       projectFolder: string;
       scan: { importer: string; projectId: string; scanId: string };

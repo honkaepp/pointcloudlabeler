@@ -4,8 +4,8 @@
 // <projectFolder>/preprocessing/e57/<safeName>/manifest.json so the
 // list survives a PointCloudLabeler reload.
 //
-// Unlike Riegl, E57 is a SINGLE file (.e57), so this uses the file
-// picker (not the folder picker).
+// E57 is a SINGLE file (.e57), so this uses the file picker (not the
+// folder picker).
 
 import { useEffect, useState } from 'react';
 import { useProject } from '../../context/ProjectContext';

@@ -1,7 +1,7 @@
 // PTX scan-section list — one row per section in the imported file.
 // PTS files end up as one row (single section, identity pose).
 //
-// Same shape as the Riegl + E57 panels so the user sees consistent UI:
+// Same shape as the E57 panel so the user sees consistent UI:
 // per-row select toggle + tags, world-coord bbox crop (post-pose) and
 // export to LAS / LAZ via the Rust ptx_export_region command.
 

@@ -33,7 +33,7 @@ pub fn token(stage: &str) -> Arc<AtomicBool> {
 
 /// Ask whatever is running on `stage` to stop. Does nothing if nothing
 /// is running, which is why it is safe to call from a button.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_cancel(stage: String) -> bool {
     let mut m = flags().lock().unwrap_or_else(|e| e.into_inner());
     let f = m.entry(stage).or_insert_with(|| Arc::new(AtomicBool::new(false)));
@@ -91,7 +91,7 @@ pub fn any_running() -> bool {
 /// For a view that was (re)loaded while a run was going: is one still?
 /// The panel asks this on mount, so a run it did not start is shown
 /// with the same Stop it would have had.
-#[tauri::command]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn octree_stage_running(stage: String) -> bool {
     is_running(&stage)
 }

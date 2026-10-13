@@ -2,7 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+#[cfg(feature = "gui")]
+use tauri::{AppHandle, State};
 
 use crate::error::{AppError, AppResult};
 use crate::state::{
@@ -102,17 +103,19 @@ fn payload(proj: &OpenProject) -> ProjectState {
     }
 }
 
-fn recent_projects_path(app: &AppHandle) -> AppResult<PathBuf> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| AppError::msg(format!("app_config_dir: {e}")))?;
+/// Where the recent-project list lives: the application's own config
+/// directory (`app_id::config_dir`), the same place the settings and the
+/// crash log go. Tauri's `app_config_dir()` resolves to that directory
+/// too, so the desktop and the headless surfaces share one list.
+fn recent_projects_path() -> AppResult<PathBuf> {
+    let dir = crate::app_id::config_dir()
+        .ok_or_else(|| AppError::msg("no application data directory"))?;
     fs::create_dir_all(&dir)?;
     Ok(dir.join(RECENT_PROJECTS_FILE))
 }
 
-fn load_recent(app: &AppHandle) -> Vec<String> {
-    let Ok(p) = recent_projects_path(app) else {
+fn load_recent() -> Vec<String> {
+    let Ok(p) = recent_projects_path() else {
         return Vec::new();
     };
     let Ok(text) = fs::read_to_string(&p) else {
@@ -126,28 +129,33 @@ fn load_recent(app: &AppHandle) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn save_recent(app: &AppHandle, list: &[String]) {
-    if let Ok(p) = recent_projects_path(app) {
+fn save_recent(list: &[String]) {
+    if let Ok(p) = recent_projects_path() {
         if let Ok(text) = serde_json::to_string(list) {
             let _ = fs::write(p, text);
         }
     }
 }
 
-fn add_recent(app: &AppHandle, folder: &str) {
-    let mut list = load_recent(app);
+fn add_recent(folder: &str) {
+    // The test suite opens projects in temporary directories by the
+    // dozen; the list is the user's, in the user's config directory,
+    // and a run of `cargo test` on the machine the application is used
+    // on filled it with "Synthetic" and "Scene" under AppData\Temp.
+    if cfg!(test) { return; }
+    let mut list = load_recent();
     list.retain(|p| p != folder);
     list.insert(0, folder.to_string());
     list.truncate(RECENT_MAX);
-    save_recent(app, &list);
+    save_recent(&list);
 }
 
+/// Tell the renderer and the native menu that the open project changed.
+/// GUI only: the headless surfaces have no window to tell and no menu.
+#[cfg(feature = "gui")]
 fn emit_changed(app: &AppHandle, state: &AppState) {
     use tauri::Emitter;
-    let payload_value = {
-        let guard = state.current.lock();
-        guard.as_ref().map(payload)
-    };
+    let payload_value = current_project(state);
     let _ = app.emit("project:changed", payload_value);
     // Rebuild the native menu so File/Project items reflect the new state
     // (Save enabled/disabled, Recent submenu, Close Project enabled, …).
@@ -155,21 +163,19 @@ fn emit_changed(app: &AppHandle, state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// The project lifecycle, runtime-free. The Tauri commands below are thin
+// wrappers over these; the command line, the console and the API call
+// them directly with their own `AppState`.
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn project_current(state: State<'_, AppState>) -> Option<ProjectState> {
+/// The open project, if any.
+pub fn current_project(state: &AppState) -> Option<ProjectState> {
     let guard = state.current.lock();
     guard.as_ref().map(payload)
 }
 
-#[tauri::command]
-pub fn project_create(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    opts: CreateOptions,
-) -> AppResult<ProjectState> {
+/// Make a project folder (project.json, clouds/, project.db) and open it.
+pub fn create_project(state: &AppState, opts: CreateOptions) -> AppResult<ProjectState> {
     if opts.folder.is_empty() {
         return Err(AppError::msg("folder is required"));
     }
@@ -205,24 +211,12 @@ pub fn project_create(
     drop(db);
 
     // Open it.
-    open_internal(&app, &state, &folder)
+    open_project(state, &folder)
 }
 
-#[tauri::command]
-pub fn project_open(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    folder: String,
-) -> AppResult<ProjectState> {
-    let folder = PathBuf::from(folder);
-    open_internal(&app, &state, &folder)
-}
-
-fn open_internal(
-    app: &AppHandle,
-    state: &AppState,
-    folder: &std::path::Path,
-) -> AppResult<ProjectState> {
+/// Open the project in `folder`, closing whatever was open, and put it
+/// at the top of the recent list.
+pub fn open_project(state: &AppState, folder: &std::path::Path) -> AppResult<ProjectState> {
     if !is_project_folder(folder) {
         return Err(AppError::msg(format!(
             "Not a project folder: {}",
@@ -247,13 +241,12 @@ fn open_internal(
     let snapshot = payload(&proj);
     *state.current.lock() = Some(proj);
 
-    add_recent(app, &snapshot.folder);
-    emit_changed(app, state);
+    add_recent(&snapshot.folder);
     Ok(snapshot)
 }
 
-#[tauri::command]
-pub fn project_close(app: AppHandle, state: State<'_, AppState>) -> bool {
+/// Close the open project and drop every cloud handle it had.
+pub fn close_project(state: &AppState) {
     {
         let mut guard = state.current.lock();
         *guard = None;
@@ -264,15 +257,10 @@ pub fn project_close(app: AppHandle, state: State<'_, AppState>) -> bool {
         let mut reads = state.cloud_reads.lock();
         reads.clear();
     }
-    emit_changed(&app, &state);
-    true
 }
 
-#[tauri::command]
-pub fn project_save_meta(
-    state: State<'_, AppState>,
-    patch: MetaPatch,
-) -> AppResult<ProjectMeta> {
+/// Patch the open project's metadata and write project.json.
+pub fn save_meta(state: &AppState, patch: MetaPatch) -> AppResult<ProjectMeta> {
     state.with_current(|proj| {
         if let Some(n) = patch.name {
             proj.meta.name = n;
@@ -292,20 +280,11 @@ pub fn project_save_meta(
     })
 }
 
-/// Public helper used by menu.rs to populate the Recent Projects submenu.
-/// Reuses the on-disk recentProjects.json populated by add_recent.
-pub fn load_recent_public<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<RecentProject> {
-    let cfg_dir = match app.path().app_config_dir() {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let recent_file = cfg_dir.join(RECENT_PROJECTS_FILE);
-    let text = match std::fs::read_to_string(&recent_file) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    let list: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
-    list.into_iter()
+/// The recent projects, newest first, each checked for still being
+/// there. Used by the Recent submenu, the landing view and the console.
+pub fn recent_projects() -> Vec<RecentProject> {
+    load_recent()
+        .into_iter()
         .take(RECENT_MAX)
         .map(|folder| {
             let path = PathBuf::from(&folder);
@@ -331,16 +310,75 @@ pub fn load_recent_public<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<R
         .collect()
 }
 
-#[tauri::command]
-pub fn project_recent(app: AppHandle) -> Vec<RecentProject> {
-    load_recent_public(&app)
+/// Forget one recent project; returns the list that remains.
+pub fn remove_recent(folder: &str) -> Vec<String> {
+    let mut list = load_recent();
+    list.retain(|p| p != folder);
+    save_recent(&list);
+    list
 }
 
-#[tauri::command]
+// ---------------------------------------------------------------------------
+// Commands (desktop only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_current(state: State<'_, AppState>) -> Option<ProjectState> {
+    current_project(&state)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_create(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    opts: CreateOptions,
+) -> AppResult<ProjectState> {
+    let snapshot = create_project(&state, opts)?;
+    emit_changed(&app, &state);
+    Ok(snapshot)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder: String,
+) -> AppResult<ProjectState> {
+    let snapshot = open_project(&state, &PathBuf::from(folder))?;
+    emit_changed(&app, &state);
+    Ok(snapshot)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_close(app: AppHandle, state: State<'_, AppState>) -> bool {
+    close_project(&state);
+    emit_changed(&app, &state);
+    true
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_save_meta(
+    state: State<'_, AppState>,
+    patch: MetaPatch,
+) -> AppResult<ProjectMeta> {
+    save_meta(&state, patch)
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn project_recent() -> Vec<RecentProject> {
+    recent_projects()
+}
+
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
 pub fn project_remove_recent(app: AppHandle, folder: String) -> Vec<String> {
-    let mut list = load_recent(&app);
-    list.retain(|p| p != &folder);
-    save_recent(&app, &list);
+    let list = remove_recent(&folder);
     crate::menu::apply(&app);
     list
 }
