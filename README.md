@@ -40,6 +40,21 @@ SoftwareX.
 > [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). See
 > [Licence](#licence) for the full notice.
 
+## See it work
+
+A five-minute walk-through, no narration: a project, a 2021 terrestrial
+scan and a 2023 helicopter scan of the same plot, ground and rasters,
+the corrected segmentation carried from one cloud to the other through
+the trees' skeletons, review with lasso and undo, Point QC and the QC
+flags, and an export with every column along.
+
+https://github.com/user-attachments/assets/9039feec-240b-492b-88a6-8d9d0574f95c
+
+The same steps in text, with the parameter values, are in
+[`docs/TUTORIAL.md`](docs/TUTORIAL.md); the full-size video is on the
+[Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page
+beside the installer.
+
 ## Features
 
 ### Editor
