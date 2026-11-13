@@ -16,11 +16,12 @@
 
 //! Per-tree quality control, headless.
 //!
-//! The QC panel and Tree Review rank trees by ten checks over the
+//! The QC panel and Tree Review rank trees by twelve checks over the
 //! per-tree metrics and the QSM cache: robust population statistics
 //! (median and MAD, which a few bad trees do not move) plus a handful
-//! of absolute tests. The checks live in the renderer, in
-//! `src/metrics/qcFlags.ts`, and this is the same ten, rule for rule
+//! of absolute tests (the plot's own height–DBH curve and the QSM log
+//! among them). The checks live in the renderer, in
+//! `src/metrics/qcFlags.ts`, and this is the same twelve, rule for rule
 //! and threshold for threshold, so the command line, the console and
 //! the API rank a plot exactly as the panel does.
 //!
@@ -55,10 +56,12 @@ pub enum FlagCode {
     QsmCoverage,
     QsmCompleteness,
     QsmVolume,
+    HdCurve,
+    QsmNote,
 }
 
 impl FlagCode {
-    pub const ALL: [FlagCode; 10] = [
+    pub const ALL: [FlagCode; 12] = [
         FlagCode::NoDbh,
         FlagCode::CrownLarge,
         FlagCode::CrownSmall,
@@ -69,6 +72,8 @@ impl FlagCode {
         FlagCode::QsmCoverage,
         FlagCode::QsmCompleteness,
         FlagCode::QsmVolume,
+        FlagCode::HdCurve,
+        FlagCode::QsmNote,
     ];
 
     /// The stable identifier, as the renderer spells it.
@@ -84,6 +89,8 @@ impl FlagCode {
             FlagCode::QsmCoverage => "qsm-coverage",
             FlagCode::QsmCompleteness => "qsm-completeness",
             FlagCode::QsmVolume => "qsm-volume",
+            FlagCode::HdCurve => "hd-curve",
+            FlagCode::QsmNote => "qsm-note",
         }
     }
 
@@ -100,6 +107,8 @@ impl FlagCode {
             FlagCode::QsmCoverage => "QSM coverage",
             FlagCode::QsmCompleteness => "QSM gaps",
             FlagCode::QsmVolume => "QSM volume",
+            FlagCode::HdCurve => "height–DBH curve",
+            FlagCode::QsmNote => "QSM log",
         }
     }
 }
@@ -241,6 +250,69 @@ pub type TreeBox = [[f64; 3]; 2];
 /// (most severe first) and then by tree id. `qsm` is the QSM cache by
 /// tree id (None skips the three QSM checks); `bbox` looks up a tree's
 /// bounds (None leaves the flags without one).
+/// The plot's own height–DBH curve — Näslund's
+/// h = 1.3 + d² / (b0 + b1·d)², d in cm — fitted to its trees by least
+/// squares on the linear form d / √(h − 1.3) = b0 + b1·d, then once more
+/// without the residuals beyond 2.5 robust σ (the trees the check is
+/// looking for must not bend the curve). None under 15 trees. A curve of
+/// the plot itself needs no species or region: it is what the rest of
+/// the stand does.
+pub fn hd_curve(metrics: &[TreeMetric]) -> Option<(f64, f64)> {
+    let pairs: Vec<(f64, f64)> = metrics
+        .iter()
+        .filter(|t| t.dbh.is_finite() && t.dbh > 0.0 && t.height.is_finite() && t.height > 1.8)
+        .map(|t| {
+            let d = t.dbh * 100.0;
+            (d, d / (t.height - 1.3).sqrt())
+        })
+        .collect();
+    if pairs.len() < 15 {
+        return None;
+    }
+    let fit = |p: &[(f64, f64)]| -> Option<(f64, f64)> {
+        let n = p.len() as f64;
+        let md = p.iter().map(|q| q.0).sum::<f64>() / n;
+        let my = p.iter().map(|q| q.1).sum::<f64>() / n;
+        let sxx: f64 = p.iter().map(|q| (q.0 - md) * (q.0 - md)).sum();
+        let sxy: f64 = p.iter().map(|q| (q.0 - md) * (q.1 - my)).sum();
+        if sxx <= 0.0 {
+            return None;
+        }
+        let b1 = sxy / sxx;
+        Some((my - b1 * md, b1))
+    };
+    let (b0, b1) = fit(&pairs)?;
+    let res: Vec<f64> = pairs.iter().map(|&(d, y)| y - (b0 + b1 * d)).collect();
+    let rmed = median(&res);
+    let rsig = robust_sigma(mad(&res, rmed));
+    let kept: Vec<(f64, f64)> = if rsig > 0.0 {
+        pairs.iter().zip(&res).filter(|(_, &r)| (r - rmed).abs() <= 2.5 * rsig).map(|(p, _)| *p).collect()
+    } else {
+        pairs.clone()
+    };
+    if kept.len() < 10 {
+        return None;
+    }
+    let (b0, b1) = fit(&kept)?;
+    if b0 <= 0.0 {
+        return None;
+    }
+    Some((b0, b1))
+}
+
+/// The DBH (cm) the curve gives a tree of height `h`, where it is defined.
+pub fn hd_expected(curve: (f64, f64), h: f64) -> Option<f64> {
+    if !(h > 1.8) {
+        return None;
+    }
+    let s = (h - 1.3).sqrt();
+    let den = 1.0 - curve.1 * s;
+    if den <= 0.05 {
+        return None;
+    }
+    Some(curve.0 * s / den)
+}
+
 pub fn compute_flags(
     metrics: &[TreeMetric],
     qsm: Option<&dyn Fn(i32) -> Option<TreeQsm>>,
@@ -274,6 +346,8 @@ pub fn compute_flags(
         }
         None => (f64::NAN, 0.0),
     };
+
+    let curve = hd_curve(metrics);
 
     let mut out: Vec<Flag> = Vec::new();
     for t in metrics {
@@ -340,8 +414,27 @@ pub fn compute_flags(
                 "Tree may be partially occluded or beyond effective scan range. Metrics will be noisier than usual.");
         }
 
+        // (10) A diameter far off the plot's height–DBH curve.
+        if let Some(c) = curve {
+            if t.dbh.is_finite() && t.dbh > 0.0 && t.height.is_finite() {
+                if let Some(dexp) = hd_expected(c, t.height) {
+                    let d = t.dbh * 100.0;
+                    let ratio = d / dexp;
+                    if !(0.6..=1.6).contains(&ratio) {
+                        push(&mut out, FlagCode::HdCurve, Severity::Warning,
+                            format!("DBH {d:.1} cm is {ratio:.2}× what the plot's height–DBH curve gives a {:.1} m tree ({dexp:.1} cm)", t.height),
+                            "A diameter far off the curve the rest of the stand follows: the stem fit caught a branch, a neighbour or a buttress, or the height is wrong (a broken top, a crown merged in). Check the stem by eye.");
+                    }
+                }
+            }
+        }
+
         // QSM-derived checks, when a cache exists.
         if let Some(q) = qsm.and_then(|f| f(t.tree_id)) {
+            // (11) What the QSM fit itself warns about.
+            for n in q.notes.iter().filter(|n| n.severity == "warning") {
+                push(&mut out, FlagCode::QsmNote, Severity::Warning, n.text.clone(), &n.hint);
+            }
             // (7) Low angular coverage: the stem seen from one side only.
             if q.confidence < 0.50 {
                 push(&mut out, FlagCode::QsmCoverage, Severity::Warning,
@@ -479,6 +572,61 @@ mod tests {
         assert!(flags(&[]).is_empty());
     }
 
+    /// A stand following Näslund's curve with b0 = 1.5, b1 = 0.22
+    /// (a little noise), and one tree whose DBH is twice what its height
+    /// says. The fit recovers the curve without being bent by that tree,
+    /// and flags it alone.
+    fn naslund_stand() -> Vec<TreeMetric> {
+        (0..40)
+            .map(|i| {
+                let d = 8.0 + i as f64 * 0.8; // cm
+                let wobble = 1.0 + 0.03 * ((i * 7 % 5) as f64 - 2.0) / 2.0;
+                let h = 1.3 + (d / (1.5 + 0.22 * d)).powi(2) * wobble;
+                let mut t = ok(i + 1);
+                t.dbh = d / 100.0;
+                t.height = h;
+                t
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_plots_own_height_dbh_curve_finds_a_diameter_off_it() {
+        let mut m = naslund_stand();
+        let c = hd_curve(&m).expect("40 trees make a curve");
+        assert!((c.0 - 1.5).abs() < 0.15 && (c.1 - 0.22).abs() < 0.01, "{c:?}");
+        let expect = hd_expected(c, m[20].height).unwrap();
+        assert!((expect - 24.0).abs() < 2.0, "{expect}"); // its height is 3 % low
+        assert!(flags(&m).iter().all(|f| f.code != FlagCode::HdCurve), "a stand on its curve raises nothing");
+        m[20].dbh *= 2.0;
+        let fs = flags(&m);
+        let hd: Vec<&Flag> = fs.iter().filter(|f| f.code == FlagCode::HdCurve).collect();
+        assert_eq!(hd.len(), 1);
+        assert_eq!(hd[0].tree_id, 21);
+        assert!(hd[0].reason.contains("DBH 48.0 cm is 2.1"), "{}", hd[0].reason);
+        // too few trees: no curve
+        assert!(hd_curve(&m[..14]).is_none());
+    }
+
+    #[test]
+    fn the_qsm_logs_warnings_become_flags() {
+        let m = vec![ok(1)];
+        let mut q: TreeQsm = serde_json::from_value(serde_json::json!({
+            "treeId": 1, "baseX": 0, "baseY": 0, "baseZ": 0, "height": 20, "slices": [], "branches": [],
+            "branchVolume": 0, "branchCount": 0, "totalVolume": 1, "stemVolume": 1, "stemVolumeStd": 0, "stemVolumeCi95": 0,
+            "dbh": 0.3, "confidence": 1, "completeness": 1, "acceptedSlices": 10, "rejectedSlices": 0,
+        })).unwrap();
+        q.notes = vec![
+            crate::commands::octree::QsmNote { code: "taper-reversal".into(), severity: "warning".into(), text: "thickens".into(), hint: "look".into() },
+            crate::commands::octree::QsmNote { code: "leaves-out".into(), severity: "info".into(), text: "leaves".into(), hint: "".into() },
+        ];
+        let get = move |_id: i32| Some(q.clone());
+        let fs = compute_flags(&m, Some(&get), Some(&[1.0]), None);
+        let notes: Vec<&Flag> = fs.iter().filter(|f| f.code == FlagCode::QsmNote).collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reason, "thickens");
+    }
+
     #[test]
     fn a_tree_with_no_dbh_fit_is_critical() {
         let mut p = plot(30);
@@ -595,6 +743,9 @@ mod tests {
             accepted_slices: 70,
             rejected_slices: 10,
             treeqsm: None,
+            cylinder_quality: Vec::new(),
+            notes: Vec::new(),
+            leaf_points: 0,
         }
     }
 
@@ -658,7 +809,7 @@ mod tests {
     #[test]
     fn every_code_has_a_label_and_a_stable_name() {
         let names: std::collections::HashSet<&str> = FlagCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 12); // hd-curve, qsm-note
         for c in FlagCode::ALL {
             assert!(!c.label().is_empty());
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());

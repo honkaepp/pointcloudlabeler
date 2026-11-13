@@ -40,12 +40,11 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
     let has_proj = has_project(app);
     let recent = recent_projects();
 
-    // ---- File ---- (needs an open project; rebuilt by the project
-    // commands, so these enable the moment one is opened)
-    let open_cloud = MenuItemBuilder::new("Add Cloud…")
-        .id("open-cloud")
-        .enabled(has_proj)
-        .build(app)?;
+    // ---- File ---- (needs an open project, Open Data… aside; rebuilt by
+    // the project commands, so these enable the moment one is opened)
+    // Open Data… is the one door for clouds, scans and projects, and works
+    // with no project open (it makes one) — App's DataDoor handles it.
+    let open_data = MenuItemBuilder::new("Open Data…").id("open-data").build(app)?;
     let save = MenuItemBuilder::new("Save")
         .id("save")
         .enabled(has_proj)
@@ -60,7 +59,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         .build(app)?;
 
     let file_menu = SubmenuBuilder::new(app, "File")
-        .item(&open_cloud)
+        .item(&open_data)
         .separator()
         .item(&save)
         .item(&export)
@@ -103,10 +102,19 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         builder.build()?
     };
 
+    // The open project's name and its folder's, together
+    // (commands/project_rename.rs; App.tsx opens the dialog)
+    let rename_project = MenuItemBuilder::new("Rename Project…")
+        .id("project-rename")
+        .enabled(has_proj)
+        .build(app)?;
+
     let project_menu = SubmenuBuilder::new(app, "Project")
         .item(&new_project)
         .item(&open_project)
         .item(&recent_submenu)
+        .separator()
+        .item(&rename_project)
         .build()?;
 
     // ---- Edit ---- (the editing actions of state/keybindings.ts, by the
@@ -134,6 +142,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         .item(&item(app, "Side View", "view-side")?)
         .separator()
         .item(&item(app, "Toggle Eye-Dome Lighting", "view-edl")?)
+        .item(&item(app, "Perspective / Parallel Projection", "view-ortho")?)
         .separator()
         .item(&item(app, "Tools Panel", "panel-tools")?)
         .item(&item(app, "Display Panel", "panel-display")?)
@@ -143,6 +152,8 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
         .separator()
         .item(&item(app, "Command Palette…", "palette")?)
         .separator()
+        .item(&item(app, "Second Window…", "compare-window")?)
+        .separator()
         .item(&PredefinedMenuItem::fullscreen(app, None)?)
         .build()?;
 
@@ -150,9 +161,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> AppResult<Menu<R>> {
     // order a plot is worked: terrain, trees, review, then the two-cloud
     // tools, then what leaves the program)
     let tools_menu = SubmenuBuilder::new(app, "Tools")
+        .item(&item(app, "Survey & Measure…", "panel-survey")?)
+        .item(&item(app, "Height Between Two Points…", "panel-height")?)
+        .item(&item(app, "Views & Video…", "panel-viewtools")?)
+        .separator()
         .item(&item(app, "Terrain…", "panel-ground")?)
         .item(&item(app, "Auto-segment Trees…", "panel-segment")?)
         .item(&item(app, "Tree Review…", "panel-review")?)
+        .item(&item(app, "Branches…", "panel-branches")?)
+        .item(&item(app, "Stems…", "panel-stems")?)
         .item(&item(app, "QC — Flag Suspect Trees…", "panel-qc")?)
         .item(&item(app, "Point QC…", "panel-pointqc")?)
         .separator()
@@ -241,12 +258,33 @@ pub struct MenuClick {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// The window whose menu bar was clicked — the focused one.
+    /// With a second window open (commands/compare_window.rs) both pages
+    /// hear the click, and only this one acts on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+}
+
+impl MenuClick {
+    /// The click as the window `label`'s.
+    pub fn in_window(mut self, label: Option<String>) -> Self {
+        self.window = label;
+        self
+    }
+}
+
+/// The focused window — the one whose menu bar was clicked.
+fn focused_window<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    app.webview_windows()
+        .into_iter()
+        .find(|(_, w)| w.is_focused().unwrap_or(false))
+        .map(|(label, _)| label)
 }
 
 pub fn click_for_id(id: &str) -> MenuClick {
     match id.strip_prefix(RECENT_PROJECT_PREFIX) {
-        Some(folder) => MenuClick { action: "project-open".to_string(), folder: Some(folder.to_string()) },
-        None => MenuClick { action: id.to_string(), folder: None },
+        Some(folder) => MenuClick { action: "project-open".to_string(), folder: Some(folder.to_string()), window: None },
+        None => MenuClick { action: id.to_string(), folder: None, window: None },
     }
 }
 
@@ -254,7 +292,7 @@ pub fn handle_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
     // Every id goes through, the predefined items' included: the renderer
     // ignores what it does not know, and a fixed list here was how the
     // menu came to have items that did nothing.
-    let _ = app.emit("menu", click_for_id(event.id().as_ref()));
+    let _ = app.emit("menu", click_for_id(event.id().as_ref()).in_window(focused_window(app)));
 }
 
 #[cfg(test)]
@@ -264,7 +302,7 @@ mod tests {
     #[test]
     fn a_plain_item_sends_its_id_and_nothing_else() {
         let click = click_for_id("undo");
-        assert_eq!(click, MenuClick { action: "undo".into(), folder: None });
+        assert_eq!(click, MenuClick { action: "undo".into(), folder: None, window: None });
         assert_eq!(serde_json::to_string(&click).unwrap(), r#"{"action":"undo"}"#);
     }
 

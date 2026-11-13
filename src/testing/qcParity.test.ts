@@ -16,10 +16,11 @@ const stats = readFileSync(new URL('../metrics/plotStats.ts', import.meta.url), 
 const CODES = [
   'no-dbh', 'crown-large', 'crown-small', 'slenderness', 'height-high',
   'height-low', 'few-points', 'qsm-coverage', 'qsm-completeness', 'qsm-volume',
+  'hd-curve', 'qsm-note',
 ];
 
 describe('the QC checks agree between the renderer and the headless core', () => {
-  it('emit the same ten codes', () => {
+  it('emit the same codes', () => {
     const tsUnion = ts.slice(ts.indexOf('export type FlagCode ='), ts.indexOf(';', ts.indexOf('export type FlagCode =')));
     const tsCodes = [...tsUnion.matchAll(/'([a-z-]+)'/g)].map(m => m[1]);
     expect(tsCodes).toEqual(CODES);
@@ -55,6 +56,12 @@ describe('the QC checks agree between the renderer and the headless core', () =>
     ['QSM coverage under 0.50', /q\.confidence < 0\.50/, /q\.confidence < 0\.50/],
     ['QSM completeness under 0.50', /q\.completeness < 0\.50/, /q\.completeness < 0\.50/],
     ['QSM volume z above 4', /const z = \(q\.stemVolume - vMed\) \/ vSig;\s+if \(z > 4\.0\)/, /let z = \(q\.stem_volume - v_med\) \/ v_sig;\s+if z > 4\.0/],
+    // The height–DBH curve
+    ['height–DBH curve: off by more than 1.6× or under 0.6×', /ratio > 1\.6 \|\| ratio < 0\.6/, /!\(0\.6\.\.=1\.6\)\.contains\(&ratio\)/],
+    ['height–DBH curve needs 15 trees', /pairs\.length < 15/, /pairs\.len\(\) < 15/],
+    ['height–DBH curve refit without residuals beyond 2.5σ', /<= 2\.5 \* rSig/, /<= 2\.5 \* rsig/],
+    ['height–DBH curve defined where 1 − b1·√(h − 1.3) > 0.05', /if \(den <= 0\.05\) return null;/, /if den <= 0\.05 \{/],
+    ['QSM log: its warnings become flags', /filter\(n => n\.severity === 'warning'\)/, /filter\(\|n\| n\.severity == "warning"\)/],
   ];
 
   for (const [what, tsRe, rsRe] of THRESHOLDS) {

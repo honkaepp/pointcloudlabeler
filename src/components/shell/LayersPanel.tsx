@@ -3,7 +3,10 @@
 // Scene objects: the point cloud (visibility toggle) and any raster
 // surfaces (DTM / DSM / CHM) computed in the Terrain panel, each with a
 // show/hide eye and a remove control. This is where multiple objects
-// (and, later, multiple clouds) are managed.
+// (and, later, multiple clouds) are managed. PointCloudLabeler: also the layers
+// opened from files — trajectories, meshes, a run's scan positions,
+// targets, stems, regions, voxels — a File… picker for them, and the
+// project's run outputs (ProjectFiles.tsx).
 //
 // Datasets: the saved octrees under the project — import a new cloud or
 // switch to another.
@@ -14,6 +17,8 @@ import type { OctreeListEntry, RasterLayer, CrsListEntry, OctreeCrs, NadGridStat
 import { formatBytes } from '../../utils/format';
 import { confirmDialog } from '../../ui/dialogs';
 import { describePayload, type AnalysisLayer } from '../../layers/analysisLayers';
+import { removeTrajectory, updateTrajectory, useSurveyStore } from './surveyStore';
+import ProjectFiles, { FileLayerRows, pickFileLayer } from './ProjectFiles';
 
 interface Desktop {
   browseForFolder?: (title?: string) => Promise<string | null>;
@@ -28,7 +33,7 @@ interface Desktop {
   }) => Promise<{ outDir: string; pointCountIn: number; pointCountOut: number; durationMs: number }>;
   octreeVoxelDownsample?: (args: {
     srcDir: string; outDir: string; name: string; scannerType: string;
-    voxelSize: number;
+    voxelSize: number; keepCentroid?: boolean;
   }) => Promise<{ outDir: string; pointCountIn: number; pointCountOut: number; durationMs: number }>;
   onOctreeProgress?: (cb: (e: { stage: string; pct: number }) => void) => Promise<() => void> | (() => void);
   crsList?: () => Promise<CrsListEntry[]>;
@@ -109,6 +114,8 @@ const KIND_SWATCH: Record<RasterLayer['kind'], string> = {
   // Hillshade: pure grayscale, cartographic standard.
   hillshade:       'linear-gradient(90deg,#101010,#404040,#808080,#c0c0c0,#f0f0f0)',
   hillshade_multi: 'linear-gradient(90deg,#101010,#404040,#808080,#c0c0c0,#f0f0f0)',
+  // A grid opened from a file.
+  grid: 'linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725)',
 };
 
 export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemoveDataset }: Props) {
@@ -121,6 +128,7 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
     refreshDatasets, reloadActiveOctree, overlayError, clearOverlayError,
   } = useOctreeShell();
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
+  const { trajectories, meshes, features } = useSurveyStore();
 
   // What a layer action could not do, said where the row is.
   const [layerError, setLayerError] = useState<string | null>(null);
@@ -367,6 +375,8 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
         r = await desktop!.octreeVoxelDownsample!({
           srcDir: octree.dir, outDir, name: finalName, scannerType: octree.meta.scannerType,
           voxelSize: cleanVoxel,
+          // The point nearest each voxel's centroid, not the first
+          keepCentroid: true,
         });
       } else {
         r = await desktop!.octreeFilterOutliers!({
@@ -439,7 +449,15 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
     <div className="flex flex-col gap-3" style={{ width: 272 }}>
       {/* Scene objects */}
       <div>
-        <div className="chip mb-1.5">Scene</div>
+        <div className="flex items-center mb-1.5">
+          <div className="chip">Scene</div>
+          <span className="flex-1" />
+          <button className="mono text-[9.5px] px-1.5 py-0.5 rounded-sm" style={{ border: '1px solid var(--line)', color: 'var(--text-dim)' }}
+            onClick={() => void pickFileLayer((m) => setLayerError(m))}
+            title="Open a file as a layer over the cloud: a trajectory (_traj.txt), scan positions, targets or stems (CSV), a region (GeoJSON, shapefile), voxels, a mesh (PLY, OBJ, STL), a QSM — or a point cloud into the editor">
+            + File…
+          </button>
+        </div>
         <div className="flex flex-col gap-1">
           {/* Primary (active, editable) cloud — the one every tool targets. */}
           {octree && (
@@ -497,6 +515,7 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
               onColor={(color) => updateSecondary(c.id, { color })}
               onMode={(colorMode) => updateSecondary(c.id, { colorMode })}
               onSyncFilters={(syncFilters) => updateSecondary(c.id, { syncFilters })}
+              onSyncExtent={(syncExtent) => updateSecondary(c.id, { syncExtent })}
               onMakeActive={() => makeActive(c.id)}
             />
           ))}
@@ -528,12 +547,27 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
               onRemove={() => removeLayer(l)}
             />
           ))}
+          {/* trajectories — the path a mobile scanner walked
+              (surveyStore), drawn over the cloud; hidden or taken off here
+              like any other layer. */}
+          {trajectories.map(t => (
+            <Row
+              key={t.id}
+              swatch={t.color}
+              title={t.name}
+              sub="trajectory"
+              visible={t.visible}
+              onToggle={() => updateTrajectory(t.path, { visible: !t.visible })}
+              onRemove={() => removeTrajectory(t.path)}
+            />
+          ))}
+          <FileLayerRows Row={Row} />
           {layerError && (
             <div className="mono text-[9.5px] px-2 py-1 rounded-sm" style={{ color: '#e0506b', background: 'rgba(224,80,107,0.10)', border: '1px solid rgba(224,80,107,0.45)' }}>
               {layerError}
             </div>
           )}
-          {rasterLayers.length === 0 && secondaryClouds.length === 0 && analysisLayers.length === 0 && (
+          {rasterLayers.length === 0 && secondaryClouds.length === 0 && analysisLayers.length === 0 && trajectories.length === 0 && meshes.length === 0 && features.length === 0 && (
             <div className="mono text-[9.5px] px-1" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
               Compute DTM / DSM / CHM in the Terrain panel to add raster surfaces, run an analysis (M3C2, stem
               centrelines, stem taper, click-to-measure, skeletons) to add its layer here, or add another dataset to
@@ -541,6 +575,9 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
             </div>
           )}
         </div>
+
+        {/* What the runs wrote into the project, opened from here */}
+        <ProjectFiles datasets={list} onOpenDataset={onOpen} />
 
         {/* Clean / downsample the active cloud → new dataset. SOR
             (Statistical Outlier Removal) flags points whose mean k-NN
@@ -707,7 +744,7 @@ export default function LayersPanel({ list, currentDir, onOpen, onImport, onRemo
       <div>
         <div className="chip mb-1.5">Datasets</div>
         <button className="btn !h-8 w-full justify-center gap-1.5 mono text-[11.5px] mb-1.5" onClick={onImport}>
-          <PlusIcon /> Import point cloud
+          <PlusIcon /> Open data…
         </button>
         {overlayError && (
           <div
@@ -1400,16 +1437,19 @@ const OVERLAY_COLOR_MODES: { value: SecondaryCloud['colorMode']; label: string; 
 /** An overlay cloud row: show/hide + tint colour + colour mode + filter
  *  sync + promote-to-active + remove. Overlays are read-only so this is
  *  the full set of controls that apply to them. */
-function OverlayRow({ cloud, onToggle, onRemove, onColor, onMode, onSyncFilters, onMakeActive }: {
+function OverlayRow({ cloud, onToggle, onRemove, onColor, onMode, onSyncFilters, onSyncExtent, onMakeActive }: {
   cloud: SecondaryCloud;
   onToggle: () => void;
   onRemove: () => void;
   onColor: (color: string) => void;
   onMode: (mode: SecondaryCloud['colorMode']) => void;
   onSyncFilters: (sync: boolean) => void;
+  onSyncExtent: (sync: boolean) => void;
   onMakeActive: () => void;
 }) {
-  const { visible, color, colorMode, syncFilters, label } = cloud;
+  const { visible, color, colorMode, syncFilters, syncExtent, label } = cloud;
+  // The extent rides along with the full sync.
+  const extentOn = syncFilters || syncExtent;
   // The colour swatch reflects the active mode: tint for flat, ramp/palette
   // for the scalar/categorical modes. Tint mode still doubles the swatch as
   // a colour picker so the user can tweak the overlay's accent.
@@ -1486,9 +1526,25 @@ function OverlayRow({ cloud, onToggle, onRemove, onColor, onMode, onSyncFilters,
             color: syncFilters ? 'var(--accent)' : 'var(--text-mute)',
             border: `1px solid ${syncFilters ? 'color-mix(in oklch, var(--accent) 45%, transparent)' : 'var(--line)'}`,
           }}
-          title="Mirror the primary cloud's filters (hide unassigned / isolate / id range / hide classes) onto this overlay"
+          title="Mirror the primary cloud's filters (hide unassigned / isolate / id range / hide classes / extent) onto this overlay"
         >
           <SyncDot on={syncFilters} /> sync filters
+        </button>
+        <button
+          onClick={() => onSyncExtent(!syncExtent)}
+          disabled={syncFilters}
+          className="mono text-[9.5px] px-1.5 py-0.5 rounded-sm flex items-center gap-1"
+          style={{
+            background: extentOn ? 'color-mix(in oklch, var(--accent) 18%, transparent)' : 'transparent',
+            color: extentOn ? 'var(--accent)' : 'var(--text-mute)',
+            border: `1px solid ${extentOn ? 'color-mix(in oklch, var(--accent) 45%, transparent)' : 'var(--line)'}`,
+            opacity: syncFilters ? 0.6 : 1,
+          }}
+          title={syncFilters
+            ? 'Included in sync filters'
+            : "Clip this overlay with the Filters panel's extent — X, Y and the Z (height) range — and nothing else of the primary's filters"}
+        >
+          <SyncDot on={extentOn} /> sync extent
         </button>
         <div className="flex-1" />
         <button

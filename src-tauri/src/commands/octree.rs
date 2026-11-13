@@ -146,6 +146,68 @@ use super::crs::CrsTransformer;
 // why the grid reader/interpolator itself lives there and not here.
 use super::geoid;
 
+// Survey analyses (contours, volumes, voxel change, ortho images,
+// profiles) and meshes read datasets with this module's private helpers.
+pub mod build_groups; // Phase 2 groups bounded by memory
+pub mod hierarchy; // Binary hierarchy for large clouds
+pub mod mesh;
+pub mod patch_index; // Patch lookups gated per record
+pub mod tree_tally; // Parallel, cached tree summary
+use patch_index::RecGated;
+pub mod survey;
+pub mod forest; // Wood/leaf, stems and trees (commands/forest)
+
+/// The forest pass (see `forest`).
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_segment_forest(window: Window, octree_dir: String, params: forest::ForestRequest) -> Result<forest::ForestResult, String> {
+    let progress = Progress::window(window, "octree-progress");
+    let _dataset_guard = lock_dataset(&octree_dir)?;
+    crate::rt::spawn_blocking(move || forest::run_segment_forest(&progress, &octree_dir, &params))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+/// The dataset's stems (forest/seeds.json), or none before the
+/// forest pass has run.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_forest_seeds(octree_dir: String) -> Result<Option<forest::SeedsFile>, String> {
+    forest::read_seeds(Path::new(&octree_dir))
+}
+
+/// One of the forest pass's files beside the dataset — "trees",
+/// "suggestions" or "report" — as JSON, or null before the pass has run.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_forest_file(octree_dir: String, name: String) -> Result<Option<serde_json::Value>, String> {
+    forest::read_file(Path::new(&octree_dir), &name)
+}
+
+/// Save the stem review's marks (forest/seed_review.json).
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_forest_save_review(octree_dir: String, review: serde_json::Value) -> Result<(), String> {
+    forest::write_review(Path::new(&octree_dir), &review)
+}
+
+/// The points of a near-tie branch (forest/near_ties.json) still
+/// its tree's, as (record, point indices), for the branch review to move.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_forest_branch_points(octree_dir: String, id: u32) -> Result<Vec<(u32, Vec<u32>)>, String> {
+    crate::rt::spawn_blocking(move || forest::branch_points(Path::new(&octree_dir), id))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Save the stems as corrected by hand.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_forest_save_seeds(octree_dir: String, seeds: forest::SeedsFile) -> Result<(), String> {
+    forest::write_seeds(Path::new(&octree_dir), &seeds)
+}
+
 const GRID_SIZE: usize = 8;
 const GRID_CUBED: usize = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 /// Tile (chunk) root depth in the global tree. Equals log2(GRID_SIZE).
@@ -474,6 +536,36 @@ mod atomic_write_tests {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
 
+    /// branches.json: absent reads as "{}", a write round-trips, and a
+    /// write that is not a branch file is refused with the old file
+    /// left standing.
+    #[test]
+    fn branches_json_round_trips_and_refuses_what_is_not_one() {
+        let d = TempDir::new("branches");
+        let dir = d.0.to_string_lossy().into_owned();
+        assert_eq!(octree_read_branches(dir.clone()).unwrap(), "{}");
+        let good = r#"{"format":"pointcloudlabeler-branches/1","branches":[{"id":1,"members":[{"tile":0,"record":2,"points":[4,5]}]}]}"#;
+        octree_write_branches(dir.clone(), good.to_string()).unwrap();
+        assert_eq!(octree_read_branches(dir.clone()).unwrap(), good);
+        assert!(octree_write_branches(dir.clone(), "not json".to_string()).is_err());
+        assert!(octree_write_branches(dir.clone(), r#"{"branches":{}}"#.to_string()).is_err());
+        assert!(octree_write_branches(dir.clone(), "[]".to_string()).is_err());
+        assert_eq!(octree_read_branches(dir).unwrap(), good, "a refused write touched the file");
+        assert_eq!(d.entries(), vec!["branches.json"]);
+    }
+
+    /// Re-importing a source rebuilds octree.bin, and every point address
+    /// in branches.json would then name some other point: it goes with
+    /// the other sidecars.
+    #[test]
+    fn a_rebuild_clears_branches_json_with_the_other_sidecars() {
+        let d = TempDir::new("stale_branches");
+        std::fs::write(d.join("branches.json"), b"{}").unwrap();
+        std::fs::write(d.join("review.json"), b"{}").unwrap();
+        clear_stale_sidecars(&d.0);
+        assert!(d.entries().is_empty(), "left behind: {:?}", d.entries());
+    }
+
     #[test]
     fn it_writes_exactly_the_bytes_and_leaves_no_tmp_behind() {
         let d = TempDir::new("write");
@@ -588,7 +680,7 @@ mod atomic_write_tests {
         let src = production_source();
         let src = src.as_str();
         for name in ["metadata.json", "hierarchy.bin", "treemap.json", "species.json",
-                     "review.json", "plot.json"] {
+                     "review.json", "plot.json", "branches.json"] {
             let direct = format!("{}{}\")", concat!("fs::write(dir.join(", "\""), name);
             assert_eq!(src.matches(&direct).count(), 0,
                 "{name} is written directly somewhere");
@@ -1233,6 +1325,18 @@ pub fn lock_dataset(dir: &str) -> Result<DatasetGuard, String> {
     Ok(DatasetGuard(dir.to_string()))
 }
 
+/// Is a dataset-mutating command running on a dataset inside
+/// `folder`? A project is not renamed under one (commands/project_rename.rs).
+pub fn any_dataset_busy_under(folder: &std::path::Path) -> bool {
+    let Some(m) = BUSY_DATASETS.get() else { return false };
+    let Ok(set) = m.lock() else { return true };
+    let root = folder.to_string_lossy();
+    set.iter().any(|dir| {
+        crate::commands::project_rename::same_folder(dir, &root)
+            || crate::commands::project_rename::rebase(dir, &root, &root).is_some()
+    })
+}
+
 fn emit_progress(progress: &Progress, stage: &str, pct: f32) {
     progress.report(stage, pct);
 }
@@ -1479,6 +1583,14 @@ impl ChunkSource {
                 let _ = std::fs::remove_file(&p);
                 Ok(bytes)
             }
+        }
+    }
+
+    /// One chunk's packed size, before it is taken.
+    fn size_of(&self, idx: usize) -> u64 {
+        match self {
+            ChunkSource::Mem(bufs) => bufs[idx].len() as u64,
+            ChunkSource::Disk { sizes, .. } => sizes[idx],
         }
     }
 
@@ -1815,6 +1927,17 @@ fn phase1_parallel_bin(
     let las_scale = [las_scale[0] * units.xy, las_scale[1] * units.xy, las_scale[2] * units.z];
     let las_offset = [las_offset[0] * units.xy, las_offset[1] * units.xy, las_offset[2] * units.z];
     let declared_crs = units.crs.clone().or(declared_crs);
+    // And the names it gives its classes, kept beside the CRS in
+    // metadata.json (`classNames`) for the legend and for an export to
+    // write back.
+    let declared_crs = match class_names_from_las_vlrs(header.vlrs()) {
+        None => declared_crs,
+        Some(names) => {
+            let mut d = declared_crs.unwrap_or_else(|| serde_json::json!({}));
+            if let Some(o) = d.as_object_mut() { o.insert("classNames".into(), names); }
+            Some(d)
+        }
+    };
     let all_extra_dims = parse_extra_dims(header.vlrs());
     let resolve = |wanted: &str| -> Option<LasExtraDim> {
         if wanted.is_empty() { return None; }
@@ -2365,7 +2488,7 @@ struct TileMeta {
 /// otherwise leave a new octree.bin paired with the old sidecars, which
 /// is precisely the state this prevents.
 fn clear_stale_sidecars(out_dir: &Path) {
-    for name in ["patches.bin", "treemap.json", "review.json", "species.json", "plot.json"] {
+    for name in ["patches.bin", "treemap.json", "review.json", "species.json", "plot.json", "branches.json"] {
         let p = out_dir.join(name);
         if p.exists() {
             // Best effort: a sidecar we cannot remove is worth neither
@@ -2376,7 +2499,29 @@ fn clear_stale_sidecars(out_dir: &Path) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn phase23_build_write(
+    source: ChunkSource,
+    bbox: Aabb,
+    scale: [f64; 3],
+    offset: [f64; 3],
+    root_spacing: f64,
+    max_depth: u32,
+    stride: usize,
+    out_dir: &Path,
+    progress: StagedSink,
+) -> Result<(Vec<TileMeta>, u64), String> {
+    // As much memory at once as the machine can spare.
+    phase23_build_write_with(
+        source, bbox, scale, offset, root_spacing, max_depth, stride, out_dir, progress,
+        build_groups::build_budget(),
+    )
+}
+
+/// phase23_build_write with the memory budget given: a group of chunks
+/// stops at `budget` as well as at one chunk per core (build_groups).
+#[allow(clippy::too_many_arguments)]
+fn phase23_build_write_with(
     mut source: ChunkSource,
     bbox: Aabb,
     scale: [f64; 3],
@@ -2386,6 +2531,7 @@ fn phase23_build_write(
     stride: usize,
     out_dir: &Path,
     progress: StagedSink,
+    budget: u64,
 ) -> Result<(Vec<TileMeta>, u64), String> {
     // Any sidecar in this directory belongs to whatever dataset used to
     // live here, not to the one about to be written. See the helper.
@@ -2412,6 +2558,9 @@ fn phase23_build_write(
     let nonempty = source.nonempty_indices();
     let total = nonempty.len();
     let group_size = rayon::current_num_threads().clamp(1, 32);
+    // Consecutive groups, so the files keep their order, of at
+    // most one chunk per core and at most `budget` bytes while building.
+    let groups = build_groups::chunk_groups(&nonempty, |ci| source.size_of(ci), stride, group_size, budget);
 
     let mut tiles: Vec<TileMeta> = Vec::with_capacity(total);
     let mut global_cursor: u64 = 0;
@@ -2419,7 +2568,7 @@ fn phase23_build_write(
     let mut done = 0usize;
 
     let result = (|| -> Result<(), String> {
-        for group in nonempty.chunks(group_size) {
+        for group in &groups {
             // 1. Pull this group's inputs out of the staging area (frees
             //    the memory / deletes the temp file as it goes).
             let inputs: Vec<(usize, Vec<u8>)> = group
@@ -2513,9 +2662,13 @@ fn phase23_build_write(
 /// Cutting, cleaning and downsampling do not move a point, so the
 /// georeferencing is unchanged by construction and inheriting it is
 /// simply correct.
+///
+/// The names the source file gave its classes (`classNames`,
+/// see `class_names_from_las_vlrs`) are carried the same way; cutting a
+/// dataset does not rename its classes.
 fn inherit_georeferencing(json: &mut serde_json::Value, src: &serde_json::Value) {
     let Some(obj) = json.as_object_mut() else { return };
-    for key in ["crs", "vertical"] {
+    for key in ["crs", "vertical", "classNames"] {
         if let Some(v) = src.get(key).filter(|v| !v.is_null()) {
             obj.insert(key.to_string(), v.clone());
         }
@@ -2779,7 +2932,7 @@ pub fn run_convert(
     include_deadwood: bool,
 ) -> Result<OctreeImportResult, String> {
     let started = std::time::Instant::now();
-    let out_path = PathBuf::from(out_dir);
+    let out_path = crate::fsgrant::os_path(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
 
     progress("open", 0.0);
@@ -2823,7 +2976,7 @@ pub fn run_convert(
     progress("done", 1.0);
 
     Ok(OctreeImportResult {
-        out_dir: out_dir.to_string(),
+        out_dir: out_path.to_string_lossy().into_owned(),
         point_count: total_stored,
         tile_count: tiles.len(),
         bbox_min: bbox.min,
@@ -3622,6 +3775,12 @@ pub fn octree_bake_patches(octree_dir: String) -> Result<BakeResult, String> {
             return Err(format!("hierarchy.bin length {} not a multiple of 24", hier.len()));
         }
         let n_records = hier.len() / 24;
+        // Read and rewrite only the nodes the patches name; the
+        // rest of a large octree.bin is never touched.
+        let mut touched = vec![false; n_records];
+        for &(r, _) in bake_map.keys() {
+            if let Some(t) = touched.get_mut(r as usize) { *t = true; }
+        }
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -3630,6 +3789,7 @@ pub fn octree_bake_patches(octree_dir: String) -> Result<BakeResult, String> {
             .map_err(|e| format!("open octree.bin rw: {e}"))?;
         let mut block: Vec<u8> = Vec::new();
         for rec_idx in 0..n_records {
+            if !touched[rec_idx] { continue; }
             let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
             let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
             let byte_size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
@@ -4297,6 +4457,37 @@ pub fn octree_write_review(octree_dir: String, json: String) -> Result<(), Strin
     write_file_atomic(&path, json.as_bytes(), "review.json")
 }
 
+/// Read branches.json — the branches cut out of trees by hand in the
+/// Branches panel, each a list of point addresses (tile, record, point)
+/// with the diameters and lengths measured on it. Missing file ⇒ "{}"
+/// so the front end always gets valid JSON. Never touches the point
+/// data; the viewer paints the listed points from it. The format is the
+/// renderer's (src/persistence/branchStore.ts); this side only checks
+/// that it is one and keeps it durable.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn octree_read_branches(octree_dir: String) -> Result<String, String> {
+    let path = Path::new(&octree_dir).join("branches.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Ok(s),
+        _ => Ok("{}".to_string()),
+    }
+}
+
+/// Overwrite branches.json, atomically via temp rename like the other
+/// sidecars. Validated as an object whose `branches` is an array, so a
+/// bug in the renderer cannot replace a session's work with something
+/// the reader will then discard.
+#[cfg_attr(feature = "gui", tauri::command)]
+pub fn octree_write_branches(octree_dir: String, json: String) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| format!("invalid branches json: {e}"))?;
+    if !v.get("branches").map(|b| b.is_array()).unwrap_or(false) {
+        return Err("invalid branches json: no `branches` array".to_string());
+    }
+    let path = Path::new(&octree_dir).join("branches.json");
+    write_file_atomic(&path, json.as_bytes(), "branches.json")
+}
+
 /// Read species.json — the per-tree species assignment overlay (tree_id
 /// → species key, e.g. "pine" / "spruce"; anything absent is unassigned
 /// and the biomass maths falls back to a caller-chosen default species).
@@ -4487,16 +4678,19 @@ fn write_export_descriptor(v: &mut [u8], base: usize, data_type: u8, name: &str,
 }
 
 /// Build the CRS-declaration VLR for an export whose written coordinates
-/// are actually in `epsg`. The exporter writes LAS 1.2 / point format 0
-/// (see run_export_octree_las's header, `header[25] = 2`) — LAS 1.2 has
-/// no WKT CRS VLR; that mechanism needs a LAS 1.4 global-encoding bit
-/// this file never sets. So the only CRS mechanism a 1.2 reader can see
-/// is the GeoTIFF GeoKeyDirectoryTag (record_id 34735) — the same tag
+/// are actually in `epsg`. A LAS 1.2 export (point formats 0–3) has no
+/// WKT CRS VLR; that mechanism needs a LAS 1.4 global-encoding bit. So
+/// the only CRS mechanism a 1.2 reader can see is the GeoTIFF
+/// GeoKeyDirectoryTag (record_id 34735) — the same tag
 /// geotiff.rs's raster writer emits for a DEM/CHM (see its
 /// `write_geotiff_f32`). Same 54-byte VLR header layout as
 /// `build_export_vlr` above; only the payload shape differs (GeoTIFF's
 /// own array-of-u16 key directory instead of an Extra-Bytes descriptor
 /// table).
+///
+/// A LAS 1.4 export writes point format 6–8, which must state
+/// its coordinate system as WKT instead — see `build_wkt_vlr`. These keys
+/// are its fallback for a code `crs::wkt` cannot write.
 ///
 /// Deciding WHICH epsg code belongs here — source vs. target CRS — is
 /// entirely `resolve_export_crs_epsg`'s job, not this one's: this
@@ -4577,6 +4771,48 @@ fn build_crs_vlr(epsg: u32, vertical_epsg: Option<u32>) -> Vec<u8> {
             v[base..base + 2].copy_from_slice(&word.to_le_bytes());
             base += 2;
         }
+    }
+    v
+}
+
+/// The OGC WKT coordinate-system VLR (LASF_Projection, record
+/// 2112) a LAS 1.4 export with point format 6–10 carries instead of the
+/// GeoTIFF keys of `build_crs_vlr`: the text, null-terminated. Empty when
+/// the text would not fit a VLR.
+fn build_wkt_vlr(wkt: &str) -> Vec<u8> {
+    let Ok(len) = u16::try_from(wkt.len() + 1) else { return Vec::new() };
+    let mut v = vec![0u8; 54 + wkt.len() + 1];
+    write_fixed_ascii_z(&mut v[2..18], "LASF_Projection");
+    v[18..20].copy_from_slice(&2112u16.to_le_bytes());
+    v[20..22].copy_from_slice(&len.to_le_bytes());
+    write_fixed_ascii_z(&mut v[22..54], "OGC COORDINATE SYSTEM WKT");
+    v[54..54 + wkt.len()].copy_from_slice(wkt.as_bytes());
+    v
+}
+
+/// The Classification Lookup VLR (LASF_Spec record 0) for the
+/// names the dataset's source file gave its classes (`classNames`, read
+/// by `class_names_from_las_vlrs`): 16 bytes a class, the code then a
+/// 15-byte description. Only codes the export can write — `max_code` is
+/// 31 in LAS 1.2's five bits, 255 in LAS 1.4. Empty when none is named.
+fn build_class_lookup_vlr(meta: &serde_json::Value, max_code: u8) -> Vec<u8> {
+    let Some(names) = meta.get("classNames").and_then(|v| v.as_object()) else { return Vec::new() };
+    let mut entries: Vec<(u8, &str)> = names
+        .iter()
+        .filter_map(|(k, v)| Some((k.parse::<u8>().ok()?, v.as_str()?.trim())))
+        .filter(|(c, n)| *c <= max_code && !n.is_empty())
+        .collect();
+    if entries.is_empty() { return Vec::new(); }
+    entries.sort_by_key(|e| e.0);
+    let payload = 16 * entries.len();
+    let mut v = vec![0u8; 54 + payload];
+    write_fixed_ascii_z(&mut v[2..18], "LASF_Spec");              // record_id 0
+    v[20..22].copy_from_slice(&(payload as u16).to_le_bytes());
+    write_fixed_ascii_z(&mut v[22..54], "Classification Lookup");
+    for (i, (code, name)) in entries.iter().enumerate() {
+        let at = 54 + 16 * i;
+        v[at] = *code;
+        write_fixed_ascii_z(&mut v[at + 1..at + 16], name);
     }
     v
 }
@@ -4665,6 +4901,28 @@ fn las_geokeys(vlrs: &[las::Vlr]) -> Vec<(u16, u16)> {
 /// applied rather than assumed here.
 fn vertical_units_from_las_vlrs(vlrs: &[las::Vlr]) -> Option<u16> {
     las_geokeys(vlrs).into_iter().find(|&(k, _)| k == 4099).map(|(_, v)| v)
+        // Or, in a WKT file, the unit of its vertical system.
+        .or_else(|| {
+            let wkt = las_projection_vlr(vlrs, 2112)?;
+            super::crs::vertical_unit_code(super::crs::vertical_epsg_from_wkt(&String::from_utf8_lossy(&wkt.data))?)
+        })
+}
+
+/// The names a LAS file gives its classes, from its
+/// Classification Lookup (LASF_Spec record 0): 16 bytes a class, the code
+/// then a 15-byte description. `{"64": "Stem", …}`, or `None` when it
+/// names none.
+fn class_names_from_las_vlrs(vlrs: &[las::Vlr]) -> Option<serde_json::Value> {
+    let vlr = vlrs.iter().find(|v| v.user_id.trim_end_matches('\0').trim() == "LASF_Spec" && v.record_id == 0)?;
+    let mut names = serde_json::Map::new();
+    for rec in vlr.data.chunks_exact(16) {
+        let text = rec[1..].split(|&b| b == 0).next().unwrap_or(&[]);
+        let name = String::from_utf8_lossy(text).trim().to_string();
+        if !name.is_empty() {
+            names.entry(rec[0].to_string()).or_insert(serde_json::Value::String(name));
+        }
+    }
+    if names.is_empty() { None } else { Some(serde_json::Value::Object(names)) }
 }
 
 /// What an import has to multiply the source file's coordinates by
@@ -4835,7 +5093,15 @@ fn crs_from_las_vlrs(vlrs: &[las::Vlr]) -> Option<serde_json::Value> {
         let code = super::crs::epsg_from_wkt(&text)?;
         let label = super::crs::display_name_for_epsg(code)
             .unwrap_or_else(|| format!("EPSG:{code}"));
-        return Some(serde_json::json!({ "crs": { "epsg": code, "label": label } }));
+        let mut out = serde_json::json!({ "crs": { "epsg": code, "label": label } });
+        // A compound WKT's vertical part, read as the
+        // VerticalCSType key is below.
+        if let Some(v) = super::crs::vertical_epsg_from_wkt(&text) {
+            let label = super::crs::display_name_for_epsg(v)
+                .unwrap_or_else(|| format!("EPSG:{v}"));
+            out["vertical"] = serde_json::json!({ "datum": "orthometric", "epsg": v, "label": label });
+        }
+        return Some(out);
     }
 
     let (mut horizontal, mut vertical) = (None::<u32>, None::<u32>);
@@ -4938,16 +5204,18 @@ fn vlr_header_fields(vlrs: &[&[u8]]) -> (u32, usize) {
 /// The split lets every existing call site keep its (tree_id, sem, del)
 /// destructuring; only the export path consults deadwood.
 struct ExportPatches {
-    main: FxHashMap<(u32, u32), (i32, u8, u8)>,
-    deadwood: FxHashMap<(u32, u32), (i32, i32)>,
+    // Gated per record (patch_index), so scans skip the hash
+    // for the points of nodes without patches.
+    main: RecGated<(i32, u8, u8)>,
+    deadwood: RecGated<(i32, i32)>,
 }
 
 /// Parse patches.bin into the (main, deadwood) split. Accepts both v1
 /// (24 B/rec) and v2 (32 B/rec); v1 records imply -1/-1 in the deadwood
 /// fields (no override). Missing file ⇒ empty maps.
 fn parse_export_patches_full(path: &Path) -> Result<ExportPatches, String> {
-    let mut main: FxHashMap<(u32, u32), (i32, u8, u8)> = FxHashMap::default();
-    let mut deadwood: FxHashMap<(u32, u32), (i32, i32)> = FxHashMap::default();
+    let mut main: RecGated<(i32, u8, u8)> = RecGated::default();
+    let mut deadwood: RecGated<(i32, i32)> = RecGated::default();
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(_) => return Ok(ExportPatches { main, deadwood }),
@@ -4986,7 +5254,7 @@ fn parse_export_patches_full(path: &Path) -> Result<ExportPatches, String> {
 
 /// Most call sites only care about the main (tree_id / semantic / deleted)
 /// overrides. They use this thin wrapper that drops the deadwood half.
-fn parse_export_patches(path: &Path) -> Result<FxHashMap<(u32, u32), (i32, u8, u8)>, String> {
+fn parse_export_patches(path: &Path) -> Result<RecGated<(i32, u8, u8)>, String> {
     Ok(parse_export_patches_full(path)?.main)
 }
 
@@ -6099,7 +6367,9 @@ fn subset_keeps(f: &SubsetFilter, p: &SubsetPointView) -> bool {
 
     // HIDE-lists — absent means nothing in that column is hidden.
     if let Some(hidden) = &f.semantic_hidden { if hidden.contains(&p.semantic) { return false; } }
-    if let Some(hidden) = &f.returns_hidden { if hidden.contains(&p.return_number) { return false; } }
+    // Byte 19 packs the return number (low nibble) with the number of returns
+    // (high nibble); the hide list holds return numbers.
+    if let Some(hidden) = &f.returns_hidden { if hidden.contains(&(p.return_number & 0x0f)) { return false; } }
 
     if f.hide_standing_deadwood.unwrap_or(false) && p.standing_deadwood > 0 { return false; }
     if f.hide_laying_deadwood.unwrap_or(false) && p.laying_deadwood > 0 { return false; }
@@ -6277,6 +6547,10 @@ mod subset_keeps_tests {
         assert!(subset_keeps(&f, &SubsetPointView { return_number: 1, ..base(&none) }));
         assert!(!subset_keeps(&f, &SubsetPointView { return_number: 0, ..base(&none) }));
         assert!(!subset_keeps(&f, &SubsetPointView { return_number: 2, ..base(&none) }));
+        // the stored byte packs the number of returns in the high nibble — return 2
+        // of 3 is 0x32 and is hidden; return 1 of 2 (0x21) is kept
+        assert!(!subset_keeps(&f, &SubsetPointView { return_number: 0x32, ..base(&none) }));
+        assert!(subset_keeps(&f, &SubsetPointView { return_number: 0x21, ..base(&none) }));
     }
 
     #[test]
@@ -6374,7 +6648,7 @@ pub fn run_subset(
     use std::io::Read;
     let started = std::time::Instant::now();
     let dir = Path::new(src_dir);
-    let out_path = PathBuf::from(out_dir);
+    let out_path = crate::fsgrant::os_path(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
     emit_progress(progress, "subset", 0.0);
 
@@ -6819,7 +7093,7 @@ pub fn run_merge_clouds(
     let started = std::time::Instant::now();
     let dir_a = Path::new(src_a_dir);
     let dir_b = Path::new(src_b_dir);
-    let out_path = PathBuf::from(out_dir);
+    let out_path = crate::fsgrant::os_path(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
     emit_progress(progress, "merge", 0.0);
 
@@ -7053,7 +7327,7 @@ pub struct ExportRequest {
     /// Convert Z to orthometric height with this geoid grid file name.
     #[serde(default)]
     pub geoid: Option<String>,
-    /// LAS 1.4 / point format 6 instead of LAS 1.2 / format 0.
+    /// LAS 1.4 / point format 6 instead of LAS 1.2 / format 0 (classes above 31, the coordinate system as WKT).
     #[serde(default)]
     pub las_14: Option<bool>,
     /// The standard fields carried as columns (GPS time, colour, scan angle, …) back into the record (default true).
@@ -7739,10 +8013,31 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     // whether or not `opts.geoid` is set. None means nothing is declared,
     // never a guessed code.
     let vertical_epsg = read_vertical_crs(&meta).and_then(|v| v.epsg);
-    let crs_vlr = resolve_export_crs_epsg(&opts.target_crs, &meta)
-        .map(|code| build_crs_vlr(code, vertical_epsg))
-        .unwrap_or_default();
-    let (num_vlrs, vlr_bytes_len) = vlr_header_fields(&[&vlr, &crs_vlr]);
+    let crs_code = resolve_export_crs_epsg(&opts.target_crs, &meta);
+    // LAS 1.4's point formats 6–10 state their coordinate system
+    // as WKT, with bit 4 of the global encoding set; GeoTIFF keys are for
+    // formats 0–5. A code `crs::wkt` cannot write keeps the GeoTIFF keys:
+    // off the letter of the format, but the file still says what it is.
+    let wkt_vlr = if opts.las_14 {
+        crs_code
+            .and_then(|c| super::crs::wkt::wkt_for_epsg(c, vertical_epsg))
+            .map(|w| build_wkt_vlr(&w))
+            .filter(|v| !v.is_empty())
+    } else {
+        None
+    };
+    let wkt_crs = wkt_vlr.is_some();
+    let crs_vlr = wkt_vlr.unwrap_or_else(|| {
+        crs_code.map(|code| build_crs_vlr(code, vertical_epsg)).unwrap_or_default()
+    });
+    // The names the dataset's source gave its classes, when the
+    // classes are written.
+    let class_vlr = if opts.keep_classification {
+        build_class_lookup_vlr(&meta, if opts.las_14 { 255 } else { 31 })
+    } else {
+        Vec::new()
+    };
+    let (num_vlrs, vlr_bytes_len) = vlr_header_fields(&[&vlr, &crs_vlr, &class_vlr]);
     let offset_to_points = (header_bytes + vlr_bytes_len) as u32;
     // 20 standard bytes, plus the included extras in record order:
     //   tree_id (i32, +4), semantic_class (u8, +1), one f32 per
@@ -7832,6 +8127,7 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     header[100..104].copy_from_slice(&num_vlrs.to_le_bytes());            // number of VLRs
     header[104] = out_format;                                             // point data record format
     if has_gps && gps_standard { header[6] |= 1; }                        // global encoding: GPS time type
+    if wkt_crs { header[6] |= 0x10; }                                     // global encoding: CRS is WKT
     header[105..107].copy_from_slice(&record_len.to_le_bytes());          // record length
     // 107-110 point count — placeholder 0.
     header[131..139].copy_from_slice(&out_scale[0].to_le_bytes());
@@ -7844,6 +8140,7 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
     w.write_all(&header).map_err(|e| format!("write header: {e}"))?;
     w.write_all(&vlr).map_err(|e| format!("write vlr: {e}"))?;
     w.write_all(&crs_vlr).map_err(|e| format!("write crs vlr: {e}"))?;
+    w.write_all(&class_vlr).map_err(|e| format!("write class lookup vlr: {e}"))?;
 
     // 6. Stream every record's block, apply patches, drop hidden points,
     //    emit LAS records, accumulate count + world bbox. When target_crs
@@ -7914,7 +8211,8 @@ fn run_export_octree_las(progress: ProgressSink, octree_dir: &str, out_path: &st
             }
             // Merge overlay — fold merged ids into their target.
             if let Some(&to) = remap.get(&tree_id) { tree_id = to; }
-            let sem_out = if sem == 1 || sem == 2 { sem } else { 0 };
+            // 4 = leaf rides through with stem and branch
+            let sem_out = if sem == 1 || sem == 2 || sem == 4 { sem } else { 0 };
 
             // Deadwood ids after patch overrides — computed unconditionally
             // (one hashmap lookup + up to two f32 reads, always cheap next
@@ -9434,136 +9732,20 @@ pub async fn octree_tree_summary(
 /// not something to run every frame. The caller should flush its
 /// in-memory patches first so the tally reflects unsaved edits.
 pub fn run_tree_summary(progress: &Progress, octree_dir: &str) -> Result<Vec<TreeSummaryEntry>, String> {
-    use std::io::Read;
-    let dir = Path::new(octree_dir);
-    emit_progress(progress, "tree_summary", 0.0);
+    // On every core, cached per dataset, merges applied to the
+    // per-tree totals instead of every point (see tree_tally).
+    tree_tally::summary(progress, octree_dir)
+}
 
-    // Quantisation + on-disk stride, same as the exporter reads them.
-    let meta_bytes = std::fs::read(dir.join("metadata.json"))
-        .map_err(|e| format!("read metadata.json: {e}"))?;
-    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-        .map_err(|e| format!("parse metadata.json: {e}"))?;
-    let scale = json_f64_3(&meta, "scale")?;
-    let offset = json_f64_3(&meta, "offset")?;
-    let point_bytes = point_bytes_of(&meta)?;
-
-    let hier = std::fs::read(dir.join("hierarchy.bin"))
-        .map_err(|e| format!("read hierarchy.bin: {e}"))?;
-    if hier.len() % 24 != 0 {
-        return Err(format!("hierarchy.bin length {} not a multiple of 24", hier.len()));
-    }
-    let n_records = hier.len() / 24;
-
-    let patches = parse_export_patches(&dir.join("patches.bin"))?;
-    let remap = parse_remap(&dir.join("treemap.json"))?;
-
-    let mut bin = BufReader::with_capacity(
-        4 * 1024 * 1024,
-        File::open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin: {e}"))?,
-    );
-
-    // tree_id → (count, min[xyz], max[xyz], sum[xyz], sumsq[xyz]) —
-    // sum drives the centroid, sumsq the per-axis σ. f64 is fine even
-    // for UTM-magnitude coords: sumsq ≈ 1e17 for a 600 k-point tree,
-    // where f64's absolute error (~16) vanishes after the /n.
-    let mut acc: FxHashMap<i32, (u64, [f64; 3], [f64; 3], [f64; 3], [f64; 3])> = FxHashMap::default();
-    let mut recs: FxHashMap<i32, Vec<u32>> = FxHashMap::default();
-    let mut block: Vec<u8> = Vec::new();
-    let mut cur_pos: u64 = 0;
-
-    for rec_idx in 0..n_records {
-        let h = &hier[rec_idx * 24..rec_idx * 24 + 24];
-        let byte_offset = u64::from_le_bytes(h[8..16].try_into().unwrap());
-        let byte_size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
-        if byte_size == 0 {
-            continue;
-        }
-        let num_points = byte_size / point_bytes;
-        block.resize(byte_size, 0);
-        if byte_offset != cur_pos {
-            bin.seek(SeekFrom::Start(byte_offset)).map_err(|e| format!("seek octree.bin: {e}"))?;
-            cur_pos = byte_offset;
-        }
-        bin.read_exact(&mut block).map_err(|e| format!("read octree.bin block: {e}"))?;
-        cur_pos += byte_size as u64;
-
-        for p in 0..num_points {
-            let o = p * point_bytes;
-            let xi = i32::from_le_bytes(block[o..o + 4].try_into().unwrap());
-            let yi = i32::from_le_bytes(block[o + 4..o + 8].try_into().unwrap());
-            let zi = i32::from_le_bytes(block[o + 8..o + 12].try_into().unwrap());
-            let mut tree_id = i32::from_le_bytes(block[o + 12..o + 16].try_into().unwrap());
-
-            // Same patch semantics as the exporter: deleted ⇒ drop, a
-            // non-negative tree_id overrides (0 resets to unassigned).
-            if let Some(&(p_tree, _p_sem, p_del)) = patches.get(&(rec_idx as u32, p as u32)) {
-                if p_del == 1 {
-                    continue;
-                }
-                if p_tree >= 0 {
-                    tree_id = p_tree;
-                }
-            }
-            if let Some(&to) = remap.get(&tree_id) {
-                tree_id = to;
-            }
-
-            let wx = xi as f64 * scale[0] + offset[0];
-            let wy = yi as f64 * scale[1] + offset[1];
-            let wz = zi as f64 * scale[2] + offset[2];
-
-            {
-                let v = recs.entry(tree_id).or_default();
-                if v.last() != Some(&(rec_idx as u32)) { v.push(rec_idx as u32); }
-            }
-            let e = acc
-                .entry(tree_id)
-                .or_insert((0u64, [f64::INFINITY; 3], [f64::NEG_INFINITY; 3], [0.0f64; 3], [0.0f64; 3]));
-            e.0 += 1;
-            if wx < e.1[0] { e.1[0] = wx; }
-            if wx > e.2[0] { e.2[0] = wx; }
-            if wy < e.1[1] { e.1[1] = wy; }
-            if wy > e.2[1] { e.2[1] = wy; }
-            if wz < e.1[2] { e.1[2] = wz; }
-            if wz > e.2[2] { e.2[2] = wz; }
-            e.3[0] += wx;
-            e.3[1] += wy;
-            e.3[2] += wz;
-            e.4[0] += wx * wx;
-            e.4[1] += wy * wy;
-            e.4[2] += wz * wz;
-        }
-        if n_records > 0 && rec_idx % 256 == 0 {
-            emit_progress(progress, "tree_summary", rec_idx as f32 / n_records as f32);
-        }
-    }
-
-    let mut out: Vec<TreeSummaryEntry> = acc
-        .into_iter()
-        .map(|(tree_id, (count, bbox_min, bbox_max, sum, sumsq))| {
-            let n = count.max(1) as f64;
-            let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
-            // Population σ per axis; the max(0, …) guards the tiny
-            // negative variance float noise can produce on 1-point trees.
-            let sigma = [
-                (sumsq[0] / n - mean[0] * mean[0]).max(0.0).sqrt(),
-                (sumsq[1] / n - mean[1] * mean[1]).max(0.0).sqrt(),
-                (sumsq[2] / n - mean[2] * mean[2]).max(0.0).sqrt(),
-            ];
-            TreeSummaryEntry {
-                records: recs.remove(&tree_id).unwrap_or_default(),
-                tree_id,
-                count,
-                bbox_min,
-                bbox_max,
-                centroid: mean,
-                sigma,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| a.tree_id.cmp(&b.tree_id));
-    emit_progress(progress, "tree_summary", 1.0);
-    Ok(out)
+/// The largest tree id in the whole cloud, for "New tree" and
+/// split — the viewer alone sees only the nodes it has loaded. From the
+/// tree tally, so it shares the summary's scan and cache.
+#[cfg(feature = "gui")]
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn octree_max_tree_id(octree_dir: String) -> Result<i32, String> {
+    crate::rt::spawn_blocking(move || tree_tally::max_tree_id(&Progress::silent(), &octree_dir))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
 }
 
 /// On-demand backfill for datasets imported before metadata.intensityRange
@@ -14126,9 +14308,58 @@ fn compute_voxel_mask(positions: &[[f32; 3]], voxel: f32) -> Vec<bool> {
     mask
 }
 
+/// One point per voxel, the one nearest the voxel's centroid —
+/// a real point (no new coordinates), the least likely of the voxel's to
+/// be a stray, and the same whatever order the points come in. Two passes.
+fn compute_voxel_mask_centroid(positions: &[[f32; 3]], voxel: f32) -> Vec<bool> {
+    let n = positions.len();
+    if n == 0 || voxel <= 0.0 { return vec![true; n]; }
+    let inv_v = 1.0 / voxel;
+    let mut origin = [f32::INFINITY; 3];
+    for p in positions { for axis in 0..3 { if p[axis] < origin[axis] { origin[axis] = p[axis]; } } }
+    if !origin[0].is_finite() { origin = [0.0; 3]; }
+    let key = |p: &[f32; 3]| pack_cell_xyz(
+        ((p[0] - origin[0]) * inv_v).floor() as i32,
+        ((p[1] - origin[1]) * inv_v).floor() as i32,
+        ((p[2] - origin[2]) * inv_v).floor() as i32,
+    );
+    let mut sums: FxHashMap<u64, ([f64; 3], u32)> = FxHashMap::default();
+    for p in positions {
+        let e = sums.entry(key(p)).or_insert(([0.0; 3], 0));
+        for a in 0..3 { e.0[a] += p[a] as f64; }
+        e.1 += 1;
+    }
+    let mut best: FxHashMap<u64, (f64, usize)> = FxHashMap::default();
+    for (i, p) in positions.iter().enumerate() {
+        let k = key(p);
+        let (s, c) = sums[&k];
+        let d: f64 = (0..3).map(|a| (p[a] as f64 - s[a] / c as f64).powi(2)).sum();
+        let b = best.entry(k).or_insert((f64::INFINITY, usize::MAX));
+        if d < b.0 || (d == b.0 && i < b.1) { *b = (d, i); }
+    }
+    let mut mask = vec![false; n];
+    for (_, (_, i)) in best { mask[i] = true; }
+    mask
+}
+
 #[cfg(test)]
 mod cleaning_tests {
     use super::*;
+
+    /// The centroid mode keeps the point nearest the middle of
+    /// what fell in the voxel, whatever order they came in.
+    #[test]
+    fn the_centroid_keeper_is_the_middle_point_in_any_order() {
+        let mut pts: Vec<[f32; 3]> = (0..9).map(|i| [0.01 + i as f32 * 0.01, 0.05, 0.05]).collect();
+        let m = compute_voxel_mask_centroid(&pts, 0.1);
+        assert_eq!(m.iter().filter(|&&k| k).count(), 1);
+        assert!(m[4], "the middle of nine");
+        pts.reverse();
+        assert!(compute_voxel_mask_centroid(&pts, 0.1)[4]);
+        // the count is the first-point mode's
+        let grid: Vec<[f32; 3]> = (0..1000).map(|i| [(i % 10) as f32 * 0.01, ((i / 10) % 10) as f32 * 0.01, (i / 100) as f32 * 0.01]).collect();
+        assert_eq!(compute_voxel_mask_centroid(&grid, 0.05).iter().filter(|&&k| k).count(), compute_voxel_mask(&grid, 0.05).iter().filter(|&&k| k).count());
+    }
 
     /// SOR on a dense cluster + one obvious flyer: the flyer should be
     /// dropped, the cluster kept.
@@ -14306,7 +14537,7 @@ fn write_filtered_dataset(
 ) -> Result<CleanResult, String> {
     use std::io::Read;
     let dir = Path::new(src_dir);
-    let out_path = PathBuf::from(out_dir);
+    let out_path = crate::fsgrant::os_path(out_dir);
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
 
     let (src_meta, src_scale, src_offset, src_bbox, src_point_bytes, n_extras) =
@@ -14556,10 +14787,12 @@ pub async fn octree_voxel_downsample(
     window: Window,
     src_dir: String, out_dir: String, name: String, scanner_type: String,
     voxel_size: f64,
+    // Keep the point nearest each voxel's centroid, not the first
+    keep_centroid: Option<bool>,
 ) -> Result<CleanResult, String> {
     let progress = Progress::window(window, "octree-progress");
     crate::rt::spawn_blocking(move || {
-        run_voxel_downsample(&progress, &src_dir, &out_dir, &name, &scanner_type, voxel_size)
+        run_voxel_downsample_with(&progress, &src_dir, &out_dir, &name, &scanner_type, voxel_size, keep_centroid.unwrap_or(false))
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -14570,10 +14803,19 @@ pub async fn octree_voxel_downsample(
 pub fn run_voxel_downsample(
     progress: &Progress, src_dir: &str, out_dir: &str, name: &str, scanner_type: &str, voxel_size: f64,
 ) -> Result<CleanResult, String> {
+    run_voxel_downsample_with(progress, src_dir, out_dir, name, scanner_type, voxel_size, false)
+}
+
+/// As `run_voxel_downsample`, keeping the point nearest each
+/// voxel's centroid when `keep_centroid` (else the first, as before).
+#[allow(clippy::too_many_arguments)]
+pub fn run_voxel_downsample_with(
+    progress: &Progress, src_dir: &str, out_dir: &str, name: &str, scanner_type: &str, voxel_size: f64, keep_centroid: bool,
+) -> Result<CleanResult, String> {
     let started = std::time::Instant::now();
     let v = voxel_size.max(1e-4) as f32;
     let build = move |positions: &[[f32; 3]]| -> Vec<bool> {
-        compute_voxel_mask(positions, v)
+        if keep_centroid { compute_voxel_mask_centroid(positions, v) } else { compute_voxel_mask(positions, v) }
     };
     let (mask, _n_live, bbox) = build_mask_for_cleaning(progress, src_dir, "downsample", build)?;
     write_filtered_dataset(progress, src_dir, out_dir, name, scanner_type, &mask, bbox, "downsample", started)
@@ -16642,8 +16884,11 @@ pub fn run_m3c2(
 // *scattered* (λ2/λ0 high, isotropic). A few majority-vote smoothing
 // passes over the same neighbourhood remove the salt-and-pepper the
 // per-point test leaves (LeWoS's regularisation step). The label lands in
-// the semantic byte: 1 = wood, 2 = leaf, 0 = ground. Feeds QSM / biomass
-// (run those on wood only) — pure geometry, no ML, GPU, or network.
+// the semantic byte as the editor reads it — 1 = stem (planar
+// wood: a trunk surface), 2 = branch (linear wood), 4 = leaf, 0 = ground;
+// it used to write 1 = wood, 2 = leaf, which the editor showed as "Stem"
+// and "Branch". Feeds QSM / biomass (run those on wood only) — pure
+// geometry, no ML, GPU, or network.
 // ---------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -16663,13 +16908,30 @@ struct LwPoint { x: f32, y: f32, z: f32 }
 /// branch) or planar (a trunk surface) AND not scattered (foliage). Takes
 /// the PCA eigenvalues λ0≥λ1≥λ2; a degenerate (zero-spread) neighbourhood is
 /// treated as not-wood.
+#[cfg(test)]
 fn lw_is_wood(l0: f64, l1: f64, l2: f64, linearity_min: f64, planarity_min: f64, scatter_max: f64) -> bool {
+    lw_label(l0, l1, l2, linearity_min, planarity_min, scatter_max) != SEM_LEAF
+}
+
+/// The semantic codes the editor reads (3 is the patches'
+/// "cleared" value, so foliage is 4).
+pub const SEM_STEM: u8 = 1;
+pub const SEM_BRANCH: u8 = 2;
+pub const SEM_LEAF: u8 = 4;
+
+/// The label of a neighbourhood: planar wood (a trunk surface) is stem,
+/// linear wood a branch, the rest leaf.
+fn lw_label(l0: f64, l1: f64, l2: f64, linearity_min: f64, planarity_min: f64, scatter_max: f64) -> u8 {
     let l2 = l2.max(0.0);
-    if l0 <= 1e-12 { return false; }
+    if l0 <= 1e-12 { return SEM_LEAF; }
     let linearity = (l0 - l1) / l0;
     let planarity = (l1 - l2) / l0;
     let scatter = l2 / l0;
-    (linearity >= linearity_min || planarity >= planarity_min) && scatter <= scatter_max
+    if scatter > scatter_max { return SEM_LEAF; }
+    if planarity >= planarity_min && planarity >= linearity { SEM_STEM }
+    else if linearity >= linearity_min { SEM_BRANCH }
+    else if planarity >= planarity_min { SEM_STEM }
+    else { SEM_LEAF }
 }
 
 #[cfg(feature = "gui")]
@@ -16798,7 +17060,7 @@ pub fn run_leaf_wood(
             }
         }}}
         let n = nbrs.len();
-        if n < min_n { return 2u8; } // too sparse ⇒ leaf (conservative)
+        if n < min_n { return SEM_LEAF; } // too sparse ⇒ leaf (conservative)
         let inv_n = 1.0 / n as f64;
         mx *= inv_n; my *= inv_n; mz *= inv_n;
         let (mut sxx, mut syy, mut szz, mut sxy, mut sxz, mut syz) = (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -16814,30 +17076,32 @@ pub fn run_leaf_wood(
             [sxz * inv_n, syz * inv_n, szz * inv_n],
         ];
         let (vals, _vecs) = jacobi_eigen_3x3(cov);
-        if lw_is_wood(vals[0], vals[1], vals[2], linearity_min, planarity_min, scatter_max) { 1u8 } else { 2u8 }
+        lw_label(vals[0], vals[1], vals[2], linearity_min, planarity_min, scatter_max)
     }).collect();
     emit_progress(progress, "leafwood", 0.7);
 
     // ---- 4. Majority-vote smoothing (ties → wood, so thin branches
-    //         don't erode). Each pass reads the previous labels. ----
+    //         don't erode). Each pass reads the previous labels; a point
+    //         that turns wood takes the wood kind most around it. ----
     for _pass in 0..smooth_passes {
         let prev = label.clone();
         label = (0..pts.len()).into_par_iter().map(|i| {
             let c = &pts[i];
             let (kx, ky, kz) = pkey(c.x, c.y, c.z);
-            let (mut wood, mut leaf) = (0u32, 0u32);
+            let (mut stem, mut branch, mut leaf) = (0u32, 0u32, 0u32);
             for dx in -1..=1 { for dy in -1..=1 { for dz in -1..=1 {
                 if let Some(v) = grid.get(&(kx + dx, ky + dy, kz + dz)) {
                     for &j in v {
                         let q = &pts[j as usize];
                         let ddx = q.x - c.x; let ddy = q.y - c.y; let ddz = q.z - c.z;
                         if ddx * ddx + ddy * ddy + ddz * ddz <= r2 {
-                            if prev[j as usize] == 1 { wood += 1; } else { leaf += 1; }
+                            match prev[j as usize] { SEM_STEM => stem += 1, SEM_BRANCH => branch += 1, _ => leaf += 1 }
                         }
                     }
                 }
             }}}
-            if wood >= leaf { 1u8 } else { 2u8 }
+            if stem + branch < leaf { return SEM_LEAF; }
+            if prev[i] == SEM_STEM || prev[i] == SEM_BRANCH { prev[i] } else if stem >= branch { SEM_STEM } else { SEM_BRANCH }
         }).collect();
     }
     emit_progress(progress, "leafwood", 0.85);
@@ -16867,9 +17131,9 @@ pub fn run_leaf_wood(
                 let new_sem = if block[o + 18] == 2 {
                     0u8 // ground
                 } else {
-                    let l = label.get(idx).copied().unwrap_or(2u8);
+                    let l = label.get(idx).copied().unwrap_or(SEM_LEAF);
                     idx += 1;
-                    if l == 1 { wood_points += 1; } else { leaf_points += 1; }
+                    if l == SEM_LEAF { leaf_points += 1; } else { wood_points += 1; }
                     l
                 };
                 if block[o + 20] != new_sem { block[o + 20] = new_sem; dirty = true; }
@@ -17365,11 +17629,22 @@ struct TreeAcc {
     /// heights give the stem's AXIS, which is what lets the position be
     /// carried down to the base — see `stem_base`.
     low_band: Vec<(f64, f64)>,
+    /// The same two bands, only the points labelled stem
+    /// (semantic 1) — what the forest pass and the leaf–wood tool say the
+    /// stem is. A spruce's breast-height band is mostly branches.
+    band_stem: Vec<(f64, f64)>,
+    low_band_stem: Vec<(f64, f64)>,
 }
 
 impl TreeAcc {
     fn new() -> Self {
-        TreeAcc { count: 0, sum_x: 0.0, sum_y: 0.0, sum_ground: 0.0, max_hag: f32::NEG_INFINITY, crown_cells: FxHashMap::default(), band: Vec::new(), low_band: Vec::new() }
+        TreeAcc { count: 0, sum_x: 0.0, sum_y: 0.0, sum_ground: 0.0, max_hag: f32::NEG_INFINITY, crown_cells: FxHashMap::default(), band: Vec::new(), low_band: Vec::new(), band_stem: Vec::new(), low_band_stem: Vec::new() }
+    }
+
+    /// The band to fit — its stem points when there are enough
+    /// of them for a circle, else all of it.
+    fn fit_band<'a>(stem: &'a [(f64, f64)], all: &'a [(f64, f64)]) -> &'a [(f64, f64)] {
+        if stem.len() >= 12 { stem } else { all }
     }
 }
 
@@ -17555,6 +17830,26 @@ mod tree_metrics_end_to_end {
 
     fn metrics(plot: &Plot) -> Vec<TreeMetric> {
         run_tree_metrics(&|_| {}, plot.0.to_str().unwrap(), 0.25, 1.2, 1.4, 0.5).unwrap()
+    }
+
+    /// A forest-pass dataset's stems, measured at breast height
+    /// from the full points, are the trees' diameters and positions —
+    /// while the file is as new as the labels.
+    #[test]
+    fn the_forest_pass_stems_are_the_diameters_while_current() {
+        use crate::commands::octree::forest::{write_seeds, SeedJson, SeedsFile};
+        let plot = Plot::new("forest_stems");
+        let trees = [Tree { id: 1, x: 5.0, y: 5.0, dbh: 0.30, height: 18.0, crown_r: 2.5 }];
+        build(&plot, &trees, 120.0, 0.0, 0.0, 10.0);
+        let seed = SeedJson { id: 1, tree: 1, x: 5.01, y: 5.02, z: 120.0, r: 0.1475, lean: [0.0; 2], top: 2.2, circles: 6, source: "circle".into() };
+        write_seeds(&plot.0, &SeedsFile { version: 1, seeds: vec![seed] }).unwrap();
+        let t = &metrics(&plot)[0];
+        assert!((t.dbh - 0.295).abs() < 1e-9 && (t.x - 5.01).abs() < 1e-9 && (t.y - 5.02).abs() < 1e-9, "{} {} {}", t.dbh, t.x, t.y);
+        // labels rewritten after the forest pass: its stems are stale
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(plot.0.join("octree.bin")).unwrap().set_modified(later).unwrap();
+        let t = &metrics(&plot)[0];
+        assert!((t.dbh - 0.30).abs() < 0.01, "{}", t.dbh);
     }
 
     /// Flat ground, one tree, everything known. The diameter is the
@@ -19013,7 +19308,7 @@ mod stem_fit_end_to_end {
         let stems: Vec<Stem> = vec![
             (1, 4.0, 4.0, 0.10, 5.0, 1.0),
             (2, 9.0, 4.0, 0.175, 5.0, 1.0),
-            (3, 4.0, 9.0, 0.25, 5.0, 1.0),
+            (3, 4.0, 9.0, 0.25, 8.0, 1.0), // 8 m: a 0.5 m stem 5 m tall is no tree
         ];
         build(&st, &stems, 13.0);
         let fits = fit(&st, 1.0, 3.0, false);
@@ -19062,6 +19357,235 @@ mod stem_fit_end_to_end {
         assert!(fits.iter().all(|f| f.dbh.is_nan() || f.band_count == 0),
             "a band above the stem produced {:?}",
             fits.iter().map(|f| f.dbh).collect::<Vec<_>>());
+    }
+
+    /// One tree that cannot be fitted must not cost the others their fit.
+    /// A failed fit is written with NaNs, JSON stores NaN as null, and the
+    /// reader refused null — so stems.json became unreadable the moment a
+    /// single tree failed, `metrics trees` stopped on it, and the desktop
+    /// app dropped every refined diameter without a word.
+    #[test]
+    fn a_stems_file_with_a_failed_fit_reads_back() {
+        let st = stand("failed");
+        // Tree 2 is a 2 m "stem": past the 1.5 m radius RANSAC accepts,
+        // so it has a band and no fit.
+        build(&st, &[(1, 4.0, 4.0, 0.15, 5.0, 1.0), (2, 10.0, 10.0, 2.0, 5.0, 1.0)], 14.0);
+        let fits = fit(&st, 1.0, 3.0, false);
+        assert!(fits.iter().any(|f| f.tree_id == 2 && f.dbh.is_nan() && f.band_count > 0),
+            "tree 2 was meant to fail: {:?}", fits.iter().map(|f| (f.tree_id, f.dbh)).collect::<Vec<_>>());
+        let raw = std::fs::read_to_string(st.0.join("stems.json")).unwrap();
+        assert!(raw.contains("null"), "the failed fit was not written as null");
+
+        let back = octree_read_stems(st.0.to_str().unwrap().to_string())
+            .expect("stems.json with a failed fit could not be read").expect("no stems.json");
+        assert_eq!(back.len(), fits.len());
+        for (a, b) in fits.iter().zip(&back) {
+            assert_eq!(a.tree_id, b.tree_id);
+            assert_eq!(a.band_count, b.band_count);
+            assert_eq!(a.inlier_count, b.inlier_count);
+            for (x, y) in [(a.dbh, b.dbh), (a.center_x, b.center_x), (a.center_y, b.center_y), (a.rmse, b.rmse)] {
+                assert!(x == y || (x.is_nan() && y.is_nan()), "tree {}: {x} came back {y}", a.tree_id);
+            }
+        }
+        assert!((back.iter().find(|f| f.tree_id == 1).unwrap().dbh - 0.30).abs() < 0.01,
+            "the tree that fitted lost its diameter");
+    }
+
+    /// A spruce keeps its live branches down to the ground, so its 1–3 m
+    /// band is mostly branch, not stem. On plot 1041 (TLS, 26 positions)
+    /// 404 of 638 fits came back wider than half a metre with 15–21 % of
+    /// the band as inliers: a circle drawn through the branch cloud
+    /// collects more points than the stem does, simply because its
+    /// circumference is longer, and RANSAC kept whichever circle had the
+    /// most. What the branch circle does not have is an empty inside. The
+    /// laser cannot see into wood, so inside a real stem there is nothing;
+    /// inside a circle through branches there are more branches, and the
+    /// stem.
+    #[test]
+    fn branches_around_the_stem_do_not_win_the_fit() {
+        let st = stand("branches");
+        let (sx, sy, r) = (6.0_f64, 6.0_f64, 0.15_f64);
+        // Many positions see the whole stem (TLS plot); one position sees
+        // half of it and nothing in its shadow — behind the stem as seen
+        // from +y, the branches are hidden too. Band points: the bark is
+        // a tenth to a fifth of them.
+        for (arc, label) in [(1.0_f64, "whole stem"), (0.5, "one position")] {
+            let mut pts: Vec<[f64; 3]> = Vec::new();
+            let mut cls: Vec<u8> = Vec::new();
+            let mut ids: Vec<i32> = Vec::new();
+            for i in 0..=60 { for j in 0..=60 {
+                pts.push([i as f64 * 0.2, j as f64 * 0.2, 120.0]); cls.push(2); ids.push(0);
+            } }
+            let mut seed: u64 = 0x2545F4914F6CDD1D;
+            let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 11) as f64 / (1u64 << 53) as f64 };
+            let mut h = 0.5_f64;
+            while h <= 5.0 {
+                let k = (60.0 * arc) as usize;
+                for m in 0..k {
+                    let a = m as f64 * std::f64::consts::TAU * arc / k as f64;
+                    // A few millimetres of range noise on the bark.
+                    let rr = r + 0.004 * (rnd() - 0.5);
+                    pts.push([sx + rr * a.cos(), sy + rr * a.sin(), 120.0 + h]); cls.push(1); ids.push(1);
+                }
+                // Needles and twigs: in the crown's ring, 30 cm out from
+                // the stem to 1.2 m, five to ten times the bark's points.
+                let mut placed = 0;
+                while placed < 300 {
+                    let a = rnd() * std::f64::consts::TAU;
+                    let d = (0.3_f64.powi(2) + rnd() * (1.2_f64.powi(2) - 0.3_f64.powi(2))).sqrt();
+                    let (x, y) = (sx + d * a.cos(), sy + d * a.sin());
+                    if arc < 1.0 && y < sy && (x - sx).abs() < r + 0.02 { continue; }
+                    pts.push([x, y, 120.0 + h]); cls.push(1); ids.push(1);
+                    placed += 1;
+                }
+                h += 0.05;
+            }
+            // Live branches from the bark, in whorls every 35 cm: five per
+            // whorl, drooping as they go out, a point every centimetre.
+            let mut wz = 0.6_f64;
+            while wz <= 4.8 {
+                for _ in 0..5 {
+                    let a = rnd() * std::f64::consts::TAU;
+                    let mut d = r;
+                    while d <= 1.2 {
+                        let (x, y) = (sx + d * a.cos() + 0.01 * (rnd() - 0.5), sy + d * a.sin() + 0.01 * (rnd() - 0.5));
+                        let shadowed = arc < 1.0 && y < sy && (x - sx).abs() < r + 0.02;
+                        if !shadowed { pts.push([x, y, 120.0 + wz - 0.2 * (d - r)]); cls.push(1); ids.push(1); }
+                        d += 0.01;
+                    }
+                }
+                wz += 0.35;
+            }
+            write_plot(&st.0, &pts, &cls, &ids);
+            let fits = fit(&st, 1.0, 3.0, false);
+            assert_eq!(fits.len(), 1);
+            let f = &fits[0];
+            assert!((f.dbh - 0.30).abs() < 0.02,
+                "{label}: DBH {:.3} m against 0.30 m, centre ({:.3}, {:.3}) ({} inliers of {})",
+                f.dbh, f.center_x, f.center_y, f.inlier_count, f.band_count);
+            assert!((f.center_x - sx).hypot(f.center_y - sy) < 0.03,
+                "{label}: centre ({:.3}, {:.3}) against ({sx}, {sy})", f.center_x, f.center_y);
+        }
+    }
+
+    /// A tree's height ignores the stray returns above it: ten noise
+    /// points at 110 m over a 20 m crown of 10 000.
+    #[test]
+    fn tree_height_ignores_a_few_returns_above_the_crown() {
+        let mut bins = vec![0u32; HEIGHT_BINS];
+        for b in bins.iter_mut().take(40) { *b = 250; } // 0–20 m
+        bins[HEIGHT_BINS - 1] = 10; // the noise, clamped to the top bin
+        let h = tree_height_p99(&bins);
+        assert!((19.5..=20.0).contains(&h), "height {h}");
+        assert_eq!(tree_height_p99(&[0u32; HEIGHT_BINS]), 0.0);
+    }
+
+    /// A thin stem among its own branches has too few bark points to
+    /// outvote them. It may go without a fit — the tree keeps its
+    /// algebraic diameter — but it must not be given a circle drawn
+    /// through the branches.
+    #[test]
+    fn a_thin_stem_gets_its_diameter_or_none() {
+        let st = stand("thin");
+        let (sx, sy, r) = (6.0_f64, 6.0_f64, 0.045_f64);
+        let mut pts: Vec<[f64; 3]> = Vec::new();
+        let mut cls: Vec<u8> = Vec::new();
+        let mut ids: Vec<i32> = Vec::new();
+        for i in 0..=60 { for j in 0..=60 {
+            pts.push([i as f64 * 0.2, j as f64 * 0.2, 120.0]); cls.push(2); ids.push(0);
+        } }
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 11) as f64 / (1u64 << 53) as f64 };
+        let mut h = 0.5_f64;
+        while h <= 5.0 {
+            // Seen from one side, a few points across: about what a 2 cm
+            // cloud holds of a 9 cm stem behind its branches.
+            for m in 0..5 {
+                let a = m as f64 * std::f64::consts::PI / 4.0;
+                pts.push([sx + r * a.cos(), sy + r * a.sin(), 120.0 + h]); cls.push(1); ids.push(1);
+            }
+            for _ in 0..400 {
+                let a = rnd() * std::f64::consts::TAU;
+                let d = (0.15_f64.powi(2) + rnd() * (0.9_f64.powi(2) - 0.15_f64.powi(2))).sqrt();
+                pts.push([sx + d * a.cos(), sy + d * a.sin(), 120.0 + h]); cls.push(1); ids.push(1);
+            }
+            h += 0.05;
+        }
+        let mut wz = 0.6_f64;
+        while wz <= 4.8 {
+            for _ in 0..6 {
+                let a = rnd() * std::f64::consts::TAU;
+                let mut d = r;
+                while d <= 0.9 {
+                    pts.push([sx + d * a.cos(), sy + d * a.sin(), 120.0 + wz - 0.2 * (d - r)]); cls.push(1); ids.push(1);
+                    d += 0.01;
+                }
+            }
+            wz += 0.25;
+        }
+        write_plot(&st.0, &pts, &cls, &ids);
+        let f = &fit(&st, 1.0, 3.0, false)[0];
+        assert!(f.dbh.is_nan() || (f.dbh - 0.09).abs() < 0.03,
+            "a 9 cm stem was given {:.3} m ({} inliers of {})", f.dbh, f.inlier_count, f.band_count);
+    }
+
+    /// A leaning stem smears across the band: at 5° its 1–3 m section
+    /// walks 17 cm sideways. Asking the inside of the circle to be empty
+    /// must not turn that smear against the stem's own circle.
+    #[test]
+    fn a_leaning_stem_keeps_its_diameter() {
+        let st = stand("lean");
+        for (lean_deg, arc) in [(0.0_f64, 0.5_f64), (3.0, 0.5), (5.0, 0.5), (8.0, 0.5), (5.0, 1.0)] {
+            let (sx, sy, r) = (6.0_f64, 6.0_f64, 0.15_f64);
+            let mut pts: Vec<[f64; 3]> = Vec::new();
+            let mut cls: Vec<u8> = Vec::new();
+            let mut ids: Vec<i32> = Vec::new();
+            for i in 0..=60 { for j in 0..=60 {
+                pts.push([i as f64 * 0.2, j as f64 * 0.2, 120.0]); cls.push(2); ids.push(0);
+            } }
+            let t = lean_deg.to_radians().tan();
+            let mut h = 0.5_f64;
+            while h <= 5.0 {
+                let cx = sx + (h - 2.0) * t;
+                for m in 0..60 {
+                    let a = m as f64 * std::f64::consts::TAU * arc / 60.0;
+                    pts.push([cx + r * a.cos(), sy + r * a.sin(), 120.0 + h]); cls.push(1); ids.push(1);
+                }
+                h += 0.05;
+            }
+            write_plot(&st.0, &pts, &cls, &ids);
+            let f = &fit(&st, 1.0, 3.0, false)[0];
+            eprintln!("lean {lean_deg}° arc {arc}: DBH {:.3} ({} of {})", f.dbh, f.inlier_count, f.band_count);
+            if std::env::var("BASELINE").is_err() { assert!((f.dbh - 0.30).abs() < 0.03,
+                "lean {lean_deg}°, arc {arc}: DBH {:.3} m against 0.30 m", f.dbh); }
+        }
+    }
+
+    /// qsm.json has the same NaNs to carry: a tree with no slice at
+    /// breast height has no DBH.
+    #[test]
+    fn a_qsm_file_with_a_nan_dbh_reads_back() {
+        let st = stand("qsmnan");
+        std::fs::create_dir_all(&st.0).unwrap();
+        let tree = |tree_id: i32, dbh: f64| TreeQsm {
+            tree_id, base_x: 0.0, base_y: 0.0, base_z: 0.0, height: 12.0,
+            slices: Vec::new(), branches: Vec::new(), branch_volume: 0.0, branch_count: 0,
+            total_volume: 0.1, stem_volume: 0.1, stem_volume_std: 0.01, stem_volume_ci95: 0.02,
+            dbh, confidence: 0.8, completeness: f64::NAN, accepted_slices: 10, rejected_slices: 0,
+            treeqsm: None, cylinder_quality: Vec::new(), notes: Vec::new(), leaf_points: 0,
+        };
+        let body = serde_json::json!({
+            "version": 1, "slice_height": 0.25, "min_points_per_slice": 8,
+            "trees": serde_json::to_value(vec![tree(1, 0.31), tree(2, f64::NAN)]).unwrap(),
+        });
+        std::fs::write(st.0.join("qsm.json"), serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        let q = octree_read_qsm(st.0.to_str().unwrap().to_string())
+            .expect("qsm.json with a NaN DBH could not be read").expect("no qsm.json");
+        assert_eq!(q.trees.len(), 2);
+        assert_eq!(q.trees[0].dbh, 0.31);
+        assert!(q.trees[1].dbh.is_nan());
+        assert!(q.trees[0].completeness.is_nan());
+        assert!((q.total_stem_volume - 0.2).abs() < 1e-12);
     }
 
     /// The band is normalised, so entering it backwards is the band the
@@ -20628,6 +21152,14 @@ mod stem_volume_end_to_end {
         assert_eq!(r.trees.len(), 1);
         let a = r.trees[0].treeqsm.as_ref()
             .expect("the treeqsm method builds a model and must report it");
+        // The trunk's cylinders ride in `branches` (order 0, for
+        // the tubes and the .qsm files) but they are the stem already: a
+        // bare stem has no branch volume, and its total is its stem
+        let t = &r.trees[0];
+        assert!(t.branches.iter().any(|b| b.branch_order == 0), "the trunk's cylinders are listed");
+        assert_eq!(t.branch_volume, 0.0);
+        assert_eq!(t.branch_count, 0);
+        assert!((t.total_volume - t.stem_volume).abs() < 1e-12, "{} against {}", t.total_volume, t.stem_volume);
 
         // The stem is a cone frustum from r = 0.15 to r = 0.05 over
         // 8 m, so every one of these has a closed form to be checked
@@ -21244,9 +21776,11 @@ pub fn run_tree_metrics(
             cur_pos += byte_size as u64;
             for p in 0..num_points {
                 let mut tree_id = i32::from_le_bytes(block[p * point_bytes + 12..p * point_bytes + 16].try_into().unwrap());
-                if let Some(&(p_tree, _s, del)) = patches.get(&(rec_idx as u32, p as u32)) {
+                let mut sem = if point_bytes > 20 { block[p * point_bytes + 20] } else { 0 };
+                if let Some(&(p_tree, p_sem, del)) = patches.get(&(rec_idx as u32, p as u32)) {
                     if del == 1 { continue; }
                     if p_tree >= 0 { tree_id = p_tree; }
+                    if p_sem != 0 { sem = if p_sem == 3 { 0 } else { p_sem }; }
                 }
                 if let Some(&to) = remap.get(&tree_id) { tree_id = to; }
                 if tree_id <= 0 { continue; } // only segmented trees
@@ -21272,9 +21806,11 @@ pub fn run_tree_metrics(
                 acc.crown_cells.insert((cx, cy), ());
                 if hag >= bh_low && hag <= bh_high {
                     acc.band.push((wx, wy));
+                    if sem == 1 { acc.band_stem.push((wx, wy)); }
                 }
                 if hag >= low_lo && hag <= low_hi {
                     acc.low_band.push((wx, wy));
+                    if sem == 1 { acc.low_band_stem.push((wx, wy)); }
                 }
             }
             if n_records > 0 && rec_idx % 256 == 0 {
@@ -21294,10 +21830,10 @@ pub fn run_tree_metrics(
         let crown_area = acc.crown_cells.len() as f64 * ccell * ccell;
         let crown_diameter = 2.0 * (crown_area / std::f64::consts::PI).sqrt();
         // DBH and stem centre from one circle fit to the breast-height band.
-        let fit = fit_stem_circle(&acc.band);
+        let fit = fit_stem_circle(TreeAcc::fit_band(&acc.band_stem, &acc.band));
         let dbh = fit.map(|(_, _, d)| d).unwrap_or(f64::NAN);
         // Carry the position down the stem axis to the base.
-        let low_fit = fit_stem_circle(&acc.low_band);
+        let low_fit = fit_stem_circle(TreeAcc::fit_band(&acc.low_band_stem, &acc.low_band));
         let (base, lean_deg) = stem_base(
             fit.map(|(cx, cy, _)| (cx, cy)), bh_c,
             low_fit.map(|(cx, cy, _)| (cx, cy)), low_c,
@@ -21315,9 +21851,44 @@ pub fn run_tree_metrics(
             crown_area, crown_diameter, x, y, base_z, lean_deg,
         });
     }
+    // A dataset the forest pass segmented has every stem measured
+    // at breast height from the full points; those circles are the trees'
+    // diameters and stem positions (its largest stem's, for a forked tree)
+    if let Some(stems) = forest_stem_circles(dir, &remap) {
+        for t in out.iter_mut() {
+            if let Some(&(d, x, y)) = stems.get(&t.tree_id) {
+                t.dbh = d;
+                t.basal_area = std::f64::consts::PI * (d * 0.5).powi(2);
+                t.x = x;
+                t.y = y;
+                if let Some(g) = dtm.sample(x, y) { t.base_z = g as f64; }
+            }
+        }
+    }
     out.sort_by_key(|t| t.tree_id);
     progress(1.0);
     Ok(out)
+}
+
+/// The forest pass's stems by tree — (diameter, base x, base y),
+/// world coordinates, the largest measured stem of each tree — when
+/// forest/seeds.json is there and no older than the labels in octree.bin
+/// (a later pass that rewrote them makes the file stale).
+fn forest_stem_circles(dir: &Path, remap: &FxHashMap<i32, i32>) -> Option<FxHashMap<i32, (f64, f64, f64)>> {
+    let seeds_path = forest::forest_dir(dir).join("seeds.json");
+    let seeds_time = std::fs::metadata(&seeds_path).and_then(|m| m.modified()).ok()?;
+    let labels_time = std::fs::metadata(dir.join("octree.bin")).and_then(|m| m.modified()).ok()?;
+    if seeds_time + std::time::Duration::from_secs(2) < labels_time { return None; }
+    let file = forest::read_seeds(dir).ok()??;
+    let mut by: FxHashMap<i32, (f64, f64, f64)> = FxHashMap::default();
+    for s in &file.seeds {
+        if s.r <= 0.0 { continue; }
+        let mut t = s.tree as i32;
+        if let Some(&to) = remap.get(&t) { t = to; }
+        let e = by.entry(t).or_insert((0.0, s.x, s.y));
+        if 2.0 * s.r > e.0 { *e = (2.0 * s.r, s.x, s.y); }
+    }
+    Some(by)
 }
 
 /// Algebraic circle fit to the breast-height band → (centre x, centre y,
@@ -21341,7 +21912,22 @@ fn fit_stem_circle(pts: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
     // carbon. Measured on a clean 30 cm stem: one branch 0.35 m out read
     // 0.39 m (+31 %, so +72 % of basal area), a six-point understorey
     // clump 0.62 m (+106 %). With the strays dropped, all of them 0.30 m.
-    let (cx, cy, r, _, _) = robust_circle_fit(pts)?;
+    //
+    // First the forest pass's trimmed fit, which looks for the
+    // circle most points lie on with none inside it (a stem is hollow, a
+    // branch whorl round it is not) and refits on its own points. The
+    // median-centred rejection below reads a spruce's band — branches all
+    // round a stem a fifth of their spread — as one wide circle: on plot
+    // 1041 the forest trees averaged 65 cm.
+    let trimmed = if pts.len() >= 8 {
+        crate::commands::forest::stems::trimmed_circle_n(pts, 0.015, 400, true)
+            .filter(|(_, _, _, inl)| inl.len() >= 8)
+            .map(|(cx, cy, r, _)| (cx, cy, r))
+    } else { None };
+    let (cx, cy, r) = match trimmed {
+        Some(c) => c,
+        None => { let (cx, cy, r, _, _) = robust_circle_fit(pts)?; (cx, cy, r) }
+    };
     // Plausible stem radius 1 cm .. 1.5 m; otherwise the band was noise.
     if !(0.01..=1.5).contains(&r) { return None; }
     // A circle through a stem cross-section has its centre within about a
@@ -21517,10 +22103,13 @@ pub fn run_fit_stems(
     let dtm = build_dtm_grid(dir, dtm_cell)?;
     progress(0.10);
 
-    // Per-tree stem-band points (XY only — the optional semantic write
-    // re-streams and re-tests inlier membership geometrically).
-    struct BandPt { x: f64, y: f64 }
+    // Per-tree stem-band points, XY and height above ground (the optional
+    // semantic write re-streams and re-tests inlier membership against the
+    // fitted axis).
     let mut bands: FxHashMap<i32, Vec<BandPt>> = FxHashMap::default();
+    // Per-tree heights above ground in half-metre bins, for the tree's
+    // height (see `tree_height_p99`).
+    let mut heights: FxHashMap<i32, Vec<u32>> = FxHashMap::default();
     {
         let mut bin = BufReader::with_capacity(4 * 1024 * 1024,
             File::open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin: {e}"))?);
@@ -21553,8 +22142,10 @@ pub fn run_fit_stems(
                 let wz = zi as f64 * scale[2] + offset[2];
                 let ground = match dtm.sample(wx, wy) { Some(g) => g as f64, None => continue };
                 let hag = wz - ground;
+                let bin = ((hag.max(0.0) / HEIGHT_BIN) as usize).min(HEIGHT_BINS - 1);
+                heights.entry(tree_id).or_insert_with(|| vec![0; HEIGHT_BINS])[bin] += 1;
                 if hag < band_low || hag > band_high { continue; }
-                bands.entry(tree_id).or_default().push(BandPt { x: wx, y: wy });
+                bands.entry(tree_id).or_default().push(BandPt { x: wx, y: wy, h: hag });
             }
             if n_records > 0 && rec_idx % 256 == 0 {
                 if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
@@ -21564,73 +22155,42 @@ pub fn run_fit_stems(
     }
     progress(0.7);
 
-    // Per-tree RANSAC in parallel. Each tree gets its own deterministic PRNG
-    // seeded from tree_id so re-runs reproduce the same fit.
+    // Per-tree fits in parallel: thin slices, an axis through them, and
+    // the circle of that axis at breast height (see fit_stem_axis).
+    let breast = 1.3_f64.clamp(band_low, band_high);
     let tree_keys: Vec<i32> = bands.keys().copied().collect();
-    let fits: Vec<StemFit> = tree_keys.par_iter().map(|&tid| {
+    let fitted: Vec<(StemFit, Option<StemAxis>)> = tree_keys.par_iter().map(|&tid| {
         let pts = bands.get(&tid).unwrap();
         let n = pts.len() as u64;
-        if (n as u32) < min_in {
-            return StemFit { tree_id: tid, dbh: f64::NAN, center_x: f64::NAN, center_y: f64::NAN,
-                             inlier_count: 0, band_count: n, rmse: f64::NAN, written_stem_points: 0 };
-        }
-        let mut rng_state = (tid as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEFu64;
-        let mut next_u32 = || -> u32 {
-            // xorshift64 → mix → u32
-            let mut s = rng_state;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            rng_state = s;
-            (s >> 32) as u32
-        };
-        let m = pts.len();
-        let mut best_inliers: Vec<usize> = Vec::new();
-        let mut best_cx = 0.0; let mut best_cy = 0.0; let mut best_r = 0.0;
-        for _ in 0..iters {
-            // Pick 3 distinct samples.
-            let i0 = (next_u32() as usize) % m;
-            let mut i1 = (next_u32() as usize) % m; if i1 == i0 { i1 = (i1 + 1) % m; }
-            let mut i2 = (next_u32() as usize) % m; while i2 == i0 || i2 == i1 { i2 = (i2 + 1) % m; }
-            let p0 = &pts[i0]; let p1 = &pts[i1]; let p2 = &pts[i2];
-            let (cx, cy, r) = match circle_from_three(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y) {
-                Some(t) => t, None => continue,
-            };
-            // Reject implausible stem radii (0.5 cm .. 1.5 m).
-            if !(0.005..=1.5).contains(&r) { continue; }
-            // Count inliers within radial tolerance.
-            let mut inliers: Vec<usize> = Vec::new();
-            for (k, p) in pts.iter().enumerate() {
-                let d = ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt();
-                if (d - r).abs() <= tol { inliers.push(k); }
-            }
-            if inliers.len() > best_inliers.len() {
-                best_inliers = inliers;
-                best_cx = cx; best_cy = cy; best_r = r;
-            }
-        }
-        if (best_inliers.len() as u32) < min_in {
-            return StemFit { tree_id: tid, dbh: f64::NAN, center_x: f64::NAN, center_y: f64::NAN,
-                             inlier_count: 0, band_count: n, rmse: f64::NAN, written_stem_points: 0 };
-        }
-        // Refit on the inlier set for a tighter circle, but only if that
-        // fit is plausible — otherwise keep the RANSAC estimate.
-        let inlier_xy: Vec<(f64, f64)> = best_inliers.iter().map(|&k| (pts[k].x, pts[k].y)).collect();
-        let refit_d = fit_stem_circle(&inlier_xy).map(|(_, _, d)| d).unwrap_or(f64::NAN);
-        let (cx, cy, r) = if refit_d.is_finite() {
-            let (cxr, cyr, rr) = refit_circle_center(&inlier_xy).unwrap_or((best_cx, best_cy, best_r));
-            (cxr, cyr, rr)
-        } else { (best_cx, best_cy, best_r) };
-        let dbh = 2.0 * r;
-        // RMSE of inlier radial residuals.
+        let failed = (StemFit { tree_id: tid, dbh: f64::NAN, center_x: f64::NAN, center_y: f64::NAN,
+                                inlier_count: 0, band_count: n, rmse: f64::NAN, written_stem_points: 0 }, None);
+        let Some(axis) = fit_stem_axis(pts, band_low, band_high, tol, iters, min_in,
+                                       (tid as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEFu64) else { return failed };
+        // Inliers and RMSE against the final model, over the whole band —
+        // the same test the semantic write below applies point by point.
+        let mut inliers = 0u64;
         let mut sq = 0f64;
-        for &k in &best_inliers {
-            let d = ((pts[k].x - cx).powi(2) + (pts[k].y - cy).powi(2)).sqrt();
-            sq += (d - r).powi(2);
+        for p in pts {
+            let e = axis.residual(p.x, p.y, p.h);
+            if e.abs() <= tol { inliers += 1; sq += e * e; }
         }
-        let rmse = (sq / best_inliers.len() as f64).sqrt();
-        StemFit { tree_id: tid, dbh, center_x: cx, center_y: cy,
-                  inlier_count: best_inliers.len() as u64, band_count: n,
-                  rmse, written_stem_points: 0 }
+        if (inliers as u32) < min_in { return failed; }
+        let (cx, cy, r) = axis.at(breast);
+        // A tree is at least fifteen times as tall as it is thick at
+        // breast height; even an open-grown veteran is past twenty. A
+        // diameter beyond that is a circle through a shrub's crown, which
+        // is what most of the wide fits left on plot 1041 were (a 2.4 m
+        // median height). A broken-topped snag can fall foul of this, and
+        // keeps its algebraic diameter.
+        let height = heights.get(&tid).map(|h| tree_height_p99(h)).unwrap_or(f64::INFINITY);
+        if 2.0 * r * 15.0 > height { return failed; }
+        (StemFit { tree_id: tid, dbh: 2.0 * r, center_x: cx, center_y: cy,
+                   inlier_count: inliers, band_count: n,
+                   rmse: (sq / inliers as f64).sqrt(), written_stem_points: 0 }, Some(axis))
     }).collect();
+    let axes: FxHashMap<i32, StemAxis> = fitted.iter()
+        .filter_map(|(f, a)| a.map(|a| (f.tree_id, a))).collect();
+    let fits: Vec<StemFit> = fitted.into_iter().map(|(f, _)| f).collect();
     progress(0.9);
 
     // Optional: write semantic=1 for inlier points (those inside the
@@ -21638,10 +22198,7 @@ pub fn run_fit_stems(
     let mut out = fits;
     if write_semantic {
         // Index successful fits by tree_id for the rewrite pass.
-        let fit_map: FxHashMap<i32, (f64, f64, f64)> = out.iter()
-            .filter(|f| f.dbh.is_finite())
-            .map(|f| (f.tree_id, (f.center_x, f.center_y, f.dbh * 0.5)))
-            .collect();
+        let fit_map = &axes;
         let mut written_per_tree: FxHashMap<i32, u64> = FxHashMap::default();
         let mut file = OpenOptions::new().read(true).write(true)
             .open(dir.join("octree.bin")).map_err(|e| format!("open octree.bin rw: {e}"))?;
@@ -21664,7 +22221,7 @@ pub fn run_fit_stems(
                 }
                 if let Some(&to) = remap.get(&tree_id) { tree_id = to; }
                 if tree_id <= 0 { continue; }
-                let &(cx, cy, r) = match fit_map.get(&tree_id) { Some(f) => f, None => continue };
+                let axis = match fit_map.get(&tree_id) { Some(a) => a, None => continue };
                 let o = p * point_bytes;
                 let xi = i32::from_le_bytes(block[o..o + 4].try_into().unwrap());
                 let yi = i32::from_le_bytes(block[o + 4..o + 8].try_into().unwrap());
@@ -21675,8 +22232,7 @@ pub fn run_fit_stems(
                 let ground = match dtm.sample(wx, wy) { Some(g) => g as f64, None => continue };
                 let hag = wz - ground;
                 if hag < band_low || hag > band_high { continue; }
-                let d = ((wx - cx).powi(2) + (wy - cy).powi(2)).sqrt();
-                if (d - r).abs() <= tol {
+                if axis.residual(wx, wy, hag).abs() <= tol {
                     let sem_o = o + 20;
                     if block[sem_o] != 1 { block[sem_o] = 1; dirty = true; }
                     *written_per_tree.entry(tree_id).or_insert(0) += 1;
@@ -21748,10 +22304,263 @@ pub fn octree_read_stems(octree_dir: String) -> Result<Option<Vec<StemFit>>, Str
     let bytes = std::fs::read(&path).map_err(|e| format!("read stems.json: {e}"))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse stems.json: {e}"))?;
-    let fits: Vec<StemFit> = serde_json::from_value(
+    // A tree whose fit failed was written with NaNs, which JSON stores as
+    // null — see commands/nanjson.rs.
+    let fits: Vec<StemFit> = super::nanjson::from_value(
         v.get("fits").cloned().unwrap_or(serde_json::Value::Array(vec![])),
     ).map_err(|e| format!("decode fits: {e}"))?;
     Ok(Some(fits))
+}
+
+/// Height bins for the stem fit's tree heights: half a metre up to 80 m.
+const HEIGHT_BIN: f64 = 0.5;
+const HEIGHT_BINS: usize = 160;
+
+/// A tree's height above ground as the 99th percentile of its points' —
+/// a bird or a noise return above the crown is one of a hundred thousand
+/// points and does not make a 20 m spruce 110 m tall.
+fn tree_height_p99(bins: &[u32]) -> f64 {
+    let total: u64 = bins.iter().map(|&c| c as u64).sum();
+    if total == 0 { return 0.0; }
+    let want = (total as f64 * 0.99).ceil() as u64;
+    let mut seen = 0u64;
+    for (i, &c) in bins.iter().enumerate() {
+        seen += c as u64;
+        if seen >= want { return (i + 1) as f64 * HEIGHT_BIN; }
+    }
+    bins.len() as f64 * HEIGHT_BIN
+}
+
+/// A stem-band point: world XY and height above ground.
+struct BandPt { x: f64, y: f64, h: f64 }
+
+/// The stem through the band: a straight axis and a radius, both linear
+/// in height above ground, read only inside the heights the slices that
+/// made it cover.
+#[derive(Clone, Copy, Debug)]
+struct StemAxis { cx0: f64, cxh: f64, cy0: f64, cyh: f64, r0: f64, rh: f64, h_lo: f64, h_hi: f64 }
+
+impl StemAxis {
+    /// Centre and radius at height `h`, held at the end slices beyond them.
+    fn at(&self, h: f64) -> (f64, f64, f64) {
+        let h = h.clamp(self.h_lo, self.h_hi);
+        (self.cx0 + self.cxh * h, self.cy0 + self.cyh * h, self.r0 + self.rh * h)
+    }
+    /// Signed radial distance of a point from the stem surface at its height.
+    fn residual(&self, x: f64, y: f64, h: f64) -> f64 {
+        let (cx, cy, r) = self.at(h);
+        (x - cx).hypot(y - cy) - r
+    }
+}
+
+/// Least-squares line `a + b·t`; None for fewer than two distinct t.
+fn line_fit(ts: &[f64], vs: &[f64]) -> Option<(f64, f64)> {
+    let n = ts.len() as f64;
+    if ts.len() < 2 { return None; }
+    let (mt, mv) = (ts.iter().sum::<f64>() / n, vs.iter().sum::<f64>() / n);
+    let stt: f64 = ts.iter().map(|t| (t - mt) * (t - mt)).sum();
+    if stt < 1e-12 { return None; }
+    let b = ts.iter().zip(vs).map(|(t, v)| (t - mt) * (v - mv)).sum::<f64>() / stt;
+    Some((mv - b * mt, b))
+}
+
+/// One RANSAC circle in the plane, scored as a stem and not as a ring.
+///
+/// Counting inliers alone rewards circumference: through a cloud of
+/// branches a circle a metre across collects more points than the stem
+/// does, and on plot 1041 that is what most fits did. A stem differs from
+/// a ring drawn through branches in two ways, and the score uses both:
+///
+/// - its inside is empty, because the laser does not see into wood, so
+///   every point well inside the circle (more than two tolerances in from
+///   the inlier shell — two rather than one leaves the stem its range
+///   noise) counts against it;
+/// - its surface is thin: bark lies within the range noise of the circle,
+///   branch points fill the whole tolerance band. Each inlier counts
+///   `1 − (e/tol)²` (MSAC) rather than 1, so a shell of points right on
+///   the circle outweighs a band of points merely near it.
+fn ransac_stem_circle(pts: &[(f64, f64)], iters: u32, tol: f64, min_in: u32, seed: u64) -> Option<(f64, f64, f64)> {
+    let m = pts.len();
+    if m < 3 || (m as u32) < min_in { return None; }
+    let mut rng_state = seed | 1;
+    let mut next_u32 = || -> u32 {
+        // xorshift64 → mix → u32
+        let mut s = rng_state;
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        rng_state = s;
+        (s >> 32) as u32
+    };
+    // (score, inliers, points well inside)
+    let score_of = |set: &mut dyn Iterator<Item = &(f64, f64)>, cx: f64, cy: f64, r: f64| -> (f64, usize, usize) {
+        let inner = r - 2.0 * tol;
+        let (mut n_in, mut n_inside, mut score) = (0usize, 0usize, 0f64);
+        for p in set {
+            let d = (p.0 - cx).hypot(p.1 - cy);
+            let e = (d - r) / tol;
+            if e.abs() <= 1.0 { n_in += 1; score += 1.0 - e * e; } else if d < inner { n_inside += 1; score -= 1.0; }
+        }
+        (score, n_in, n_inside)
+    };
+    // Sampling. Three points drawn from the whole band all land on the
+    // stem with probability (stem share)³ — 1e-4 when branches outnumber
+    // the bark twenty to one, so 600 draws would most likely never try the
+    // stem at all. The stem is compact, so the second and third points are
+    // drawn near the first (NAPSAC), at a few scales so thin and thick
+    // stems both have one that fits; a quarter of the draws stay global.
+    let mut by_x: Vec<u32> = (0..m as u32).collect();
+    by_x.sort_by(|&a, &b| pts[a as usize].0.total_cmp(&pts[b as usize].0));
+    let xs: Vec<f64> = by_x.iter().map(|&i| pts[i as usize].0).collect();
+    // Many hypotheses are scored cheaply on a fixed subsample, and only
+    // the best few on every point: four times the draws for the same work.
+    let sub: Vec<(f64, f64)> = if m <= 400 { pts.to_vec() } else {
+        (0..400).map(|_| pts[(next_u32() as usize) % m]).collect()
+    };
+    let hyps = (iters as usize) * 4;
+    let mut cand: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(hyps); // (pre-score, cx, cy, r)
+    for it in 0..hyps {
+        let i0 = (next_u32() as usize) % m;
+        let reach = [f64::INFINITY, 0.2, 0.4, 0.8][it % 4];
+        let near = |next_u32: &mut dyn FnMut() -> u32, avoid: &[usize]| -> usize {
+            if reach.is_finite() {
+                let (x0, y0) = pts[i0];
+                let lo = xs.partition_point(|&x| x < x0 - reach);
+                let hi = xs.partition_point(|&x| x <= x0 + reach);
+                if hi > lo + 2 {
+                    for _ in 0..16 {
+                        let j = by_x[lo + (next_u32() as usize) % (hi - lo)] as usize;
+                        if !avoid.contains(&j) && (pts[j].1 - y0).abs() <= reach { return j; }
+                    }
+                }
+            }
+            let mut j = (next_u32() as usize) % m;
+            while avoid.contains(&j) { j = (j + 1) % m; }
+            j
+        };
+        let i1 = near(&mut next_u32, &[i0]);
+        let i2 = near(&mut next_u32, &[i0, i1]);
+        let (p0, p1, p2) = (pts[i0], pts[i1], pts[i2]);
+        let Some((cx, cy, r)) = circle_from_three(p0.0, p0.1, p1.0, p1.1, p2.0, p2.1) else { continue };
+        // Reject implausible stem radii (0.5 cm .. 1.5 m).
+        if !(0.005..=1.5).contains(&r) { continue; }
+        let (pre, _, _) = score_of(&mut sub.iter(), cx, cy, r);
+        cand.push((pre, cx, cy, r));
+    }
+    cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // (score, inliers, inside, cx, cy, r)
+    let mut best: Option<(f64, usize, usize, f64, f64, f64)> = None;
+    for &(_, cx, cy, r) in cand.iter().take(24) {
+        let (score, n_in, n_inside) = score_of(&mut pts.iter(), cx, cy, r);
+        if best.map_or(true, |b| score > b.0) { best = Some((score, n_in, n_inside, cx, cy, r)); }
+    }
+    let (_, n_in, n_inside, cx, cy, r) = best?;
+    if (n_in as u32) < min_in { return None; }
+    // The best circle is still not a stem when its inside is not empty.
+    // On plot 1041 that was the thin understorey spruce: too few bark
+    // points for any slice to find the stem, and the winning circle held
+    // the stem and its branches inside it — 0.6–2.6 m for a 6–24 cm tree.
+    // No fit leaves the tree its algebraic diameter, which is the honest
+    // answer here.
+    if 2 * n_inside > n_in { return None; }
+    // Refit on the inlier set for a tighter circle, but only if that fit
+    // is plausible and stays on the circle RANSAC found.
+    let inl: Vec<(f64, f64)> = pts.iter().copied()
+        .filter(|p| ((p.0 - cx).hypot(p.1 - cy) - r).abs() <= tol).collect();
+    if fit_stem_circle(&inl).map(|(_, _, d)| d).unwrap_or(f64::NAN).is_finite() {
+        if let Some(t) = refit_circle_center(&inl) {
+            if t.2.is_finite() && (t.2 - r).abs() <= tol && (t.0 - cx).hypot(t.1 - cy) <= tol { return Some(t); }
+        }
+    }
+    Some((cx, cy, r))
+}
+
+/// Slice thickness for the stem fit, metres. Thin enough that a stem
+/// leaning 8° moves about the 3 cm inlier tolerance across one.
+const STEM_SLICE: f64 = 0.25;
+
+/// The stem through a band of points: a circle per thin slice, then a
+/// straight axis and a linear taper through the slices that agree.
+///
+/// One vertical circle over the whole 1–3 m band was the model before,
+/// and a stem is not vertical: leaning 5° it walks 17 cm across that
+/// band, and on the half circumference one scan position sees, the circle
+/// that best covered the smear was the wider one — 0.54 m for a 0.30 m
+/// stem. Slices see the lean as a moving centre instead.
+///
+/// None when the slices had points but too few of them (under 30 %, or
+/// under two) agree on a stem. The single band-wide circle is the fallback
+/// only for a band too sparse to slice — fewer than two slices with points
+/// enough to fit.
+fn fit_stem_axis(pts: &[BandPt], band_low: f64, band_high: f64, tol: f64, iters: u32, min_in: u32, seed: u64) -> Option<StemAxis> {
+    let n_sl = ((band_high - band_low) / STEM_SLICE).round().max(1.0) as usize;
+    let dz = (band_high - band_low) / n_sl as f64;
+    let mut per: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n_sl];
+    for p in pts {
+        let k = (((p.h - band_low) / dz).floor().max(0.0) as usize).min(n_sl - 1);
+        per[k].push((p.x, p.y));
+    }
+    // (mid height, cx, cy, r) per slice that fitted.
+    let mut slices: Vec<(f64, f64, f64, f64)> = Vec::new();
+    // Slices with points enough to fit at all.
+    let with_data = if n_sl > 1 { per.iter().filter(|sp| sp.len() as u32 >= min_in).count() } else { 0 };
+    if n_sl > 1 {
+        for (k, sp) in per.iter().enumerate() {
+            let s = seed ^ ((k as u64 + 1).wrapping_mul(0xD1B54A32D192ED03));
+            if let Some((cx, cy, r)) = ransac_stem_circle(sp, iters, tol, min_in, s) {
+                slices.push((band_low + (k as f64 + 0.5) * dz, cx, cy, r));
+            }
+        }
+    }
+    if slices.len() >= 2 {
+        // Keep the slices that agree on the radius: a slice where a branch
+        // whorl or a neighbour won is the odd one out.
+        let mut rs: Vec<f64> = slices.iter().map(|s| s.3).collect();
+        rs.sort_by(|a, b| a.total_cmp(b));
+        let r_med = rs[rs.len() / 2];
+        let r_tol = (2.0 * tol).max(0.2 * r_med);
+        slices.retain(|s| (s.3 - r_med).abs() <= r_tol);
+        // …and on the axis: drop centres off the line through the rest.
+        for _ in 0..2 {
+            if slices.len() < 3 { break; }
+            let hs: Vec<f64> = slices.iter().map(|s| s.0).collect();
+            let xs: Vec<f64> = slices.iter().map(|s| s.1).collect();
+            let ys: Vec<f64> = slices.iter().map(|s| s.2).collect();
+            let (Some((ax, bx)), Some((ay, by))) = (line_fit(&hs, &xs), line_fit(&hs, &ys)) else { break };
+            let lim = (2.0 * tol).max(0.5 * r_med);
+            let before = slices.len();
+            slices.retain(|s| (s.1 - (ax + bx * s.0)).hypot(s.2 - (ay + by * s.0)) <= lim);
+            if slices.len() == before { break; }
+        }
+    }
+    // A stem is in most of the band. Two slices agreeing by chance out of
+    // eight that had points is a coincidence among branches, not a stem.
+    let needed = 2.max((with_data as f64 * 0.3).ceil() as usize);
+    if slices.len() >= needed {
+        let hs: Vec<f64> = slices.iter().map(|s| s.0).collect();
+        let xs: Vec<f64> = slices.iter().map(|s| s.1).collect();
+        let ys: Vec<f64> = slices.iter().map(|s| s.2).collect();
+        let rv: Vec<f64> = slices.iter().map(|s| s.3).collect();
+        let (cx0, cxh) = line_fit(&hs, &xs)?;
+        let (cy0, cyh) = line_fit(&hs, &ys)?;
+        // Taper from the slices when there are enough of them to say so
+        // and it is a taper a stem can have; otherwise one radius.
+        let r_mean = rv.iter().sum::<f64>() / rv.len() as f64;
+        let (r0, rh) = match line_fit(&hs, &rv) {
+            Some((a, b)) if slices.len() >= 3 && b.abs() <= 0.03 => (a, b),
+            _ => (r_mean, 0.0),
+        };
+        let (h_lo, h_hi) = hs.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &h| (lo.min(h), hi.max(h)));
+        // A stem leaning more than 45° is not a standing stem.
+        if cxh.hypot(cyh) > 1.0 { return None; }
+        return Some(StemAxis { cx0, cxh, cy0, cyh, r0, rh, h_lo, h_hi });
+    }
+    // The slices had the points and found no stem they agree on: there is
+    // none to find here, and one circle over the whole band would be the
+    // old fit through the branches. Only a band too sparse to slice gets
+    // that one vertical circle.
+    if with_data >= 2 { return None; }
+    let all: Vec<(f64, f64)> = pts.iter().map(|p| (p.x, p.y)).collect();
+    let (cx, cy, r) = ransac_stem_circle(&all, iters, tol, min_in, seed)?;
+    Some(StemAxis { cx0: cx, cxh: 0.0, cy0: cy, cyh: 0.0, r0: r, rh: 0.0, h_lo: band_low, h_hi: band_high })
 }
 
 /// Circumscribed circle of three points in 2D. Returns None when the
@@ -22153,6 +22962,97 @@ pub struct TreeQsm {
     /// method, which is the only one that builds a model to measure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub treeqsm: Option<crate::commands::treeqsm::QsmAttributes>,
+    /// How each branch cylinder came about, parallel to
+    /// `branches` — CYL_ADDED, CYL_CORRECTED, CYL_PARTIAL, CYL_MEASURED.
+    #[serde(default)]
+    pub cylinder_quality: Vec<u8>,
+    /// What the fit has to say about this tree, coded.
+    #[serde(default)]
+    pub notes: Vec<QsmNote>,
+    /// Points labelled leaf (semantic 4) left out of the model.
+    #[serde(default)]
+    pub leaf_points: u64,
+}
+
+/// A cylinder bridging a gap, not fitted to points (TreeQSM's
+/// `added`).
+pub const CYL_ADDED: u8 = 1;
+/// Fitted, then its radius moved more than 15 % by the parent / taper
+/// corrections.
+pub const CYL_CORRECTED: u8 = 2;
+/// Fitted to points seen round less than half of it.
+pub const CYL_PARTIAL: u8 = 3;
+/// Fitted to points seen round, and kept as fitted.
+pub const CYL_MEASURED: u8 = 4;
+
+/// How a branch cylinder came about.
+pub fn cylinder_quality(c: &BranchCylinder) -> u8 {
+    if c.added { return CYL_ADDED; }
+    if c.unmod_radius > 0.0 && (c.radius - c.unmod_radius).abs() > 0.15 * c.unmod_radius { return CYL_CORRECTED; }
+    if c.coverage < 0.5 { return CYL_PARTIAL; }
+    CYL_MEASURED
+}
+
+/// One thing the QSM fit has to say about a tree. `code` is
+/// stable (the QC panel and the command line key on it); warnings become
+/// QC flags, info stays in the tree's log.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QsmNote {
+    pub code: String,
+    /// "info" or "warning".
+    pub severity: String,
+    pub text: String,
+    pub hint: String,
+}
+
+/// The notes of one fitted tree.
+pub fn qsm_notes(height: f64, dbh: f64, slices: &[QsmSlice], branches: &[BranchCylinder], quality: &[u8], leaf_points: u64) -> Vec<QsmNote> {
+    let note = |code: &str, severity: &str, text: String, hint: &str| QsmNote {
+        code: code.into(), severity: severity.into(), text, hint: hint.into(),
+    };
+    let mut out = Vec::new();
+    if leaf_points > 0 {
+        out.push(note("leaves-out", "info", format!("{leaf_points} leaf points left out: the model is of the wood"),
+            "Leaves are labelled 4 by the forest pass or the leaf / wood separation."));
+    }
+    if height < 3.0 {
+        out.push(note("sapling", "info", format!("{height:.1} m tall: modelled roughly"), "Small trees carry little volume; their model is a sketch."));
+    }
+    if !dbh.is_finite() {
+        out.push(note("no-breast-height", "info", "No stem fitted at 1.3 m".into(), "DBH comes from the metrics pass instead."));
+    }
+    // the stem thickening upward: a branch or a neighbour in a slice fit
+    let mut sorted: Vec<&QsmSlice> = slices.iter().filter(|s| s.radius.is_finite() && s.radius > 0.0).collect();
+    sorted.sort_by(|a, b| a.hag.partial_cmp(&b.hag).unwrap_or(std::cmp::Ordering::Equal));
+    for (k, s) in sorted.iter().enumerate() {
+        let below: Vec<f64> = sorted[..k].iter().filter(|b| s.hag - b.hag >= 0.75 && s.hag - b.hag <= 2.5).map(|b| b.radius).collect();
+        if below.len() < 2 { continue; }
+        let mut b = below.clone();
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let med = b[b.len() / 2];
+        // calibrated on plot 1041's TreeQSM trunks: 1.8× and 5 cm flag
+        // about one tree in ten, where looser bars caught most
+        if med >= 0.03 && s.radius > 1.8 * med && s.radius - med > 0.05 {
+            out.push(note("taper-reversal", "warning",
+                format!("The stem thickens at {:.1} m ({:.1} → {:.1} cm across)", s.hag, med * 200.0, s.radius * 200.0),
+                "A branch whorl, a neighbouring stem or noise in that slice's fit. Check the taper and the segmentation there."));
+            break;
+        }
+    }
+    // branch volume in gap bridges (TreeQSM adjusts most radii — that is
+    // its normal working, not a fault — but a bridge has no points at all).
+    // The trunk is left out: in TreeQSM mode it rides in `branches` too.
+    let total: f64 = branches.iter().filter(|b| b.branch_order > 0).map(|b| b.volume).sum();
+    if total > 0.01 && quality.len() == branches.len() {
+        let bridged: f64 = branches.iter().zip(quality).filter(|(b, &q)| b.branch_order > 0 && q == CYL_ADDED).map(|(b, _)| b.volume).sum();
+        if bridged > 0.3 * total {
+            out.push(note("gap-bridged", "warning",
+                format!("{:.0} % of the branch volume is in cylinders bridging gaps, with no points on them", 100.0 * bridged / total),
+                "Occlusion in the crown, or branches of a neighbour in the tree: the branch volume is a guess there. Check the crown and the segmentation."));
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Clone)]
@@ -22170,6 +23070,8 @@ pub struct QsmResult {
     /// Parameters the run used (slice height etc.) for traceability.
     pub slice_height: f64,
     pub min_points_per_slice: u32,
+    /// Leaf points left out across the trees.
+    pub leaf_points: u64,
 }
 
 #[cfg(feature = "gui")]
@@ -22275,13 +23177,16 @@ pub fn run_tree_qsm(
         sum_ground: f64,
         count: u64,
         max_hag: f32,
+        /// Leaf-labelled points, counted toward the height and
+        /// left out of the model.
+        leaves: u64,
     }
     impl TreeBin {
         fn new() -> Self { Self {
             slices: FxHashMap::default(),
             voxels: FxHashMap::default(),
             treeqsm_points: Vec::new(),
-            sum_x: 0.0, sum_y: 0.0, sum_ground: 0.0, count: 0, max_hag: f32::NEG_INFINITY,
+            sum_x: 0.0, sum_y: 0.0, sum_ground: 0.0, count: 0, max_hag: f32::NEG_INFINITY, leaves: 0,
         } }
     }
     let mut trees: FxHashMap<i32, TreeBin> = FxHashMap::default();
@@ -22304,9 +23209,12 @@ pub fn run_tree_qsm(
             cur_pos += byte_size as u64;
             for p in 0..num_points {
                 let mut tree_id = i32::from_le_bytes(block[p * point_bytes + 12..p * point_bytes + 16].try_into().unwrap());
-                if let Some(&(p_tree, _s, del)) = patches.get(&(rec_idx as u32, p as u32)) {
+                // The semantic label, for leaving leaves out
+                let mut sem = if point_bytes >= 21 { block[p * point_bytes + 20] } else { 0 };
+                if let Some(&(p_tree, p_sem, del)) = patches.get(&(rec_idx as u32, p as u32)) {
                     if del == 1 { continue; }
                     if p_tree >= 0 { tree_id = p_tree; }
+                    if p_sem != 0 { sem = if p_sem == 3 { 0 } else { p_sem }; }
                 }
                 if let Some(&to) = remap.get(&tree_id) { tree_id = to; }
                 if tree_id <= 0 { continue; }
@@ -22328,6 +23236,8 @@ pub fn run_tree_qsm(
                 bin_e.sum_y += wy;
                 bin_e.sum_ground += ground;
                 if (hag as f32) > bin_e.max_hag { bin_e.max_hag = hag as f32; }
+                // A leaf counts toward the height, not the model
+                if sem == SEM_LEAF { bin_e.leaves += 1; continue; }
                 // Slice index from hag — negative is allowed for the
                 // bottom buffer but we won't fit on slices < 0.
                 let si = (hag / slice).floor() as i32;
@@ -22355,31 +23265,26 @@ pub fn run_tree_qsm(
     }
     progress(0.70);
 
-    // Per-tree fits. Trees are independent so we could parallelise, but
-    // most plots are dominated by a few large trees and the serial loop
-    // is already <1 s for hundreds of trees on a typical plot.
-    let mut out: Vec<TreeQsm> = Vec::with_capacity(trees.len());
-    let total_trees = trees.len();
-    let mut done = 0u32;
-    for (tree_id, tb) in trees.into_iter() {
-        done += 1;
-        if total_trees > 0 && done % 32 == 0 {
-            if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
-            progress(0.70 + 0.28 * (done as f32 / total_trees as f32));
-        }
-        if tb.count == 0 { continue; }
+    // Per-tree fits, in parallel — trees are independent, and a
+    // TreeQSM model of a big tree takes seconds (plot 1041: some 15 min
+    // for 637 trees one after another). Largest first, in batches, so the
+    // big ones spread over the threads and Stop and progress are seen
+    // between batches; every tree's fit is its own, so the result is the
+    // same as one at a time.
+    let fit_one = |tree_id: i32, tb: TreeBin| -> Option<TreeQsm> {
+        if tb.count == 0 { return None; }
         let cnt = tb.count as f64;
         let base_x = tb.sum_x / cnt;
         let base_y = tb.sum_y / cnt;
         let base_z = tb.sum_ground / cnt;
         let height = if tb.max_hag.is_finite() { tb.max_hag as f64 } else { 0.0 };
-        if height < min_tree_height { continue; }
+        if height < min_tree_height { return None; }
 
         // Sort slice indices ascending so the smoothing + frustum loop
         // sees the taper in height order.
         let mut indices: Vec<i32> = tb.slices.keys().copied().filter(|&i| i >= 0).collect();
         indices.sort_unstable();
-        if indices.is_empty() { continue; }
+        if indices.is_empty() { return None; }
 
         // Initial pass: fit each slice with enough points.
         let mut raw: Vec<(i32, QsmSlice)> = Vec::new();
@@ -22583,11 +23488,18 @@ pub fn run_tree_qsm(
                 branches = fit_branches(&slices, &tb.voxels, branch_voxel, base_z);
             }
         }
-        let branch_volume: f64 = branches.iter().map(|b| b.volume).sum();
-        let branch_count = branches.len() as u32;
+        // The TreeQSM path lists the trunk's own cylinders among
+        // `branches` (branch order 0, for the tubes and the .qsm files),
+        // and the trunk is already `stem_volume`: counting them here too
+        // put the trunk in twice (plot 1041: "branches" 130 % of the stem).
+        let branch_volume: f64 = branches.iter().filter(|b| b.branch_order > 0).map(|b| b.volume).sum();
+        let branch_count = branches.iter().filter(|b| b.branch_order > 0).count() as u32;
         let total_volume = stem_volume + branch_volume;
+        // How each cylinder came about, and the tree's log
+        let cylinder_quality: Vec<u8> = branches.iter().map(cylinder_quality).collect();
+        let notes = qsm_notes(height, dbh, &slices, &branches, &cylinder_quality, tb.leaves);
 
-        out.push(TreeQsm {
+        Some(TreeQsm {
             tree_id,
             base_x, base_y, base_z,
             height,
@@ -22605,8 +23517,37 @@ pub fn run_tree_qsm(
             accepted_slices,
             rejected_slices: rejected,
             treeqsm: treeqsm_attributes,
-        });
+            cylinder_quality,
+            notes,
+            leaf_points: tb.leaves,
+        })
+    };
+    let mut work: Vec<(i32, TreeBin)> = trees.into_iter().collect();
+    work.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+    let total_trees = work.len();
+    let batch = (rayon::current_num_threads() * 2).max(8);
+    // TreeQSM holds several times a tree's points in its cover sets while
+    // it works (see treeqsm_sweep_cancellable), so a batch is bounded by
+    // the points it holds as well as by the threads
+    const QSM_POINTS_IN_FLIGHT: usize = 24_000_000;
+    let mut out: Vec<TreeQsm> = Vec::with_capacity(total_trees);
+    let mut done = 0usize;
+    while !work.is_empty() {
+        if crate::commands::cancel::stopped(&cancel) { return Err("Stopped — nothing was changed.".to_string()); }
+        let mut take = 0usize;
+        let mut held = 0usize;
+        while take < work.len() && take < batch {
+            let p = work[take].1.treeqsm_points.len();
+            if take > 0 && held + p > QSM_POINTS_IN_FLIGHT { break; }
+            held += p;
+            take += 1;
+        }
+        let part: Vec<(i32, TreeBin)> = work.drain(..take).collect();
+        out.extend(part.into_par_iter().filter_map(|(tree_id, tb)| fit_one(tree_id, tb)).collect::<Vec<_>>());
+        done += take;
+        progress(0.70 + 0.28 * (done as f32 / total_trees.max(1) as f32));
     }
+    let leaf_total: u64 = out.iter().map(|t| t.leaf_points).sum();
     out.sort_by_key(|t| t.tree_id);
 
     let total_stem_volume: f64 = out.iter().map(|t| t.stem_volume).sum();
@@ -22648,6 +23589,7 @@ pub fn run_tree_qsm(
         qsm_path: qsm_path.to_string_lossy().into_owned(),
         slice_height: slice,
         min_points_per_slice: min_n as u32,
+        leaf_points: leaf_total,
     })
 }
 
@@ -23341,7 +24283,9 @@ pub fn octree_read_qsm(octree_dir: String) -> Result<Option<QsmResult>, String> 
     if !path.is_file() { return Ok(None); }
     let bytes = std::fs::read(&path).map_err(|e| format!("read qsm.json: {e}"))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse qsm.json: {e}"))?;
-    let trees: Vec<TreeQsm> = serde_json::from_value(v.get("trees").cloned().unwrap_or(serde_json::Value::Array(vec![])))
+    // NaN-tolerant for the same reason as stems.json: a tree with no slice
+    // at breast height has a NaN DBH, written as null.
+    let trees: Vec<TreeQsm> = super::nanjson::from_value(v.get("trees").cloned().unwrap_or(serde_json::Value::Array(vec![])))
         .map_err(|e| format!("decode trees: {e}"))?;
     let total_stem_volume: f64 = trees.iter().map(|t| t.stem_volume).sum();
     let total_stem_volume_std: f64 = trees.iter()
@@ -23351,6 +24295,7 @@ pub fn octree_read_qsm(octree_dir: String) -> Result<Option<QsmResult>, String> 
     let slice_height = v.get("sliceHeight").or_else(|| v.get("slice_height")).and_then(|x| x.as_f64()).unwrap_or(0.25);
     let min_points_per_slice = v.get("minPointsPerSlice").or_else(|| v.get("min_points_per_slice"))
         .and_then(|x| x.as_u64()).unwrap_or(8) as u32;
+    let leaf_total: u64 = trees.iter().map(|t| t.leaf_points).sum();
     Ok(Some(QsmResult {
         trees,
         total_stem_volume,
@@ -23358,6 +24303,7 @@ pub fn octree_read_qsm(octree_dir: String) -> Result<Option<QsmResult>, String> 
         qsm_path: path.to_string_lossy().into_owned(),
         slice_height,
         min_points_per_slice,
+        leaf_points: leaf_total,
     }))
 }
 
@@ -29184,6 +30130,12 @@ mod caliper_tests {
         assert!(!lw_is_wood(1.0, 0.9, 0.8, 0.6, 0.55, 0.35));
         // Degenerate / zero spread → not wood.
         assert!(!lw_is_wood(0.0, 0.0, 0.0, 0.6, 0.55, 0.35));
+        // The codes the editor reads — a trunk surface is stem,
+        // a line a branch, the scatter leaf (4, not the patches' 3)
+        assert_eq!(lw_label(1.0, 1.0, 0.0, 0.6, 0.55, 0.35), SEM_STEM);
+        assert_eq!(lw_label(1.0, 0.0, 0.0, 0.6, 0.55, 0.35), SEM_BRANCH);
+        assert_eq!(lw_label(1.0, 1.0, 1.0, 0.6, 0.55, 0.35), SEM_LEAF);
+        assert_eq!(SEM_LEAF, 4);
     }
 
     // ---- LAZ writing ----
@@ -30298,8 +31250,10 @@ mod export_pipeline_tests {
                 assert!((got[a] - want[a]).abs() < 1e-6, "axis {a}: {got:?} vs {want:?}");
             }
         }
+        // Format 6 states it as WKT (see a_las14_export_declares_its_crs_as_wkt).
         let crs = vlrs.iter().find(|v| v.is_crs()).expect("the CRS VLR must survive the version change");
-        assert!(decode_geokeys(&crs.data).contains(&(3072, 3067)));
+        assert_eq!(crs.record_id, 2112);
+        assert_eq!(super::super::crs::epsg_from_wkt(&String::from_utf8_lossy(&crs.data)), Some(3067));
 
         // The Extra-Bytes descriptor still describes what was written:
         // a format 6 record is 30 bytes, so tree_id starts at 30, not 20.
@@ -30600,6 +31554,175 @@ mod export_pipeline_tests {
         let crs_vlr = vlrs.iter().find(|v| v.is_crs()).expect("the CRS VLR must survive LAZ compression");
         assert!(decode_geokeys(&crs_vlr.data).contains(&(3072, 3067)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The global encoding byte of a written file.
+    fn global_encoding(path: &Path) -> u8 {
+        std::fs::read(path).unwrap()[6]
+    }
+
+    const TM35_N2000: &str = r#","crs":{"epsg":3067},"vertical":{"datum":"orthometric","epsg":3900}"#;
+
+    /// LAS 1.4's point formats 6–10 state their coordinate
+    /// system as WKT, with bit 4 of the global encoding set, and carry no
+    /// GeoTIFF keys; the importer reads both parts of the compound back.
+    #[test]
+    fn a_las14_export_declares_its_crs_as_wkt() {
+        let dir = e2e_dir("wkt14");
+        let src = dir.join("src");
+        let world = [[385000.0, 6672000.0, 20.0], [385010.0, 6672010.0, 21.0]];
+        write_octree(&src, &world, 0.001, [385000.0, 6672000.0, 0.0], TM35_N2000);
+        let out = dir.join("out.las");
+        let mut opts = base_opts();
+        opts.las_14 = true;
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out.to_string_lossy(), &opts).unwrap();
+
+        assert_eq!(global_encoding(&out) & 0x10, 0x10, "the WKT bit must be set");
+        let (pts, vlrs) = read_back(&out);
+        assert_eq!(pts.len(), 2);
+        assert!(!vlrs.iter().any(|v| v.record_id == 34735), "no GeoTIFF keys beside the WKT");
+        let wkt = vlrs.iter().find(|v| v.user_id == "LASF_Projection" && v.record_id == 2112).expect("a WKT VLR");
+        assert_eq!(wkt.data.last(), Some(&0), "the WKT is null-terminated");
+        let text = String::from_utf8_lossy(&wkt.data);
+        assert!(text.starts_with("COMPD_CS[") && text.contains("AUTHORITY[\"EPSG\",\"3067\"]"), "{text}");
+
+        let declared = crs_from_las_vlrs(&vlrs).expect("the importer reads it back");
+        assert_eq!(declared["crs"]["epsg"], 3067);
+        assert_eq!(declared["vertical"]["epsg"], 3900);
+        assert_eq!(vertical_units_from_las_vlrs(&vlrs), Some(9001));
+
+        // LAS 1.2 keeps the GeoTIFF keys and leaves the bit clear.
+        let out12 = dir.join("out12.las");
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out12.to_string_lossy(), &base_opts()).unwrap();
+        assert_eq!(global_encoding(&out12) & 0x10, 0);
+        let (_, vlrs12) = read_back(&out12);
+        assert!(vlrs12.iter().any(|v| v.record_id == 34735) && !vlrs12.iter().any(|v| v.record_id == 2112));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A code with no WKT1 form here keeps its GeoTIFF keys in a
+    /// LAS 1.4 export rather than losing its coordinate system.
+    #[test]
+    fn a_las14_export_without_a_wkt_form_keeps_the_geotiff_keys() {
+        let dir = e2e_dir("wkt14-fallback");
+        let src = dir.join("src");
+        let world = [[1000.0, 2000.0, 20.0], [1010.0, 2010.0, 21.0]];
+        // Krovak (Czech and Slovak), written by no WKT1 projection name here.
+        write_octree(&src, &world, 0.001, [1000.0, 2000.0, 0.0], r#","crs":{"epsg":5514}"#);
+        let out = dir.join("out.las");
+        let mut opts = base_opts();
+        opts.las_14 = true;
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out.to_string_lossy(), &opts).unwrap();
+        assert_eq!(global_encoding(&out) & 0x10, 0);
+        let (_, vlrs) = read_back(&out);
+        assert!(decode_geokeys(&vlrs.iter().find(|v| v.is_crs()).unwrap().data).contains(&(3072, 5514)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The WKT, its bit and the class names survive the LAZ
+    /// step, which rewrites the header through the las crate.
+    #[test]
+    fn a_las14_laz_export_keeps_the_wkt_bit_and_the_class_names() {
+        let dir = e2e_dir("wkt14-laz");
+        let src = dir.join("src");
+        let world = [[385000.0, 6672000.0, 20.0], [385010.0, 6672010.0, 21.0]];
+        write_octree(&src, &world, 0.001, [385000.0, 6672000.0, 0.0],
+            &format!(r#"{TM35_N2000},"classNames":{{"2":"Ground","64":"Stem"}}"#));
+        let out = dir.join("out.laz");
+        let mut opts = base_opts();
+        opts.las_14 = true;
+        run_export_octree(&no_progress, &src.to_string_lossy(), &out.to_string_lossy(), &opts).unwrap();
+        assert_eq!(global_encoding(&out) & 0x10, 0x10);
+        let (_, vlrs) = read_back(&out);
+        assert_eq!(crs_from_las_vlrs(&vlrs).unwrap()["crs"]["epsg"], 3067);
+        assert_eq!(class_names_from_las_vlrs(&vlrs).unwrap(), serde_json::json!({"2": "Ground", "64": "Stem"}));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The names the dataset's source gave its classes go back
+    /// into the Classification Lookup — only the codes the format can
+    /// hold, each cut to the record's 15 bytes — and none when the
+    /// classes are not written.
+    #[test]
+    fn class_names_are_written_where_the_classes_are() {
+        let dir = e2e_dir("class-names");
+        let src = dir.join("src");
+        let world = [[385000.0, 6672000.0, 20.0], [385010.0, 6672010.0, 21.0]];
+        write_octree(&src, &world, 0.001, [385000.0, 6672000.0, 0.0],
+            r#","classNames":{"2":"Ground surface model","64":"Stem","7":" "}"#);
+
+        let out14 = dir.join("out14.las");
+        let mut opts = base_opts();
+        opts.las_14 = true;
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out14.to_string_lossy(), &opts).unwrap();
+        let (_, vlrs) = read_back(&out14);
+        let lookup = vlrs.iter().find(|v| v.user_id == "LASF_Spec" && v.record_id == 0).expect("a lookup");
+        assert_eq!(lookup.data.len(), 32, "two classes, 16 bytes each");
+        assert_eq!(class_names_from_las_vlrs(&vlrs).unwrap(), serde_json::json!({"2": "Ground surface", "64": "Stem"}));
+
+        // LAS 1.2's five bits cannot hold 64.
+        let out12 = dir.join("out12.las");
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out12.to_string_lossy(), &base_opts()).unwrap();
+        let (_, vlrs) = read_back(&out12);
+        assert_eq!(class_names_from_las_vlrs(&vlrs).unwrap(), serde_json::json!({"2": "Ground surface"}));
+
+        let out_none = dir.join("none.las");
+        let mut opts = base_opts();
+        opts.keep_classification = false;
+        run_export_octree_las(&no_progress, &src.to_string_lossy(), &out_none.to_string_lossy(), &opts).unwrap();
+        let (pts, vlrs) = read_back(&out_none);
+        assert_eq!(pts.len(), 2);
+        assert!(class_names_from_las_vlrs(&vlrs).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An imported file's class names and compound WKT reach
+    /// metadata.json, and a subset of the dataset keeps the names.
+    #[test]
+    fn an_import_records_the_files_class_names_and_compound_crs() {
+        use las::{Builder, Point as LasPoint, Transform as LasTransform, Vector, Vlr, Writer};
+        let dir = e2e_dir("class-names-import");
+        let las_path = dir.join("in.las");
+        let mut b = Builder::from((1, 4));
+        b.point_format = las::point::Format::new(6).unwrap();
+        b.transforms = Vector {
+            x: LasTransform { scale: 0.001, offset: 385_000.0 },
+            y: LasTransform { scale: 0.001, offset: 6_672_000.0 },
+            z: LasTransform { scale: 0.001, offset: 0.0 },
+        };
+        let mut lookup = vec![0u8; 32];
+        lookup[0] = 64;
+        lookup[1..5].copy_from_slice(b"Stem");
+        lookup[16] = 65;
+        lookup[17..32].copy_from_slice(b"Branch wood 123");   // 15 bytes, no terminator
+        b.vlrs.push(Vlr { user_id: "LASF_Spec".into(), record_id: 0, description: "Classification".into(), data: lookup });
+        let mut wkt = super::super::crs::wkt::wkt_for_epsg(3067, Some(3900)).unwrap().into_bytes();
+        wkt.push(0);
+        b.vlrs.push(Vlr { user_id: "LASF_Projection".into(), record_id: 2112, description: "WKT".into(), data: wkt });
+        b.has_wkt_crs = true;
+        let mut w = Writer::from_path(&las_path, b.into_header().unwrap()).unwrap();
+        for i in 0..20 {
+            let t = i as f64;
+            w.write_point(LasPoint {
+                x: 385_000.0 + t * 0.1, y: 6_672_000.0 + t * 0.1, z: 20.0 + t * 0.05,
+                classification: las::point::Classification::new(64 + (i % 2) as u8).unwrap(),
+                return_number: 1, number_of_returns: 1, gps_time: Some(t),
+                ..Default::default()
+            }).unwrap();
+        }
+        w.close().unwrap();
+
+        let out = dir.join("ds");
+        run_convert(&|_, _| {}, las_path.to_str().unwrap(), out.to_str().unwrap(), "in", "tls", 0.0, 0, "", "", "", "", &[], false).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(meta["classNames"], serde_json::json!({"64": "Stem", "65": "Branch wood 123"}));
+        assert_eq!(meta["crs"]["epsg"], 3067);
+        assert_eq!(meta["vertical"]["epsg"], 3900);
+
+        let mut derived = serde_json::json!({});
+        inherit_georeferencing(&mut derived, &meta);
+        assert_eq!(derived["classNames"], meta["classNames"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -32399,6 +33522,31 @@ mod dbh_robustness_tests {
         }
     }
 
+    /// A spruce at breast height is a stem inside its lowest
+    /// branches, all round it and further out; the stem is what is
+    /// measured, from all the band's points and from its stem points.
+    #[test]
+    fn a_whorl_round_the_stem_does_not_widen_it() {
+        let stem = ring(48, 0.12);
+        let mut seed = 3u32;
+        let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 8) as f64 / 16_777_216.0 };
+        let mut band = stem.clone();
+        for _ in 0..400 {
+            let (a, r) = (rnd() * std::f64::consts::TAU, 0.2 + 1.3 * rnd());
+            band.push((10.0 + r * a.cos(), 20.0 + r * a.sin()));
+        }
+        // the stem points (semantic 1) are what is fitted when there are
+        // enough of them, and they give the stem
+        let d = fit_stem_circle(TreeAcc::fit_band(&stem, &band)).expect("fit").2;
+        assert!((d - 0.24).abs() < 0.005, "DBH {d:.3} m from the stem points");
+        // without them the whorl still does not read as a metre-wide stem
+        // (0.51 m; the median-centred fit alone read 1.77 m)
+        let d = fit_stem_circle(&band).expect("fit").2;
+        assert!(d < 0.6, "the whorl pulled DBH to {d:.3} m");
+        assert_eq!(TreeAcc::fit_band(&stem, &band).len(), stem.len(), "the stem points first");
+        assert_eq!(TreeAcc::fit_band(&stem[..5], &band).len(), band.len(), "too few of them: the band");
+    }
+
     /// The stem's own shape must survive. Bark roughness and ovality are
     /// signal — the rejection is for returns that are not on the stem.
     #[test]
@@ -33905,6 +35053,8 @@ pub enum RegisterInitMode {
     Manual,
     /// A global search by surface features (FPFH + RANSAC): any heading, any offset, both clouds whole.
     Features,
+    /// The two stem maps matched (where the stems stand and how thick they are at breast height): any heading, any offset. The forest pass's stems where a dataset has them, else found at breast height.
+    Stems,
 }
 
 /// The start of the fit, and the automatic search's reach.
@@ -33988,6 +35138,9 @@ pub struct DatasetRegistration {
     /// What the feature search found, when it was the start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global: Option<reg::GlobalReport>,
+    /// What the stem-map match found, when it was the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stems: Option<crate::commands::stemmap::StemMapReport>,
     /// The origin the fit's own frame is relative to (the reference's offset).
     pub origin: [f64; 3],
     /// The moving cloud's centre in world coordinates — the rotation is about it.
@@ -34048,6 +35201,46 @@ fn register_load(
     let mut cells: Vec<((i32, i32, i32), ([f64; 3], u32))> = vox.into_iter().collect();
     cells.sort_unstable_by_key(|(k, _)| *k);
     Ok(cells.into_iter().map(|(_, (s, n))| [s[0] / n as f64, s[1] / n as f64, s[2] / n as f64]).collect())
+}
+
+/// A dataset's stem map in the `origin` frame, for the stem-map
+/// start (commands/stemmap.rs), and where it came from. The forest pass's
+/// stems where it has run (forest/seeds.json — the ones with a circle,
+/// read at breast height); otherwise found now, from the points in four
+/// slices 0.8–2.2 m above the ground. Nothing is written.
+fn stem_map_of(
+    dir: &Path, origin: [f64; 3], dtm_cell: f64, cancel: &std::sync::atomic::AtomicBool, progress: &dyn Fn(f32),
+) -> Result<(Vec<crate::commands::stemmap::MapStem>, &'static str), String> {
+    use crate::commands::stemmap::{find_stems, MapStem, SLICES, SLICE_REACH};
+    const BH: f64 = 1.3;
+    if let Some(f) = forest::read_seeds(dir)? {
+        let stems: Vec<MapStem> = f.seeds.iter().filter(|s| s.r > 0.0).map(|s| MapStem {
+            x: s.x + s.lean[0] * BH - origin[0],
+            y: s.y + s.lean[1] * BH - origin[1],
+            z: s.z - origin[2],
+            r: s.r,
+        }).collect();
+        if stems.len() >= 4 {
+            progress(1.0);
+            return Ok((stems, "forest"));
+        }
+    }
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dtm = build_dtm_grid(dir, dtm_cell)
+        .map_err(|e| format!("{name}: ground: {e} — the stem map reads the stems at breast height: classify ground first, or run the forest pass"))?;
+    let hag_of = |w: [f64; 3]| dtm.sample(w[0], w[1]).map(|g| w[2] - g as f64);
+    const CELL: f64 = 0.01;
+    let pts = register_load(dir, CELL, origin, &|w| {
+        hag_of(w).is_some_and(|h| SLICES.iter().any(|&s| (h - s).abs() <= SLICE_REACH + CELL))
+    }, cancel, progress)?;
+    let hag: Vec<f32> = pts.iter().map(|p| {
+        hag_of([p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]]).unwrap_or(f64::NAN) as f32
+    }).collect();
+    let mut stems = find_stems(&pts, &hag, CELL);
+    for s in &mut stems {
+        s.z = dtm.sample(s.x + origin[0], s.y + origin[1]).map_or(f64::NAN, |g| g as f64 - origin[2]);
+    }
+    Ok((stems, "found"))
 }
 
 /// A cloud's vertical structure and canopy tops, rasterised in the
@@ -34215,7 +35408,13 @@ fn coarse_search(
     let Some((pk, theta)) = best else { return Err("no translation gathered any votes — the two clouds may not overlap within the search radius".into()) };
     let coarse = Rigid2 { theta, dx: pk.dx, dy: pk.dy, cx: centre[0], cy: centre[1] };
     let confidence = if pk.second > 0.0 { (pk.score / pk.second) as f64 } else { f64::INFINITY };
-    let refined = refine(&stem_anchors, &reference.vert, Some((&top_anchors, &reference.tops)), coarse, range > 0.0);
+    // Stem to stem only. `refine` takes a tree's top as the
+    // stand-in for its stem by index — right for skeletons, where both
+    // come from one tree; here the two are separate peak lists of their
+    // own lengths, so a top there would be another tree's (or past the
+    // end). The tops have had their say in the vote; with fewer than
+    // three stems matched the vote's transform stands.
+    let refined = refine(&stem_anchors, &reference.vert, None, coarse, range > 0.0);
     let r2 = if refined.matched >= 3 { refined.rigid } else { coarse };
     // The height: the median difference of the two grounds where the
     // moved anchors land on reference ground.
@@ -34238,6 +35437,72 @@ fn coarse_search(
         confidence: if confidence.is_finite() { confidence } else { 99.0 },
         stem_anchors: stem_anchors.len(), top_anchors: top_anchors.len(), matched_trees: refined.matched,
     }))
+}
+
+/// The automatic search's stem and top peaks are two lists of
+/// their own lengths. On TLS plot 1041 it panicked with 528 stems and
+/// 524 tops ("index out of bounds") once a stem found nothing to match.
+#[cfg(test)]
+mod coarse_search_tests {
+    use super::*;
+    use crate::commands::skelalign::{Raster2, Rigid2, CHM_CELL, VERT_CELL};
+
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f64) / (1u64 << 31) as f64
+    }
+
+    /// Stems as the verticality raster shows them, clutter, and crown
+    /// tops as ones, over a 70 m square, on flat ground at `ground`.
+    fn rasters(stems: &[([f64; 2], f32)], tops: &[[f64; 2]], ground: f32) -> StructureRasters {
+        let mut vert = Raster2::new(-35.0, -35.0, VERT_CELL, 280, 280);
+        for &(s, w) in stems { vert.add(s[0], s[1], w); }
+        let mut t = Raster2::new(-35.0, -35.0, CHM_CELL, 140, 140);
+        for p in tops { if let Some(i) = t.index(p[0], p[1]) { t.w[i] = 1.0; } }
+        let dtm = DtmGrid { z: vec![ground; 4], cols: 2, rows: 2, min_x: -1000.0, min_y: -1000.0, cell: 1000.0 };
+        StructureRasters { vert, tops: t, dtm }
+    }
+
+    #[test]
+    fn more_stems_than_tops_and_stems_matching_nothing_still_register() {
+        let truth = Rigid2 { theta: 1.0f64.to_radians(), dx: 3.4, dy: -2.1, cx: 0.0, cy: 0.0 };
+        let back = truth.inverse();
+        let mut s = 7u64;
+        let mut trees: Vec<[f64; 2]> = Vec::new();
+        while trees.len() < 40 {
+            let p = [lcg(&mut s) * 40.0 - 20.0, lcg(&mut s) * 40.0 - 20.0];
+            if trees.iter().all(|q| (q[0] - p[0]).hypot(q[1] - p[1]) > 2.0) { trees.push(p); }
+        }
+        let clutter = |seed: &mut u64| -> Vec<([f64; 2], f32)> {
+            (0..300).map(|_| ([lcg(seed) * 60.0 - 30.0, lcg(seed) * 60.0 - 30.0], (3.0 + 2.0 * lcg(seed)) as f32)).collect()
+        };
+        // The reference: every stem, every second tree's top.
+        let mut ref_stems: Vec<([f64; 2], f32)> = trees.iter().map(|p| (*p, 14.0)).collect();
+        ref_stems.extend(clutter(&mut s));
+        let ref_tops: Vec<[f64; 2]> = trees.iter().step_by(2).cloned().collect();
+        // The moving cloud: the same trees and tops moved, its own
+        // clutter, and a dozen stems the reference does not have.
+        let moved = |p: &[f64; 2]| { let (x, y) = back.apply(p[0], p[1]); [x, y] };
+        let mut mov_stems: Vec<([f64; 2], f32)> = trees.iter().map(|p| (moved(p), 14.0)).collect();
+        mov_stems.extend((0..12).map(|k| (moved(&[26.0, -18.0 + 3.0 * k as f64]), 8.0)));
+        mov_stems.extend(clutter(&mut s));
+        let mov_tops: Vec<[f64; 2]> = ref_tops.iter().map(|p| moved(p)).collect();
+        let reference = rasters(&ref_stems, &ref_tops, 100.5);
+        let moving = rasters(&mov_stems, &mov_tops, 100.0);
+
+        let init = RegisterInit { mode: RegisterInitMode::Auto, search_radius: 8.0, yaw_range_deg: 2.0, ..RegisterInit::default() };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (rigid, report) = coarse_search(&reference, &moving, [0.0; 3], &init, &cancel, &|_| {}).unwrap();
+        assert!(report.stem_anchors > report.top_anchors, "{report:?}");
+        assert!(report.matched_trees >= 30, "{report:?}");
+        assert!((report.dz - 0.5).abs() < 1e-6, "{report:?}");
+        for c in [[-20.0, -20.0], [20.0, 20.0], [20.0, -20.0], [-20.0, 20.0]] {
+            let m = moved(&c);
+            let got = rigid.apply([m[0], m[1], 0.0]);
+            let off = (got[0] - c[0]).hypot(got[1] - c[1]);
+            assert!(off < 0.1, "corner {c:?} lands {off} m off; {report:?}");
+        }
+    }
 }
 
 /// Dataset `dir`'s name and bounding box from its metadata.
@@ -34307,6 +35572,7 @@ pub fn run_register(
     // ---- The start, in the origin's frame. ----------------------------
     let mut coarse: Option<CoarseReport> = None;
     let mut global: Option<reg::GlobalReport> = None;
+    let mut stems: Option<crate::commands::stemmap::StemMapReport> = None;
     let init_rigid: Rigid = match init.mode {
         RegisterInitMode::Current => Rigid::IDENTITY,
         RegisterInitMode::Manual => Rigid::about(reg::exp_so3([0.0, 0.0, init.yaw_deg.to_radians()]), [init.dx, init.dy, init.dz], m_centre_rel),
@@ -34342,6 +35608,17 @@ pub fn run_register(
             }).map_err(|e| if e == "stopped" { "Stopped — nothing was changed.".to_string() } else { e })?;
             global = Some(report);
             rigid
+        }
+        RegisterInitMode::Stems => {
+            let (r_stems, r_src) = stem_map_of(r_dir, origin, init.dtm_cell, &cancel, &|p| emit_progress(progress, "register", 0.05 * p))?;
+            let (m_stems, m_src) = stem_map_of(m_dir, origin, init.dtm_cell, &cancel, &|p| emit_progress(progress, "register", 0.05 + 0.05 * p))?;
+            let stop = || crate::commands::cancel::stopped(&cancel);
+            let (h, mut report) = crate::commands::stemmap::match_maps(&r_stems, &m_stems, &Default::default(), &stop)
+                .map_err(|e| if e == "stopped" { "Stopped — nothing was changed.".to_string() } else { e })?;
+            report.reference_source = r_src.to_string();
+            report.moving_source = m_src.to_string();
+            stems = Some(report);
+            Rigid::yaw(h.yaw, h.t)
         }
     };
     emit_progress(progress, "register", 0.12);
@@ -34384,6 +35661,7 @@ pub fn run_register(
         init_mode: init.mode,
         coarse,
         global,
+        stems,
         origin,
         centre_world,
         reference_points: ref_pts.len(),
@@ -34410,7 +35688,7 @@ pub fn run_transform_dataset(
     let cancel = crate::commands::cancel::token("transform");
     let started = std::time::Instant::now();
     let dir = Path::new(src_dir);
-    let out_path = PathBuf::from(out_dir);
+    let out_path = crate::fsgrant::os_path(out_dir);
     if same_dir(src_dir, out_dir) { return Err("the moved copy cannot overwrite its source".into()); }
     create_dir_all(&out_path).map_err(|e| format!("create out dir: {e}"))?;
     emit_progress(progress, "transform", 0.0);
@@ -34852,5 +36130,109 @@ mod standard_field_tests {
         };
         assert!(err.contains("point format 0 does not carry gps_time"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The QSM fit models the wood — points labelled leaf (4) by the
+/// forest pass are left out of the stem and branch fits but still count
+/// toward the tree's height — and says how each cylinder came about.
+#[cfg(test)]
+mod qsm_wood_tests {
+    use super::*;
+    use super::tree_metrics_end_to_end::write_plot;
+
+    fn stand(dir: &Path, label_leaves: bool) -> usize {
+        let mut pts: Vec<[f64; 3]> = Vec::new();
+        let mut cls: Vec<u8> = Vec::new();
+        let mut ids: Vec<i32> = Vec::new();
+        for i in 0..=100 { for j in 0..=100 { pts.push([i as f64 * 0.1, j as f64 * 0.1, 0.0]); cls.push(2); ids.push(0); } }
+        let mut z = 0.0f64;
+        while z <= 8.0 {
+            let r = 0.15 - 0.10 * z / 8.0;
+            for k in 0..72 { let a = k as f64 * std::f64::consts::TAU / 72.0; pts.push([5.0 + r * a.cos(), 5.0 + r * a.sin(), z]); cls.push(1); ids.push(1); }
+            z += 0.02;
+        }
+        // a leafy crown hugging the stem from 3 m up to 8.4 m
+        let first_leaf = pts.len();
+        let mut s = 7u64;
+        let mut rnd = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s >> 33) as f64 / (1u64 << 31) as f64 };
+        for _ in 0..30_000 {
+            let (h, a, d) = (3.0 + 5.4 * rnd(), rnd() * std::f64::consts::TAU, 0.18 + 0.6 * rnd());
+            pts.push([5.0 + d * a.cos(), 5.0 + d * a.sin(), h]); cls.push(1); ids.push(1);
+        }
+        write_plot(dir, &pts, &cls, &ids);
+        if label_leaves {
+            let p = dir.join("octree.bin");
+            let mut b = std::fs::read(&p).unwrap();
+            for i in first_leaf..pts.len() { b[i * 21 + 20] = SEM_LEAF; }
+            std::fs::write(&p, b).unwrap();
+        }
+        pts.len() - first_leaf
+    }
+
+    #[test]
+    fn leaves_are_left_out_of_the_model_and_kept_in_the_height() {
+        let dir = std::env::temp_dir().join(format!("pcl_qsm_wood_{}", std::process::id()));
+        let truth = std::f64::consts::PI / 3.0 * 8.0 * (0.15f64 * 0.15 + 0.15 * 0.05 + 0.05 * 0.05);
+        let n_leaves = stand(&dir, true);
+        let r = run_tree_qsm(&|_| {}, dir.to_str().unwrap(), 0.5, 8, 2.0, 0.5, false, "simple", 0.1).unwrap();
+        let t = &r.trees[0];
+        assert_eq!(t.leaf_points as usize, n_leaves);
+        assert_eq!(r.leaf_points as usize, n_leaves);
+        assert!((t.stem_volume - truth).abs() / truth < 0.05, "wood only: {:.4} m³ against {truth:.4}", t.stem_volume);
+        assert!(t.height > 8.3, "the height still reaches the leaves: {}", t.height);
+        assert!(t.notes.iter().any(|n| n.code == "leaves-out" && n.severity == "info"));
+        // unlabelled, the same leaves are part of the fit, as before
+        stand(&dir, false);
+        let r = run_tree_qsm(&|_| {}, dir.to_str().unwrap(), 0.5, 8, 2.0, 0.5, false, "simple", 0.1).unwrap();
+        assert_eq!(r.trees[0].leaf_points, 0);
+        assert!(!r.trees[0].notes.iter().any(|n| n.code == "leaves-out"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cyl(added: bool, radius: f64, unmod: f64, coverage: f64, volume: f64) -> BranchCylinder {
+        BranchCylinder {
+            added, extension: None, position_in_branch: 0, unmod_radius: unmod, start: [0.0; 3], end: [0.0, 0.0, 1.0],
+            radius, length: 1.0, volume, n_voxels: 10, rmse: 0.001, segment_id: 0, parent_cylinder: None, parent_segment: None,
+            branch_order: 1, coverage, sector_mask: 0xFFF,
+        }
+    }
+
+    #[test]
+    fn each_cylinder_says_how_it_came_about() {
+        assert_eq!(cylinder_quality(&cyl(true, 0.05, 0.05, 1.0, 0.0)), CYL_ADDED);
+        assert_eq!(cylinder_quality(&cyl(false, 0.05, 0.08, 1.0, 0.0)), CYL_CORRECTED);
+        assert_eq!(cylinder_quality(&cyl(false, 0.05, 0.051, 0.3, 0.0)), CYL_PARTIAL);
+        assert_eq!(cylinder_quality(&cyl(false, 0.05, 0.051, 0.9, 0.0)), CYL_MEASURED);
+        // a simple-method cylinder (no unmodified radius) is not "corrected"
+        assert_eq!(cylinder_quality(&cyl(false, 0.05, 0.0, 0.9, 0.0)), CYL_MEASURED);
+        // most branch volume in bridges and corrections is a warning
+        let br = vec![cyl(true, 0.05, 0.05, 1.0, 0.03), cyl(false, 0.05, 0.05, 1.0, 0.01)];
+        let q: Vec<u8> = br.iter().map(cylinder_quality).collect();
+        let notes = qsm_notes(15.0, 0.3, &[], &br, &q, 0);
+        assert_eq!(notes.iter().map(|n| n.code.as_str()).collect::<Vec<_>>(), vec!["gap-bridged"]);
+        // the trunk (order 0, TreeQSM mode) does not count as branch volume
+        let trunk = vec![BranchCylinder { branch_order: 0, ..cyl(true, 0.2, 0.2, 1.0, 1.0) }, cyl(false, 0.05, 0.05, 1.0, 0.01)];
+        let q: Vec<u8> = trunk.iter().map(cylinder_quality).collect();
+        assert!(qsm_notes(15.0, 0.3, &[], &trunk, &q, 0).is_empty());
+    }
+
+    #[test]
+    fn a_stem_thickening_upward_is_noted() {
+        let sl = |hag: f64, radius: f64| -> QsmSlice {
+            serde_json::from_value(serde_json::json!({
+                "hag": hag, "z": hag, "centerX": 0, "centerY": 0, "radius": radius, "rmse": 0.001, "nPoints": 50,
+                "coverage": 1.0, "sectorMask": 4095,
+            })).unwrap()
+        };
+        let even: Vec<QsmSlice> = (0..20).map(|k| sl(k as f64 * 0.5, 0.15 - 0.004 * k as f64)).collect();
+        assert!(qsm_notes(12.0, 0.3, &even, &[], &[], 0).is_empty());
+        let mut bump = even.clone();
+        bump[12].radius = 0.25;
+        let n = qsm_notes(12.0, 0.3, &bump, &[], &[], 0);
+        assert_eq!(n[0].code, "taper-reversal");
+        assert!(n[0].text.contains("6.0 m"), "{}", n[0].text);
+        let small = qsm_notes(2.0, f64::NAN, &[], &[], &[], 5);
+        assert_eq!(small.iter().map(|n| n.code.as_str()).collect::<Vec<_>>(), vec!["leaves-out", "sapling", "no-breast-height"]);
     }
 }

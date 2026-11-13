@@ -3,10 +3,11 @@
 // rendered at zero size in the shader, so clearing a filter brings
 // them back instantly — no reload, no edit, no patches.bin entry.
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useOctreeShell, countActiveFilters, type FilterConfig } from './OctreeShellContext';
 import DualRangeSlider from './DualRangeSlider';
 import { confirmDialog } from '../../ui/dialogs';
+import { classColorIn, namedClassCodes } from '../../three/palette';
 
 // Sentinel for an open-ended upper bound: an empty "max" means "and up".
 // Tree ids never realistically approach this, so it reads as ∞.
@@ -32,6 +33,20 @@ export const CLASS_OPTIONS: { code: number; label: string; swatch: string }[] = 
   { code: 0, label: 'Unassigned', swatch: '#8c8c8c' },
 ];
 
+/** CLASS_OPTIONS as the dataset's source file named them
+ *  (`classNames`): a named code takes the file's name, and a named code
+ *  not in the list gets a chip of its own, in its own colour
+ *  (classColorIn). */
+export function classOptionsFor(names: Record<string, string> | undefined): { code: number; label: string; swatch: string }[] {
+  if (!names) return CLASS_OPTIONS;
+  const named = namedClassCodes(names);
+  const out = CLASS_OPTIONS.map(o => (names[o.code] ? { ...o, label: names[o.code] } : o));
+  for (const c of named) {
+    if (!CLASS_OPTIONS.some(o => o.code === c)) out.push({ code: c, label: names[c], swatch: `rgb(${classColorIn(c, named).join(',')})` });
+  }
+  return out;
+}
+
 // Semantic codes: leaf–wood / QSM labelling. The swatches are the EXACT
 // rgb the 'semantic' colour mode paints (see colorNode in OctreeView), so
 // a chip reads as "this colour in the viewport" rather than merely
@@ -42,7 +57,10 @@ export const CLASS_OPTIONS: { code: number; label: string; swatch: string }[] = 
 export const SEMANTIC_OPTIONS: { code: number; label: string; swatch: string | null }[] = [
   { code: 0, label: 'Unlabelled', swatch: null },
   { code: 1, label: 'Stem',       swatch: 'rgb(175,110,60)' },
-  { code: 2, label: 'Branch',     swatch: 'rgb(70,180,90)' },
+  // Branch wood tan, foliage its own label (3 is the patches'
+  // "cleared" value, so leaf is 4)
+  { code: 2, label: 'Branch',     swatch: 'rgb(225,165,95)' },
+  { code: 4, label: 'Leaf',       swatch: 'rgb(70,180,90)' },
 ];
 
 // LAS return numbers 0..7 (0 = unset/unknown — plenty of terrestrial
@@ -67,7 +85,7 @@ const RETURN_OPTIONS: { code: number; label: string }[] = [
 // unlisted code (e.g. 12) silently visible — a lie. Semantic and return
 // number happen to have a small domain that matches their real range.
 const CLASS_DOMAIN_MAX = 255;
-const SEMANTIC_DOMAIN_MAX = 2;
+const SEMANTIC_DOMAIN_MAX = 4; // 4 = leaf
 const RETURN_DOMAIN_MAX = 7;
 
 /** Alt/Option-click a hide-chip = solo it. Hides every OTHER code across
@@ -183,6 +201,7 @@ export default function FiltersPanel() {
   // observed min/max (metadata.extras); empty on v1/v2 datasets or a v3
   // import without extras, in which case the whole Section is hidden below.
   const extras = octree?.meta.extras ?? [];
+  const classOptions = useMemo(() => classOptionsFor(octree?.meta.classNames), [octree?.meta.classNames]);
   const extraRange = filters.extraRange;
   const activeExtra = extras.find(e => e.name === extraRange?.name) ?? null;
 
@@ -363,7 +382,7 @@ export default function FiltersPanel() {
         }
       >
         <div className="grid grid-cols-2 gap-1">
-          {CLASS_OPTIONS.map(opt => {
+          {classOptions.map(opt => {
             const hidden = filters.hiddenClasses.includes(opt.code);
             return (
               <button
@@ -391,7 +410,7 @@ export default function FiltersPanel() {
                   color: hidden ? 'var(--text-mute)' : 'var(--text-dim)',
                   textDecoration: hidden ? 'line-through' : 'none',
                 }}
-                title={hidden ? `Class ${opt.code} hidden — click to show` : `Hide class ${opt.code} (⌥-click to solo)`}
+                title={hidden ? `Class ${opt.code} (${opt.label}) hidden — click to show` : `Hide class ${opt.code} (${opt.label}) (⌥-click to solo)`}
               >
                 <span style={{
                   width: 10, height: 10, borderRadius: 2, background: opt.swatch,
@@ -661,6 +680,9 @@ export default function FiltersPanel() {
             onChange={(r) => setFilters({ zRange: r })}
           />
         </div>
+        <Hint>
+          Clouds added to the scene (Layers → in scene) are clipped by this extent too while their <span className="mono">sync extent</span> is on.
+        </Hint>
       </Section>
 
       <Hint>

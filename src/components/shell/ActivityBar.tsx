@@ -2,10 +2,16 @@
 // panel (tools / display / history / layers); the Open action is a
 // one-shot file picker the parent owns. Visual style mirrors Linear /
 // VS Code activity bars — narrow, icon-only, the active icon picks up
-// the accent colour.
+// the accent colour. PointCloudLabeler: » under the monogram widens it to show
+// every tool's name beside its icon (« narrows it again), remembered
+// between sessions.
 
+import { createContext, useContext, useState } from 'react';
 import { useOctreeShell, countActiveFilters, type PanelId } from './OctreeShellContext';
 import { PRODUCT_NAME, brandMonogram } from '../PointCloudLabelerLogo';
+import { SurveyIcon } from './SurveyPanel';
+import { ViewToolsIcon } from './ViewToolsPanel';
+import { shortName } from './activityNames';
 
 interface Props {
   onOpenFile: () => void;
@@ -14,16 +20,43 @@ interface Props {
 }
 
 const BAR_WIDTH = 56;
+/** Wide enough for the longest name ("Tree Skeleton Transfer") beside the scroll bar. */
+const WIDE_WIDTH = 240;
+const GROUPS_KEY = 'pointcloudlabeler-activity-groups';
+const WIDE_KEY = 'pointcloudlabeler-activity-wide';
+/** Open at first: seeing the data, editing it. */
+const GROUPS_OPEN: Record<string, boolean> = { view: true, edit: true, measure: false, analyse: false, compare: false };
+
+/** The bar is widened, with the names beside the icons. */
+const Wide = createContext(false);
 
 export default function ActivityBar({ onOpenFile, disabled }: Props) {
   const { visiblePanels, togglePanel, filters } = useOctreeShell();
   const nFilters = countActiveFilters(filters);
+  const [wide, setWide] = useState(() => {
+    try { return localStorage.getItem(WIDE_KEY) === '1'; } catch { return false; }
+  });
+  const toggleWide = () => setWide((w) => {
+    try { localStorage.setItem(WIDE_KEY, w ? '0' : '1'); } catch { /* storage unavailable */ }
+    return !w;
+  });
+  // Which groups are open, kept between sessions
+  const [open, setOpen] = useState<Record<string, boolean>>(() => {
+    try { return { ...GROUPS_OPEN, ...(JSON.parse(localStorage.getItem(GROUPS_KEY) ?? '{}') as Record<string, boolean>) }; } catch { return { ...GROUPS_OPEN }; }
+  });
+  const groupOpen = (id: string) => open[id] !== false;
+  const toggleGroup = (id: string) => setOpen((o) => {
+    const next = { ...o, [id]: !(o[id] !== false) };
+    try { localStorage.setItem(GROUPS_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+    return next;
+  });
 
   return (
+    <Wide.Provider value={wide}>
     <div
-      className="flex flex-col items-center py-2 gap-1 hairline-r shrink-0"
+      className={`flex flex-col ${wide ? 'items-stretch px-2' : 'items-center'} py-2 gap-1 hairline-r shrink-0 overflow-y-auto overflow-x-hidden scroll-thin`}
       style={{
-        width: BAR_WIDTH,
+        width: wide ? WIDE_WIDTH : BAR_WIDTH,
         background: 'rgba(8, 14, 11, 0.92)',
         backdropFilter: 'blur(20px) saturate(140%)',
         WebkitBackdropFilter: 'blur(20px) saturate(140%)',
@@ -34,128 +67,206 @@ export default function ActivityBar({ onOpenFile, disabled }: Props) {
           typed — it used to be the literal `T·R`, which no rename and
           no grep could find because the name was not in the string. */}
       <div
-        className="mono text-[10px] font-semibold mb-2 text-center w-full"
+        className="mono text-[10px] font-semibold text-center w-full"
         style={{ color: 'var(--accent)', letterSpacing: '0.10em' }}
         title={PRODUCT_NAME}
       >
         {brandMonogram()}
       </div>
+      {/* The names of the tools beside their icons, or not. */}
+      <button
+        type="button"
+        onClick={toggleWide}
+        data-activity-wide={wide ? 'on' : 'off'}
+        aria-expanded={wide}
+        title={wide ? 'Icons only (narrow the bar)' : 'Show the tool names (widen the bar)'}
+        className={`mono shrink-0 rounded-md mb-1 ${wide ? 'self-end px-2' : 'w-10'}`}
+        style={{ height: 18, fontSize: 11, lineHeight: '18px', color: 'var(--text-mute)', background: 'none', border: 'none', cursor: 'pointer' }}
+        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text)'; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-mute)'; }}
+      >
+        {wide ? '«' : '»'}
+      </button>
 
       <ActivityBtn label="Open file" onClick={onOpenFile} shortcut="O">
         <IconFolder />
       </ActivityBtn>
-
-      <div className="my-1 w-6 h-px" style={{ background: 'var(--line)' }} />
-
-      <PanelToggle id="tools" label="Tools" disabled={disabled} active={visiblePanels.has('tools')} onClick={() => togglePanel('tools')}>
-        <IconCursor />
-      </PanelToggle>
-      <PanelToggle id="display" label="Display" disabled={disabled} active={visiblePanels.has('display')} onClick={() => togglePanel('display')}>
-        <IconPalette />
-      </PanelToggle>
-      <PanelToggle
-        id="filters"
-        label={nFilters > 0 ? `Filters (${nFilters} active)` : 'Filters'}
-        disabled={disabled}
-        active={visiblePanels.has('filters')}
-        onClick={() => togglePanel('filters')}
-        badge={nFilters > 0 ? nFilters : undefined}
-      >
-        <IconFilter />
-      </PanelToggle>
-      <PanelToggle id="review" label="Tree review" disabled={disabled} active={visiblePanels.has('review')} onClick={() => togglePanel('review')}>
-        <IconTree />
-      </PanelToggle>
-      <PanelToggle id="qc" label="QC — flag suspect trees" disabled={disabled} active={visiblePanels.has('qc')} onClick={() => togglePanel('qc')}>
-        <IconQc />
-      </PanelToggle>
-      <PanelToggle id="pointqc" label="Point QC — reflectance / outlier / wind" disabled={disabled} active={visiblePanels.has('pointqc')} onClick={() => togglePanel('pointqc')}>
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
-          <path d="M2 12.5h12" />
-          <circle cx="5" cy="9" r="0.9" />
-          <circle cx="8" cy="6" r="0.9" />
-          <circle cx="11" cy="8.5" r="0.9" />
-          <path d="M12.6 3.4l2 2M14.6 3.4l-2 2" />
-        </svg>
-      </PanelToggle>
-      <PanelToggle id="rescan" label="Rescan advisor — coverage heatmap" disabled={disabled} active={visiblePanels.has('rescan')} onClick={() => togglePanel('rescan')}>
-        <IconRescan />
-      </PanelToggle>
-      <PanelToggle id="validation" label="Field-data validation" disabled={disabled} active={visiblePanels.has('validation')} onClick={() => togglePanel('validation')}>
-        <IconValidation />
-      </PanelToggle>
-      <PanelToggle id="bucking" label="Stem bucking (log assortments)" disabled={disabled} active={visiblePanels.has('bucking')} onClick={() => togglePanel('bucking')}>
-        <IconBucking />
-      </PanelToggle>
-      <PanelToggle id="thinning" label="Thinning simulator (harvennus)" disabled={disabled} active={visiblePanels.has('thinning')} onClick={() => togglePanel('thinning')}>
-        <IconThinning />
-      </PanelToggle>
-      <PanelToggle id="density" label="Forestry density metrics" disabled={disabled} active={visiblePanels.has('density')} onClick={() => togglePanel('density')}>
-        <IconDensity />
-      </PanelToggle>
-      <PanelToggle id="report" label="One-click report (HTML / PDF)" disabled={disabled} active={visiblePanels.has('report')} onClick={() => togglePanel('report')}>
-        <IconReport />
-      </PanelToggle>
-      <PanelToggle id="caliper" label="Virtual caliper (click any stem)" disabled={disabled} active={visiblePanels.has('caliper')} onClick={() => togglePanel('caliper')}>
-        <IconCaliper />
-      </PanelToggle>
-      <PanelToggle id="slab" label="Cross-section slab" disabled={disabled} active={visiblePanels.has('slab')} onClick={() => togglePanel('slab')}>
-        <IconSlab />
-      </PanelToggle>
-      <PanelToggle id="scaninspect" label="Scan inspection — HPR + panorama" disabled={disabled} active={visiblePanels.has('scaninspect')} onClick={() => togglePanel('scaninspect')}>
-        <IconScanInspect />
-      </PanelToggle>
-      <PanelToggle id="plotbound" label="Plot boundary + expansion factors" disabled={disabled} active={visiblePanels.has('plotbound')} onClick={() => togglePanel('plotbound')}>
-        <IconPlotBound />
-      </PanelToggle>
-      <PanelToggle id="treehandle" label="Click-to-measure-tree (DBH + height + lean + crown)" disabled={disabled} active={visiblePanels.has('treehandle')} onClick={() => togglePanel('treehandle')}>
-        <IconTreeHandle />
-      </PanelToggle>
-      <PanelToggle id="centerline" label="Stem centerline extraction (trunk polylines)" disabled={disabled} active={visiblePanels.has('centerline')} onClick={() => togglePanel('centerline')}>
-        <IconCenterline />
-      </PanelToggle>
-      <PanelToggle id="tst" label="Tree Skeleton Transfer (TST) — baseline → target labels" disabled={disabled} active={visiblePanels.has('tst')} onClick={() => togglePanel('tst')}>
-        <IconSkeletonTransfer />
-      </PanelToggle>
-      <PanelToggle id="m3c2" label="M3C2 — multi-temporal change / growth between two epochs" disabled={disabled} active={visiblePanels.has('m3c2')} onClick={() => togglePanel('m3c2')}>
-        <IconM3C2 />
-      </PanelToggle>
-      <PanelToggle id="taper" label="Stem taper — per-tree diameter profile, volume & log bucking" disabled={disabled} active={visiblePanels.has('taper')} onClick={() => togglePanel('taper')}>
-        <IconStemTaper />
-      </PanelToggle>
-      <PanelToggle id="growth" label="Tree growth — per-tree DBH / height / volume increment between two epochs" disabled={disabled} active={visiblePanels.has('growth')} onClick={() => togglePanel('growth')}>
-        <IconTreeGrowth />
-      </PanelToggle>
-      <PanelToggle id="crosssensor" label="ALS ↔ TLS join — match airborne crowns to ground-based stems, detection rate by diameter class" disabled={disabled} active={visiblePanels.has('crosssensor')} onClick={() => togglePanel('crosssensor')}>
-        <IconCrossSensor />
-      </PanelToggle>
-      <PanelToggle id="register" label="Cloud registration — put two clouds of one plot on each other: skeletons → target trees, lossless georeference shift" disabled={disabled} active={visiblePanels.has('register')} onClick={() => togglePanel('register')}>
-        <IconRegister />
-      </PanelToggle>
-      <PanelToggle id="finereg" label="Fine registration — two datasets on each other in six degrees of freedom: symmetric ICP with error bars, written as a moved copy" disabled={disabled} active={visiblePanels.has('finereg')} onClick={() => togglePanel('finereg')}>
-        <IconFineRegister />
-      </PanelToggle>
-      <PanelToggle id="segment" label="Auto-segment (trees + deadwood)" disabled={disabled} active={visiblePanels.has('segment')} onClick={() => togglePanel('segment')}>
-        <IconSegment />
-      </PanelToggle>
-      <PanelToggle id="ground" label="Terrain" disabled={disabled} active={visiblePanels.has('ground')} onClick={() => togglePanel('ground')}>
-        <IconGround />
-      </PanelToggle>
-      <PanelToggle id="history" label="History" disabled={disabled} active={visiblePanels.has('history')} onClick={() => togglePanel('history')}>
-        <IconClock />
-      </PanelToggle>
-      <PanelToggle id="subset" label="Subset / extract" disabled={disabled} active={visiblePanels.has('subset')} onClick={() => togglePanel('subset')}>
-        <IconScissors />
-      </PanelToggle>
-      <PanelToggle id="layers" label="Layers" disabled={false} active={visiblePanels.has('layers')} onClick={() => togglePanel('layers')}>
-        <IconLayers />
-      </PanelToggle>
+      {/* The panels in groups by what they are for, each folding
+          away (ActivityGroup) — 36 icons in one column did not fit a laptop
+          screen and the last ones could not be reached. */}
+      <ActivityGroup id="view" label="VIEW" title="Seeing the cloud: display, filters, layers, views & video, sections" open={groupOpen('view')} onToggle={() => toggleGroup('view')}
+        active={['display', 'filters', 'layers', 'viewtools', 'slab', 'scaninspect'].some((p) => visiblePanels.has(p as PanelId))}>
+        <PanelToggle id="display" label="Display" disabled={disabled} active={visiblePanels.has('display')} onClick={() => togglePanel('display')}>
+          <IconPalette />
+        </PanelToggle>
+        <PanelToggle
+          id="filters"
+          label={nFilters > 0 ? `Filters (${nFilters} active)` : 'Filters'}
+          disabled={disabled}
+          active={visiblePanels.has('filters')}
+          onClick={() => togglePanel('filters')}
+          badge={nFilters > 0 ? nFilters : undefined}
+        >
+          <IconFilter />
+        </PanelToggle>
+        <PanelToggle id="layers" label="Layers" disabled={false} active={visiblePanels.has('layers')} onClick={() => togglePanel('layers')}>
+          <IconLayers />
+        </PanelToggle>
+        <PanelToggle id="viewtools" label="Views & video — X-ray view, fly-through, slice through, time lapse; recorded as video" disabled={disabled} active={visiblePanels.has('viewtools')} onClick={() => togglePanel('viewtools')}>
+          <ViewToolsIcon />
+        </PanelToggle>
+        <PanelToggle id="slab" label="Cross-section slab" disabled={disabled} active={visiblePanels.has('slab')} onClick={() => togglePanel('slab')}>
+          <IconSlab />
+        </PanelToggle>
+        <PanelToggle id="scaninspect" label="Scan inspection — HPR + panorama" disabled={disabled} active={visiblePanels.has('scaninspect')} onClick={() => togglePanel('scaninspect')}>
+          <IconScanInspect />
+        </PanelToggle>
+      </ActivityGroup>
+      <ActivityGroup id="edit" label="EDIT" title="Editing: tools, history, segmentation, terrain, tree review" open={groupOpen('edit')} onToggle={() => toggleGroup('edit')}
+        active={['tools', 'history', 'segment', 'ground', 'review', 'branches', 'subset'].some((p) => visiblePanels.has(p as PanelId))}>
+        <PanelToggle id="tools" label="Tools" disabled={disabled} active={visiblePanels.has('tools')} onClick={() => togglePanel('tools')}>
+          <IconCursor />
+        </PanelToggle>
+        <PanelToggle id="history" label="History" disabled={disabled} active={visiblePanels.has('history')} onClick={() => togglePanel('history')}>
+          <IconClock />
+        </PanelToggle>
+        <PanelToggle id="segment" label="Auto-segment (trees + deadwood)" disabled={disabled} active={visiblePanels.has('segment')} onClick={() => togglePanel('segment')}>
+          <IconSegment />
+        </PanelToggle>
+        <PanelToggle id="ground" label="Terrain" disabled={disabled} active={visiblePanels.has('ground')} onClick={() => togglePanel('ground')}>
+          <IconGround />
+        </PanelToggle>
+        <PanelToggle id="review" label="Tree review" disabled={disabled} active={visiblePanels.has('review')} onClick={() => togglePanel('review')}>
+          <IconTree />
+        </PanelToggle>
+        <PanelToggle id="branches" label="Branches — cut branches out by hand, caliper their base diameter, measure their length" disabled={disabled} active={visiblePanels.has('branches')} onClick={() => togglePanel('branches')}>
+          <IconBranches />
+        </PanelToggle>
+        <PanelToggle id="subset" label="Subset / extract" disabled={disabled} active={visiblePanels.has('subset')} onClick={() => togglePanel('subset')}>
+          <IconScissors />
+        </PanelToggle>
+      </ActivityGroup>
+      <ActivityGroup id="measure" label="MEASURE" title="Measuring trees and the plot" open={groupOpen('measure')} onToggle={() => toggleGroup('measure')}
+        active={['survey', 'height', 'caliper', 'treehandle', 'stems', 'centerline', 'taper', 'plotbound'].some((p) => visiblePanels.has(p as PanelId))}>
+        {/* Measuring, contours, volumes, change, ortho images, profiles. */}
+        <PanelToggle id="survey" label="Survey — measure lines and areas, contour lines, volumes, voxel change, ortho images, section profiles" disabled={disabled} active={visiblePanels.has('survey')} onClick={() => togglePanel('survey')}>
+          <SurveyIcon />
+        </PanelToggle>
+        <PanelToggle id="height" label="Height — click two points (a root and a top): the height and distance between them on a scale with lines every few metres" disabled={disabled} active={visiblePanels.has('height')} onClick={() => togglePanel('height')}>
+          <IconHeight />
+        </PanelToggle>
+        <PanelToggle id="caliper" label="Virtual caliper (click any stem)" disabled={disabled} active={visiblePanels.has('caliper')} onClick={() => togglePanel('caliper')}>
+          <IconCaliper />
+        </PanelToggle>
+        <PanelToggle id="treehandle" label="Click-to-measure-tree (DBH + height + lean + crown)" disabled={disabled} active={visiblePanels.has('treehandle')} onClick={() => togglePanel('treehandle')}>
+          <IconTreeHandle />
+        </PanelToggle>
+        <PanelToggle id="stems" label="Stems — calipers at DBH, d6 or any height above the ground, a taper series, tree height and stem length" disabled={disabled} active={visiblePanels.has('stems')} onClick={() => togglePanel('stems')}>
+          <IconStems />
+        </PanelToggle>
+        <PanelToggle id="centerline" label="Stem centerline extraction (trunk polylines)" disabled={disabled} active={visiblePanels.has('centerline')} onClick={() => togglePanel('centerline')}>
+          <IconCenterline />
+        </PanelToggle>
+        <PanelToggle id="taper" label="Stem taper — per-tree diameter profile, volume & log bucking" disabled={disabled} active={visiblePanels.has('taper')} onClick={() => togglePanel('taper')}>
+          <IconStemTaper />
+        </PanelToggle>
+        <PanelToggle id="plotbound" label="Plot boundary + expansion factors" disabled={disabled} active={visiblePanels.has('plotbound')} onClick={() => togglePanel('plotbound')}>
+          <IconPlotBound />
+        </PanelToggle>
+      </ActivityGroup>
+      <ActivityGroup id="analyse" label="ANALYSE" title="Quality, metrics and reports" open={groupOpen('analyse')} onToggle={() => toggleGroup('analyse')}
+        active={['qc', 'pointqc', 'rescan', 'validation', 'density', 'bucking', 'thinning', 'report'].some((p) => visiblePanels.has(p as PanelId))}>
+        <PanelToggle id="qc" label="QC — flag suspect trees" disabled={disabled} active={visiblePanels.has('qc')} onClick={() => togglePanel('qc')}>
+          <IconQc />
+        </PanelToggle>
+        <PanelToggle id="pointqc" label="Point QC — reflectance / outlier / wind" disabled={disabled} active={visiblePanels.has('pointqc')} onClick={() => togglePanel('pointqc')}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+            <path d="M2 12.5h12" />
+            <circle cx="5" cy="9" r="0.9" />
+            <circle cx="8" cy="6" r="0.9" />
+            <circle cx="11" cy="8.5" r="0.9" />
+            <path d="M12.6 3.4l2 2M14.6 3.4l-2 2" />
+          </svg>
+        </PanelToggle>
+        <PanelToggle id="rescan" label="Rescan advisor — coverage heatmap" disabled={disabled} active={visiblePanels.has('rescan')} onClick={() => togglePanel('rescan')}>
+          <IconRescan />
+        </PanelToggle>
+        <PanelToggle id="validation" label="Field-data validation" disabled={disabled} active={visiblePanels.has('validation')} onClick={() => togglePanel('validation')}>
+          <IconValidation />
+        </PanelToggle>
+        <PanelToggle id="density" label="Forestry density metrics" disabled={disabled} active={visiblePanels.has('density')} onClick={() => togglePanel('density')}>
+          <IconDensity />
+        </PanelToggle>
+        <PanelToggle id="bucking" label="Stem bucking (log assortments)" disabled={disabled} active={visiblePanels.has('bucking')} onClick={() => togglePanel('bucking')}>
+          <IconBucking />
+        </PanelToggle>
+        <PanelToggle id="thinning" label="Thinning simulator (harvennus)" disabled={disabled} active={visiblePanels.has('thinning')} onClick={() => togglePanel('thinning')}>
+          <IconThinning />
+        </PanelToggle>
+        <PanelToggle id="report" label="One-click report (HTML / PDF)" disabled={disabled} active={visiblePanels.has('report')} onClick={() => togglePanel('report')}>
+          <IconReport />
+        </PanelToggle>
+      </ActivityGroup>
+      <ActivityGroup id="compare" label="COMPARE" title="Two clouds: registration, change, growth, transfer" open={groupOpen('compare')} onToggle={() => toggleGroup('compare')}
+        active={['register', 'finereg', 'm3c2', 'growth', 'tst', 'crosssensor'].some((p) => visiblePanels.has(p as PanelId))}>
+        <PanelToggle id="register" label="Cloud registration — put two clouds of one plot on each other: skeletons → target trees, lossless georeference shift" disabled={disabled} active={visiblePanels.has('register')} onClick={() => togglePanel('register')}>
+          <IconRegister />
+        </PanelToggle>
+        <PanelToggle id="finereg" label="Fine registration — two datasets on each other in six degrees of freedom: symmetric ICP with error bars, written as a moved copy" disabled={disabled} active={visiblePanels.has('finereg')} onClick={() => togglePanel('finereg')}>
+          <IconFineRegister />
+        </PanelToggle>
+        <PanelToggle id="m3c2" label="M3C2 — multi-temporal change / growth between two epochs" disabled={disabled} active={visiblePanels.has('m3c2')} onClick={() => togglePanel('m3c2')}>
+          <IconM3C2 />
+        </PanelToggle>
+        <PanelToggle id="growth" label="Tree growth — per-tree DBH / height / volume increment between two epochs" disabled={disabled} active={visiblePanels.has('growth')} onClick={() => togglePanel('growth')}>
+          <IconTreeGrowth />
+        </PanelToggle>
+        <PanelToggle id="tst" label="Tree Skeleton Transfer (TST) — baseline → target labels" disabled={disabled} active={visiblePanels.has('tst')} onClick={() => togglePanel('tst')}>
+          <IconSkeletonTransfer />
+        </PanelToggle>
+        <PanelToggle id="crosssensor" label="ALS ↔ TLS join — match airborne crowns to ground-based stems, detection rate by diameter class" disabled={disabled} active={visiblePanels.has('crosssensor')} onClick={() => togglePanel('crosssensor')}>
+          <IconCrossSensor />
+        </PanelToggle>
+      </ActivityGroup>
 
       <div className="flex-1" />
       <PanelToggle id="keys" label="Keyboard shortcuts" disabled={disabled} active={visiblePanels.has('keys')} onClick={() => togglePanel('keys')}>
         <IconKeyboard />
       </PanelToggle>
     </div>
+    </Wide.Provider>
+  );
+}
+
+/** An icon button's shape — a square, or in the widened bar a
+ *  row with the name beside the icon. */
+function buttonClass(wide: boolean): string {
+  return wide
+    ? 'w-full h-9 px-2.5 gap-2.5 rounded-md flex items-center justify-start transition-all relative shrink-0'
+    : 'w-10 h-10 rounded-md flex items-center justify-center transition-all relative shrink-0';
+}
+
+function NameBeside({ label }: { label: string }) {
+  return <span className="text-[12px] truncate text-left" style={{ minWidth: 0 }}>{shortName(label)}</span>;
+}
+
+/** A group of panel icons under a small header that folds it;
+ *  folded, the header lights up while one of its panels is open. */
+function ActivityGroup({ id, label, title, open, onToggle, active, children }: {
+  id: string; label: string; title: string; open: boolean; onToggle: () => void; active: boolean; children: React.ReactNode;
+}) {
+  const wide = useContext(Wide);
+  return (
+    <>
+      <button type="button" onClick={onToggle} data-group={id} title={`${title} — click to ${open ? 'fold' : 'unfold'}`}
+        className={`w-full mono flex items-center ${wide ? 'justify-start gap-1' : 'justify-center gap-0.5'} shrink-0`}
+        style={{ fontSize: wide ? 9 : 8, letterSpacing: '0.08em', color: active && !open ? 'var(--accent)' : 'var(--text-mute)', background: 'none', border: 'none', padding: wide ? '7px 0 2px 4px' : '5px 0 1px', cursor: 'pointer' }}>
+        <span style={{ fontSize: 7 }}>{open ? '▾' : '▸'}</span>
+        <span>{label}</span>
+        {active && !open && <span className="rounded-full" style={{ width: 4, height: 4, background: 'var(--accent)', marginLeft: 2 }} />}
+      </button>
+      {open && children}
+    </>
   );
 }
 
@@ -168,12 +279,13 @@ function ActivityBtn({
   shortcut?: string;
   disabled?: boolean;
 }) {
+  const wide = useContext(Wide);
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       title={shortcut ? `${label} (${shortcut})` : label}
-      className="w-10 h-10 rounded-md flex items-center justify-center transition-all"
+      className={buttonClass(wide)}
       style={{
         color: disabled ? 'var(--text-mute)' : 'var(--text-dim)',
         background: 'transparent',
@@ -190,6 +302,7 @@ function ActivityBtn({
       }}
     >
       {children}
+      {wide && <NameBeside label={label} />}
     </button>
   );
 }
@@ -205,13 +318,14 @@ function PanelToggle({
   id: PanelId;
   badge?: number;
 }) {
+  const wide = useContext(Wide);
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       title={label}
       data-panel={id}
-      className="w-10 h-10 rounded-md flex items-center justify-center transition-all relative"
+      className={buttonClass(wide)}
       style={{
         color: disabled ? 'var(--text-mute)' : (active ? 'var(--accent)' : 'var(--text-dim)'),
         background: active ? 'color-mix(in oklch, var(--accent) 14%, transparent)' : 'transparent',
@@ -229,6 +343,7 @@ function PanelToggle({
       }}
     >
       {children}
+      {wide && <NameBeside label={label} />}
       {active && (
         <span
           className="absolute left-0 top-1/2 -translate-y-1/2 rounded-full"
@@ -390,6 +505,47 @@ function IconScanInspect() {
       <path d="M15.5 15.5 L17.5 17.5" />
       <path d="M17.5 6.5 L15.5 8.5" />
       <path d="M8.5 15.5 L6.5 17.5" />
+    </svg>
+  );
+}
+
+function IconStems() {
+  // A stem on the ground with caliper jaws across it at breast height.
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 21 H21" />
+      <path d="M10 21 V3" />
+      <path d="M14 21 V5" />
+      <path d="M6 13 H18" />
+      <path d="M6 11 V15" />
+      <path d="M18 11 V15" />
+    </svg>
+  );
+}
+
+function IconBranches() {
+  // A branch leaving a stem, with caliper jaws across its base.
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 21 V3" />
+      <path d="M6 14 L19 6" />
+      <path d="M10 9.5 L12.5 13.5" />
+      <path d="M8.6 10.4 L11.1 14.4" opacity="0.5" />
+    </svg>
+  );
+}
+
+function IconHeight() {
+  // A ruler standing up with its lines, and a point at its top — a height
+  // read between two clicked points.
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 21 V4" />
+      <path d="M8 21 H11 M8 16.5 H12.5 M8 12 H11 M8 7.5 H12.5" />
+      <path d="M5 4 H11" />
+      <circle cx="17" cy="4" r="1.6" fill="currentColor" stroke="none" />
+      <circle cx="17" cy="21" r="1.6" fill="currentColor" stroke="none" />
+      <path d="M17 6.5 V18.5" strokeDasharray="1.5 2" />
     </svg>
   );
 }

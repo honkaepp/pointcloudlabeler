@@ -39,6 +39,7 @@ use crate::commands::octree::{
     TreeIsoRequest, TreeMetric, TreeSummaryEntry,
 };
 use crate::commands::pointqc::PointQcParams;
+use crate::commands::octree::forest::{run_segment_forest, ForestRequest, ForestResult};
 
 // Defaults, each the panel's. Named for where they come from.
 fn f_0_05() -> f64 { 0.05 }
@@ -447,6 +448,64 @@ pub struct LeafWoodOutcome {
     pub overrides_cleared: u64,
 }
 
+/// The forest pass — wood / leaf, stems and trees in one go.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForestParams {
+    /// The dataset directory (`<project>/octrees/<name>`).
+    pub octree_dir: String,
+    /// Voxel edge of the working set, metres (default 0.04).
+    #[serde(default = "forest_voxel")]
+    pub voxel: f64,
+    /// Points lower than this above the ground stay out of the graph, metres (default 0.25).
+    #[serde(default = "forest_cut")]
+    pub cut: f64,
+    /// Ground model cell, metres (default 0.5).
+    #[serde(default = "f_0_5")]
+    pub dtm_cell: f64,
+    /// Blend a Reflectance column (as some TLS scanners write) into the wood likelihood where present (default true).
+    #[serde(default = "forest_true")]
+    pub use_reflectance: bool,
+    /// Flag trees standing this close to the data's edge, metres (default 2).
+    #[serde(default = "f_2")]
+    pub edge_buffer: f64,
+    /// Flag trees lower than this as understory, metres (default 2).
+    #[serde(default = "f_2")]
+    pub understory: f64,
+    /// Grow the trees from forest/seeds.json (stems corrected by hand).
+    #[serde(default)]
+    pub use_saved_seeds: bool,
+    /// Also write stem / branch / leaf into the semantic column (default true).
+    #[serde(default = "forest_true")]
+    pub write_semantic: bool,
+}
+
+fn forest_voxel() -> f64 { 0.04 }
+fn forest_cut() -> f64 { 0.25 }
+fn forest_true() -> bool { true }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForestOutcome {
+    #[serde(flatten)]
+    pub result: ForestResult,
+    pub overrides_cleared: u64,
+}
+
+fn segment_forest(ctx: &OpContext, p: ForestParams) -> Result<ForestOutcome, String> {
+    non_empty(&p.octree_dir, "octreeDir")?;
+    let _guard = lock_dataset(&p.octree_dir)?;
+    let req = ForestRequest {
+        voxel: p.voxel, cut: p.cut, dtm_cell: p.dtm_cell, use_reflectance: p.use_reflectance,
+        edge_buffer: p.edge_buffer, understory: p.understory, use_saved_seeds: p.use_saved_seeds,
+        write_semantic: p.write_semantic,
+    };
+    let result = run_segment_forest(&ctx.progress, &p.octree_dir, &req)?;
+    let cols = if p.write_semantic { PatchColumns::TREE_ID_AND_SEMANTIC } else { PatchColumns::TREE_ID };
+    let overrides_cleared = clear_patch_columns(&p.octree_dir, cols)?;
+    Ok(ForestOutcome { result, overrides_cleared })
+}
+
 fn segment_leafwood(ctx: &OpContext, p: LeafWoodParams) -> Result<LeafWoodOutcome, String> {
     non_empty(&p.octree_dir, "octreeDir")?;
     let _guard = lock_dataset(&p.octree_dir)?;
@@ -658,7 +717,7 @@ fn qc_points(ctx: &OpContext, p: PointQcOpParams) -> Result<PointQcSummary, Stri
 // --- quality control ------------------------------------------------------
 
 /// Per-tree QC: the metrics (with stem fits merged), the QSM cache if
-/// there is one, the ten checks, ranked.
+/// there is one, the twelve checks, ranked.
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QcParams {
@@ -750,6 +809,8 @@ pub(super) fn ops() -> Vec<OpDef> {
             "Write the DTM, DSM, CHM and the terrain derivatives into the dataset's terrain/ folder.", TerrainParams, terrain_compute),
         op!("ground.normalize", Ground, mutates: true, stage: Some("normalize"),
             "Add a height-above-ground column computed against the DTM.", NormalizeParams, ground_normalize),
+        op!("segment.forest", Segment, mutates: true, stage: Some("forest"),
+            "Find the stems and grow every tree from them: wood and leaf from shape and the flow to the ground, trees by geodesic growth over the wood; writes tree ids and stem / branch / leaf, and forest/seeds.json, trees.json, suggestions.json.", ForestParams, segment_forest),
         op!("segment.chm", Segment, mutates: true, stage: Some("segment"),
             "Segment trees by watershed over the canopy height model; writes tree ids and clears their overlay overrides.", SegmentChmParams, segment_chm),
         op!("segment.treeiso", Segment, mutates: true, stage: Some("treeiso"),
@@ -759,7 +820,7 @@ pub(super) fn ops() -> Vec<OpDef> {
         op!("segment.deadwood", Segment, mutates: true, stage: Some("deadwood"),
             "Detect lying dead wood near the ground; writes the laying-deadwood column.", DeadwoodParams, segment_deadwood),
         op!("segment.leafwood", Segment, mutates: true, stage: Some("leafwood"),
-            "Separate wood from foliage by local geometry; writes the stem/branch label.", LeafWoodParams, segment_leafwood),
+            "Separate wood from foliage by local geometry; writes stem (1), branch (2) and leaf (4) labels.", LeafWoodParams, segment_leafwood),
         op!("segment.reset", Segment, mutates: true, stage: Some("reset_attr"),
             "Zero one label column (tree id, semantic or a deadwood column) in the dataset and its overlay.", ResetAttributeParams, segment_reset),
         op!("metrics.trees", Metrics, mutates: false, stage: Some("metrics"),
@@ -773,7 +834,7 @@ pub(super) fn ops() -> Vec<OpDef> {
         op!("metrics.density", Metrics, mutates: true, stage: Some("density"),
             "Gridded canopy density metrics written to the dataset's density/ folder.", DensityParams, metrics_density),
         op!("qc.flags", Qc, mutates: false, stage: Some("metrics"),
-            "Run the ten per-tree checks over the metrics and the QSM cache; flags ranked by severity.", QcParams, qc_flags),
+            "Run the twelve per-tree checks (with the plot's own height–DBH curve and the QSM log) over the metrics and the QSM cache; flags ranked by severity.", QcParams, qc_flags),
         op!("qc.points", Qc, mutates: true, stage: Some("pointqc"),
             "Per-point quality classification (reflectance, outliers, wind), optionally written as a column.", PointQcOpParams, qc_points),
     ]

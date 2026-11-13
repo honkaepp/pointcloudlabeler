@@ -21,6 +21,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+import { isOrtho } from './viewCamera';
 
 interface Props {
   enabled: boolean;
@@ -45,6 +46,13 @@ const VERT = /* glsl */ `
 // log so the per-neighbour difference behaves uniformly across the
 // scene's depth range. The 4-neighbour cross is enough — going to 8
 // barely changes the look and doubles the texture-sample cost.
+//
+// A parallel view (viewCamera.ts) writes depth LINEAR in eye distance
+// between its own near and far (near behind the camera, so a distance
+// can be negative): uOrtho switches to that identity, and the distance
+// is floored at a twentieth of the target distance the view matches the
+// perspective one at, so the log reads the same differences as the
+// perspective view does around its target.
 const FRAG = /* glsl */ `
   precision highp float;
   uniform sampler2D uColor;
@@ -54,13 +62,19 @@ const FRAG = /* glsl */ `
   uniform float uRadius;
   uniform float uNear;
   uniform float uFar;
+  uniform float uOrtho;
+  uniform float uOrthoDist;
   varying vec2 vUv;
 
   // Perspective depth (0..1) → eye-space distance (metres, positive).
   // The standard reverse-projection identity for a right-handed camera
-  // looking down -Z.
+  // looking down -Z. In a parallel view depth is linear in the distance.
   float linearise(float z) {
     float ndc = z * 2.0 - 1.0;
+    if (uOrtho > 0.5) {
+      float lin = 0.5 * (ndc * (uFar - uNear) + uFar + uNear);
+      return max(lin, 0.05 * uOrthoDist);
+    }
     return (2.0 * uNear * uFar) / (uFar + uNear - ndc * (uFar - uNear));
   }
 
@@ -142,6 +156,8 @@ export default function EdlPass({ enabled, strength = 1.0, radius = 1.5 }: Props
         uRadius: { value: radius },
         uNear: { value: 0.0001 },
         uFar: { value: 1e9 },
+        uOrtho: { value: 0 },
+        uOrthoDist: { value: 1 },
       },
       depthTest: false,
       depthWrite: false,
@@ -199,8 +215,17 @@ export default function EdlPass({ enabled, strength = 1.0, radius = 1.5 }: Props
       u.uDepth.value = target.depthTexture;
       u.uStrength.value = onRef.current.strength;
       u.uRadius.value = onRef.current.radius;
-      u.uNear.value = cam.near;
-      u.uFar.value = cam.far;
+      // A parallel camera's depth runs between its own near and far.
+      if (isOrtho(cam)) {
+        u.uOrtho.value = 1;
+        u.uNear.value = cam.orthoNear;
+        u.uFar.value = cam.orthoFar;
+        u.uOrthoDist.value = Math.max(1e-6, cam.orthoDistance);
+      } else {
+        u.uOrtho.value = 0;
+        u.uNear.value = cam.near;
+        u.uFar.value = cam.far;
+      }
       gl.clear();
       gl.render(quadScene, orthoCam);
     } catch {

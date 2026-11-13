@@ -36,12 +36,20 @@ pub struct ProjectMeta {
     #[serde(rename = "defaultCloudFormat")]
     pub default_cloud_format: String,
     pub notes: String,
+    /// The folder the project was last opened from — how a
+    /// folder renamed or moved outside the application is noticed
+    /// (commands/project_rename.rs).
+    #[serde(rename = "lastFolder", default, skip_serializing_if = "Option::is_none")]
+    pub last_folder: Option<String>,
 }
 
 pub struct OpenProject {
     pub folder: PathBuf,
     pub meta: ProjectMeta,
     pub db: Connection,
+    /// Where the project was before, when this open found it
+    /// somewhere new (commands/project_rename.rs).
+    pub relocated: Option<crate::commands::project_rename::Relocation>,
 }
 
 /// Per-cloud open file descriptors (so renderer can stream large writes/reads).

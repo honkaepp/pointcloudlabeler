@@ -65,7 +65,8 @@ describe('the native menu', () => {
 
   it('maps a bridge event to its target and ignores the rest', () => {
     expect(menuTarget('menu:undo')).toEqual({ kind: 'action', id: 'edit.undo' });
-    expect(menuTarget('menu:open-cloud')).toEqual({ kind: 'action', id: 'file.import' });
+    // File → Open Data… is the App's data door, not an editor action
+    expect(menuTarget('menu:open-data')).toBeNull();
     expect(menuTarget('menu:panel-filters')).toEqual({ kind: 'panel', id: 'filters' });
     expect(menuTarget('menu:shortcuts')).toEqual({ kind: 'panel', id: 'keys' });
     expect(menuTarget('menu:project-new')).toBeNull();

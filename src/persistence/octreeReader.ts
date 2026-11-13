@@ -225,6 +225,9 @@ export interface BranchCylinder {
 }
 
 /** Per-tree stem QSM (v1: stem + primary branches). */
+/** One thing the QSM fit has to say about a tree. */
+export interface QsmNote { code: string; severity: 'info' | 'warning'; text: string; hint: string }
+
 export interface TreeQsm {
   treeId: number;
   baseX: number;
@@ -261,6 +264,14 @@ export interface TreeQsm {
    *  the `treeqsm` branch method — the other methods build no model to
    *  measure. */
   treeqsm?: QsmAttributes;
+  /** How each branch cylinder came about, parallel to
+   *  `branches`: 1 a gap bridge, 2 corrected, 3 seen from one side,
+   *  4 measured. Absent in caches from before. */
+  cylinderQuality?: number[];
+  /** What the fit has to say about the tree, coded. */
+  notes?: QsmNote[];
+  /** Leaf-labelled points left out of the model. */
+  leafPoints?: number;
 }
 
 /** The attributes a TreeQSM run reports, as `tree_data`,
@@ -325,6 +336,8 @@ export interface QsmResult {
   qsmPath: string;
   sliceHeight: number;
   minPointsPerSlice: number;
+  /** Leaf-labelled points left out of the fit, across the trees. */
+  leafPoints?: number;
 }
 
 /** A parsed raster grid (from an ESRI ASCII grid). `values` is row-major
@@ -361,7 +374,10 @@ export interface RasterLayer {
       // rasters; foresters opt in from the Density panel.
       | 'height_mean' | 'height_sd' | 'height_cv' | 'height_skew' | 'height_kurt'
       | 'height_p25' | 'height_p50' | 'height_p75' | 'height_p90' | 'height_p95'
-      | 'density' | 'canopy_cover';
+      | 'density' | 'canopy_cover'
+      // A grid opened from a file (Layers): a quantity on a
+      // sequential ramp, draped on its run's ground grid when there is one.
+      | 'grid';
   label: string;
   visible: boolean;
   grid: RasterGrid | null;
@@ -714,6 +730,10 @@ export interface OctreeMetadata {
    *  See `VerticalCrs` and commands/octree.rs's "Vertical datum"
    *  section. */
   vertical?: VerticalCrs;
+  /** The names the source file gave its classes, by code, from
+   *  its LAS Classification Lookup (LASF_Spec record 0). Shown in the
+   *  legend and the class filter, and written back on a LAS export. */
+  classNames?: Record<string, string>;
   tiles: OctreeTile[];
   createdAt: string;
 }
@@ -772,6 +792,10 @@ export interface OctreeIndex {
 type DesktopApi = {
   octreeList?: (projectFolder: string) => Promise<OctreeListEntry[]>;
   octreeReadMeta?: (octreeDir: string) => Promise<{ metadata: OctreeMetadata; hierarchy: OctreeNodeRecord[] }>;
+  /** Metadata.json alone, and hierarchy.bin raw (24-byte
+   *  records) — the open path for large clouds, without the JSON. */
+  octreeReadMetadata?: (octreeDir: string) => Promise<OctreeMetadata>;
+  octreeReadHierarchy?: (octreeDir: string) => Promise<ArrayBuffer>;
   octreeReadBlock?: (octreeDir: string, byteOffset: number, byteSize: number) => Promise<ArrayBuffer>;
   octreeReadBlockColumns?: (
     octreeDir: string, byteOffset: number, byteSize: number,
@@ -791,11 +815,40 @@ export async function listOctrees(projectFolder: string): Promise<OctreeListEntr
   return api.octreeList(projectFolder);
 }
 
+/** hierarchy.bin decoded: 24 bytes a record — child mask, level, two
+ *  reserved, u32 point count, u64 byte offset, u64 byte size, all
+ *  little-endian. The 64-bit fields are exact up to 2^53 bytes. */
+export function decodeHierarchy(buf: ArrayBuffer): OctreeNodeRecord[] {
+  if (buf.byteLength % 24 !== 0) {
+    throw new Error(`hierarchy.bin length ${buf.byteLength} is not a multiple of 24 — file may be corrupt`);
+  }
+  const n = buf.byteLength / 24;
+  const b = new Uint8Array(buf);
+  const u = new Uint32Array(buf, 0, n * 6);
+  const out: OctreeNodeRecord[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const w = i * 6;
+    out[i] = {
+      childMask: b[i * 24],
+      level: b[i * 24 + 1],
+      numPoints: u[w + 1],
+      byteOffset: u[w + 2] + u[w + 3] * 4294967296,
+      byteSize: u[w + 4] + u[w + 5] * 4294967296,
+    };
+  }
+  return out;
+}
+
 /** Load the metadata + full hierarchy for one dataset. */
 export async function openOctree(dir: string): Promise<OpenOctree> {
   const api = getApi();
   if (!api?.octreeReadMeta) throw new Error('Octree reader unavailable in this build.');
-  const { metadata, hierarchy } = await api.octreeReadMeta(dir);
+  // The raw hierarchy when the build has it — a billion-point
+  // cloud has over a million records, some 110 MB as JSON.
+  const { metadata, hierarchy } = api.octreeReadMetadata && api.octreeReadHierarchy
+    ? await Promise.all([api.octreeReadMetadata(dir), api.octreeReadHierarchy(dir)])
+      .then(([metadata, raw]) => ({ metadata, hierarchy: decodeHierarchy(raw) }))
+    : await api.octreeReadMeta(dir);
   // tile.recordOffset is set by the Rust converter and matches the
   // tile's first record in `hierarchy` exactly — but we materialise an
   // explicit per-tile start index in case future writers change the

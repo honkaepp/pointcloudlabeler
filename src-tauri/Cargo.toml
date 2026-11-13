@@ -1,6 +1,6 @@
 [package]
 name = "pointcloudlabeler-editor"
-version = "0.1.3"
+version = "0.1.4"
 description = "Tree segmentation, editing and label transfer for close-range forest point clouds"
 authors = ["Eppu Honkanen"]
 license = "GPL-3.0-or-later"
@@ -129,6 +129,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
+# Windows' verbatim prefix off a canonical path (fsgrant::plain); already
+# in the tree through tauri.
+dunce = "1"
 thiserror = "1"
 once_cell = "1"
 dirs = "5"
@@ -191,6 +194,19 @@ windows-sys = { version = "0.61", features = [
 # versions; naming them here adds no new crate.
 webview2-com = { version = "0.38", optional = true }
 windows-core = { version = "0.61", optional = true }
+
+# A .zip of clouds opened or dropped on the window, unpacked into the
+# project and routed like the files inside it — see commands/dataopen.rs.
+[dependencies.zip]
+version = "2"
+default-features = false
+features = ["deflate"]
+
+# PNG ortho images from the Survey panel (commands/octree/survey.rs).
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
 
 [profile.release]
 # panic: UNWIND, deliberately, and not the smaller "abort".

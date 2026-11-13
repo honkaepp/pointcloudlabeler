@@ -17,8 +17,11 @@ import { standardLasFields, unsupportedLasFields } from '../io/parseLasStream';
 import {
   POINT_FILE_KIND_LABELS, POINT_FILE_ROLES, type PointFileKind, type PointFileMapping, type PointFileProbe,
 } from '../io/pointFile';
+import { formatChord } from '../state/keybindings'; // This platform's shortcut
 
 interface Props {
+  /** The scanner, when the source says it: preselected. */
+  initialScanner?: ScannerType;
   fileName: string;
   isLas: boolean;
   columns: string[];
@@ -98,7 +101,7 @@ function detectRole(columns: string[], names: string[]): string {
   return '';
 }
 
-export default function ImportMappingDialog({ fileName, isLas, columns, suggested, onConfirm, onCancel, mode = 'full', pointFormat = null, pointFile }: Props) {
+export default function ImportMappingDialog({ initialScanner, fileName, isLas, columns, suggested, onConfirm, onCancel, mode = 'full', pointFormat = null, pointFile }: Props) {
   // Standard LAS fields this file has that the octree cannot carry.
   const dropped = unsupportedLasFields(pointFormat);
 
@@ -161,7 +164,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
   // payload when they coincide with the tree_id or semantic role since
   // those are already stored as their own fields.
   const [includeExtras, setIncludeExtras] = useState<Record<string, boolean>>({});
-  const [scannerType, setScannerType] = useState<ScannerType>('other');
+  const [scannerType, setScannerType] = useState<ScannerType>(initialScanner ?? 'other');
   const [mapping, setMapping] = useState<ColumnMapping>(suggested);
   // Coordinate-space vertical: Z (absolute) or H (above ground). Default Z
   // when an absolute elevation is available (always for LAS); otherwise H.
@@ -664,7 +667,7 @@ export default function ImportMappingDialog({ fileName, isLas, columns, suggeste
         {/* Footer */}
         <div className="flex items-center justify-between gap-2 px-5 py-3.5" style={{ borderTop: '1px solid var(--line)', background: 'var(--wash-1)' }}>
           <span className="mono text-[10px]" style={{ color: 'var(--text-mute)' }}>
-            <span className="kbd">⌘</span><span className="kbd">↵</span> import · <span className="kbd">Esc</span> cancel
+            <span className="kbd">{formatChord('mod+Enter')}</span> import · <span className="kbd">Esc</span> cancel
           </span>
           <div className="flex gap-1.5">
             <button className="btn !px-3" onClick={onCancel}>Cancel</button>

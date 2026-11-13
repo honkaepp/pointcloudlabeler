@@ -71,6 +71,17 @@ export default function StatusBar({ cursorRef }: Props) {
         value={selectedCount > 0 ? `${selectedCount.toLocaleString()} pts` : 'none'}
         accent={selectedCount > 0}
       />
+      {selectedCount > 0 && stats.deepSelectTruncated && (
+        // The shape reached past what one selection pass reads
+        // from disk; the points it left out are not selected.
+        <span
+          className="mono text-[10.5px]"
+          style={{ color: 'var(--warn, #d9a441)' }}
+          title="The selection covers more unloaded points than one pass reads (12 M points / 4000 nodes), so part of the shape is not selected. Zoom in, or select in parts."
+        >
+          partial — zoom in
+        </span>
+      )}
       {nFilters > 0 && (
         <>
           <Sep />

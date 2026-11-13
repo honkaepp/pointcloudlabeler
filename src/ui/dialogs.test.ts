@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { confirmDialog, alertDialog } from './dialogs';
 
 type G = { desktop?: unknown; confirm?: unknown; alert?: unknown };
@@ -68,8 +69,8 @@ describe('no call site asks the browser directly', () => {
     }
     return out;
   }
-  const root = new URL('../', import.meta.url).pathname;
-  const files = sources(root).filter(f => !f.endsWith('/ui/dialogs.ts'));
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const files = sources(root).filter(f => !f.replace(/\\/g, '/').endsWith('/ui/dialogs.ts'));
 
   it('uses no window.confirm or window.alert outside the helper', () => {
     const offenders = files.filter(f => /window\.(confirm|alert)\(/.test(readFileSync(f, 'utf8')));

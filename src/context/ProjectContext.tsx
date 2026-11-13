@@ -36,3 +36,10 @@ export function useProject(): ProjectContextValue {
   }
   return v;
 }
+
+/** The same, or null outside a ProjectProvider — for a part of a
+ *  panel that only has something to show with a project (Layers → Project
+ *  files), so the panel does not fail where there is none. */
+export function useOptionalProject(): ProjectContextValue | null {
+  return useContext(ProjectContext);
+}

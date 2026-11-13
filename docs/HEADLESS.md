@@ -461,7 +461,11 @@ triples of pairs that agree with each other on the distance between
 their points — the pairs agreeing with the most others first — and
 the hypothesis chosen by how much of the moving cloud lands on the
 reference — any heading, any offset, no ground classification
-needed). The report carries the transform (a row-major 4 × 4 in world
+needed), or from the two stem maps (`init: stems`: the
+stems at breast height — the forest pass's where a dataset has them,
+else found in four slices 0.8–2.2 m above the ground — matched pair by
+pair by their spacing and thickness; any heading, any offset, no
+skeletons; reported under `stems`). The report carries the transform (a row-major 4 × 4 in world
 coordinates, moving → reference), the translation at the moving
 cloud's centre and the rotation with their *standard errors* — from
 the covariance at the solution, and again by a spatial block jackknife
@@ -503,7 +507,7 @@ for the headless surfaces, function for function, and pinned from both
 sides by tests that read the constants out of the TypeScript and the
 Rust and fail on a drift in either:
 
-- the ten per-tree QC checks with their robust statistics
+- the twelve per-tree QC checks with their robust statistics
   (`src/metrics/qcFlags.ts` ↔ `src-tauri/src/ops/qc.rs`) and the merge
   that puts a RANSAC stem fit's diameter in place of the algebraic one
   — `src/testing/qcParity.test.ts`;

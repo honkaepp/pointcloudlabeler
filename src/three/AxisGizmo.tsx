@@ -49,7 +49,9 @@ const L = 26;        // axis length (px)
 
 /** DOM overlay: draws the three axes from the shared ref on a self-driven
  *  rAF loop. Pointer-transparent so it never blocks the orbit controls. */
-export function AxisGizmoOverlay({ dirsRef }: { dirsRef: React.MutableRefObject<GizmoDirs> }) {
+/** `onAxis` — a click on an axis looks along it (Z from above,
+ *  Y from the south, X from the east), as CloudCompare's does. */
+export function AxisGizmoOverlay({ dirsRef, onAxis }: { dirsRef: React.MutableRefObject<GizmoDirs>; onAxis?: (axis: keyof GizmoDirs) => void }) {
   const rootRef = useRef<SVGSVGElement | null>(null);
   // Per-axis element refs (positive + negative ends) so the rAF loop can
   // mutate attributes directly. Both ends are drawn so the cross reads as
@@ -99,7 +101,7 @@ export function AxisGizmoOverlay({ dirsRef }: { dirsRef: React.MutableRefObject<
       className="absolute pointer-events-none select-none"
       style={{ right: 14, bottom: 36, width: BOX, height: BOX, zIndex: 20 }}
       aria-hidden="true"
-      title="Orientation — X east · Y north · Z up"
+      title={onAxis ? 'Orientation — X east · Y north · Z up. Click an axis to look along it.' : 'Orientation — X east · Y north · Z up'}
     >
       <svg ref={rootRef} width={BOX} height={BOX} viewBox={`0 0 ${BOX} ${BOX}`}>
         {/* Soft backdrop disc so the cross reads over any cloud colour. */}
@@ -114,6 +116,8 @@ export function AxisGizmoOverlay({ dirsRef }: { dirsRef: React.MutableRefObject<
             <circle
               ref={(el) => { refs.current[a.key].disc = el; }}
               cx={C} cy={C} r="7" fill={a.color}
+              onClick={onAxis ? () => onAxis(a.key) : undefined}
+              style={onAxis ? { pointerEvents: 'auto', cursor: 'pointer' } : undefined}
             />
             <text
               ref={(el) => { refs.current[a.key].text = el; }}

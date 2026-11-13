@@ -153,13 +153,13 @@ pub fn authorise(
 ) -> AppResult<PathBuf> {
     let resolved = resolve_path(Path::new(path))?;
     if grants.permits(&resolved) {
-        return Ok(resolved);
+        return Ok(plain(resolved));
     }
     if let Some(folder) = project_folder {
         if !has_parent_dir(folder) {
             if let Ok(root) = resolve_path(folder) {
                 if resolved.starts_with(&root) {
-                    return Ok(resolved);
+                    return Ok(plain(resolved));
                 }
             }
         }
@@ -167,6 +167,26 @@ pub fn authorise(
     Err(AppError::msg(format!(
         "not permitted: {path} — a file must be chosen in a dialog, or live in the open project"
     )))
+}
+
+/// A resolved path in the form the user writes it. Canonicalising
+/// on Windows gives the verbatim form (`\\?\C:\…`, `\\?\UNC\server\…`), and
+/// a verbatim path takes no `/`: handed back to the renderer and joined
+/// there with `/` (`<project>/octrees/<name>`), it names nothing ("The
+/// filename, directory name, or volume label syntax is incorrect"). The
+/// prefix comes off wherever the plain form means the same path.
+pub fn plain(p: PathBuf) -> PathBuf {
+    dunce::simplified(&p).to_path_buf()
+}
+
+/// A renderer-supplied path as the OS reads it — one in the
+/// verbatim form (an older session handed those out; see `plain`) with its
+/// `/` turned to `\` and the prefix off where it can be.
+pub fn os_path(s: &str) -> PathBuf {
+    if s.starts_with(r"\\?\") {
+        return plain(PathBuf::from(s.replace('/', "\\")));
+    }
+    PathBuf::from(s)
 }
 
 /// Check that a renderer-supplied name is ONE path component.
@@ -235,6 +255,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_authorised_path_comes_back_without_the_verbatim_prefix() {
+        let g = PathGrants::default();
+        let dir = tmp("plain");
+        let picked = dir.join("picked.laz");
+        std::fs::write(&picked, b"x").unwrap();
+        g.grant_file(&picked);
+        let p = authorise(picked.to_str().unwrap(), &g, None).unwrap();
+        let s = p.to_str().unwrap();
+        assert!(!s.starts_with(r"\\?\"), "{s}");
+        // …so a folder joined onto it with `/`, as the renderer does, is one.
+        let out = format!("{}/octrees/x", dir.canonicalize().map(plain).unwrap().display());
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_verbatim_path_from_the_renderer_is_read_as_the_os_writes_it() {
+        assert_eq!(os_path(r"\\?\C:\data\proj/octrees/cloud"), PathBuf::from(r"C:\data\proj\octrees\cloud"));
+        // A share keeps its prefix (dunce leaves UNC alone) but loses the `/`.
+        assert_eq!(os_path(r"\\?\UNC\server\share\proj/octrees"), PathBuf::from(r"\\?\UNC\server\share\proj\octrees"));
+        assert_eq!(os_path("C:/data/proj/octrees/cloud"), PathBuf::from("C:/data/proj/octrees/cloud"));
+        assert_eq!(plain(PathBuf::from(r"C:\data")), PathBuf::from(r"C:\data"));
     }
 
     #[test]

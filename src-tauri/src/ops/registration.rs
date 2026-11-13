@@ -61,7 +61,7 @@ pub struct RegisterOpParams {
     pub reference_dir: String,
     /// The dataset to move onto it.
     pub moving_dir: String,
-    /// Where the fit starts: "current" (as they stand), "auto" (a coarse search by stems and crowns), "skeleton" (the stored skeleton alignment), "manual" (the offset below), "features" (a global search by surface features, any heading).
+    /// Where the fit starts: "current" (as they stand), "auto" (a coarse search by stems and crowns), "skeleton" (the stored skeleton alignment), "manual" (the offset below), "features" (a global search by surface features, any heading), "stems" (the two stem maps matched by spacing and thickness, any heading; the forest pass's stems where a dataset has them, else found at breast height).
     #[serde(default = "d_init")]
     pub init: RegisterInitMode,
     /// Manual start: metres east, north, up, and degrees of yaw about the moving cloud's centre.
@@ -79,7 +79,7 @@ pub struct RegisterOpParams {
     /// Automatic start: the yaw fan, ± degrees (default 5).
     #[serde(default = "d_yaw_range")]
     pub yaw_range_deg: f64,
-    /// Automatic start: the ground cell for heights above ground, metres (default 0.5).
+    /// Automatic and stem-map starts: the ground cell for heights above ground, metres (default 0.5).
     #[serde(default = "d_dtm_cell")]
     pub dtm_cell: f64,
     /// Feature start: the cell the features are computed on, metres (default 0.3).

@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   wrapHue, hslToRgb, hslToRgb01, treeIdColor, treeIdColor01,
-  classColor, classColor01, deadwoodColor, rampColor, hexToRgb255,
+  classColor, classColor01, classColorIn, namedClassCodes, deadwoodColor, rampColor, hexToRgb255,
   setCustomRampStops, RAMPS, UNASSIGNED_RGB, parseHex, hexToRgb01,
 } from './palette';
 
@@ -178,6 +178,19 @@ describe('classColor', () => {
     for (const cls of [0, 1, 8, 10, 255, -1, NaN]) {
       expect(classColor(cls)).toEqual([140, 140, 140]);
     }
+  });
+
+  /** A class the dataset's source file named gets a colour of
+   *  its own where the ASPRS palette has only grey; the rest is as it was. */
+  it('colours the classes a file named', () => {
+    const named = namedClassCodes({ '65': 'Branch', '64': 'Stem', '2': 'Ground', '1': 'Unclassified', x: 'no' } as Record<string, string>);
+    expect(named).toEqual([1, 2, 64, 65]);
+    for (const c of [0, 1, 2, 5, 9, 18, 200]) expect(classColorIn(c, named)).toEqual(classColor(c));
+    const stem = classColorIn(64, named), branch = classColorIn(65, named);
+    expect(stem).not.toEqual([140, 140, 140]);
+    expect(branch).not.toEqual([140, 140, 140]);
+    expect(dist(stem, branch)).toBeGreaterThan(60);
+    expect(classColorIn(64, [])).toEqual([140, 140, 140]);
   });
 
   /** The overlay writes float colours and the main cloud writes u8. They

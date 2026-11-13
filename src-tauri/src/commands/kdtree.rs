@@ -50,6 +50,39 @@ impl KdTree3 {
         if best.0 == u32::MAX { None } else { Some((self.ids[best.0 as usize], best.1)) }
     }
 
+    /// The `k` nearest points to `q` within squared distance
+    /// `max_d2`, nearest first, into `out` as (input index, squared
+    /// distance). `out` is cleared first; it holds fewer than `k` when
+    /// fewer are that close.
+    pub fn knn(&self, q: [f32; 3], k: usize, max_d2: f32, out: &mut Vec<(u32, f32)>) {
+        out.clear();
+        if self.pts.is_empty() || k == 0 { return; }
+        self.knn_rec(0, self.pts.len(), 0, q, k, max_d2, out);
+        for e in out.iter_mut() { e.0 = self.ids[e.0 as usize]; }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn knn_rec(&self, lo: usize, hi: usize, depth: usize, q: [f32; 3], k: usize, max_d2: f32, out: &mut Vec<(u32, f32)>) {
+        if lo >= hi { return; }
+        let mid = lo + (hi - lo) / 2;
+        let p = self.pts[mid];
+        let d2 = (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]);
+        let bound = |out: &Vec<(u32, f32)>| if out.len() < k { max_d2 } else { out[out.len() - 1].1 };
+        if d2 < bound(out) {
+            // insertion into the sorted buffer (k is small)
+            let at = out.partition_point(|e| e.1 <= d2);
+            if out.len() == k { out.pop(); }
+            out.insert(at, (mid as u32, d2));
+        }
+        let axis = depth % 3;
+        let diff = q[axis] - p[axis];
+        let (near, far) = if diff < 0.0 { ((lo, mid), (mid + 1, hi)) } else { ((mid + 1, hi), (lo, mid)) };
+        self.knn_rec(near.0, near.1, depth + 1, q, k, max_d2, out);
+        if diff * diff < bound(out) {
+            self.knn_rec(far.0, far.1, depth + 1, q, k, max_d2, out);
+        }
+    }
+
     fn search(&self, lo: usize, hi: usize, depth: usize, q: [f32; 3], best: &mut (u32, f32)) {
         if lo >= hi { return; }
         let mid = lo + (hi - lo) / 2;
@@ -122,6 +155,29 @@ mod tests {
             let (ti, td) = tree.nearest(q, f32::INFINITY).unwrap();
             assert!((td - bd).abs() <= 1e-4 * bd.max(1.0), "d2 {td} vs {bd}");
             if td == bd { assert_eq!(points[ti as usize], points[bi as usize]); }
+        }
+    }
+
+    #[test]
+    fn the_k_nearest_agree_with_brute_force() {
+        let mut seed = 11u64;
+        let points: Vec<[f32; 3]> = (0..4000).map(|_| [lcg(&mut seed) * 10.0, lcg(&mut seed) * 10.0, lcg(&mut seed) * 10.0]).collect();
+        let tree = KdTree3::build(&points);
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            let q = [lcg(&mut seed) * 10.0, lcg(&mut seed) * 10.0, lcg(&mut seed) * 10.0];
+            let mut all: Vec<f32> = points.iter().map(|p| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).collect();
+            all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            tree.knn(q, 12, f32::INFINITY, &mut out);
+            assert_eq!(out.len(), 12);
+            for (j, e) in out.iter().enumerate() {
+                assert!((e.1 - all[j]).abs() <= 1e-4, "{j}: {} vs {}", e.1, all[j]);
+                let p = points[e.0 as usize];
+                assert!(((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2) - e.1).abs() < 1e-4);
+            }
+            // a bound keeps only what is that close
+            tree.knn(q, 12, all[3] + 1e-6, &mut out);
+            assert_eq!(out.len(), 4);
         }
     }
 

@@ -8,8 +8,11 @@ whatever produced them: terrestrial, mobile and handheld scanners, and
 low-altitude airborne lidar from UAVs or helicopters. It streams plots
 of hundreds of millions of points from disk and puts the segmentation
 itself in the user's hands. Individual trees are found with published
-methods, then reviewed and corrected in the viewport with lasso, split
-and merge on the full data, guided by a quality-control engine that
+methods, or by a forest pass that finds the stems first and grows each
+tree from its stem over the wood, labelling stem, branch and leaf. They
+are then reviewed and corrected in the viewport with lasso, split and
+merge on the full data — the stems one by one from above at breast
+height, as in the field — guided by a quality-control engine that
 ranks the trees most likely to be wrong and a review record of what was
 checked and decided.
 
@@ -18,8 +21,10 @@ plot, whether a later epoch or a different sensor, through the trees'
 skeletons, so tree identities stay stable across a time series and the
 manual correction is done once. Per-tree metrics (height, DBH, taper,
 stem volume with confidence intervals, biomass and carbon), terrain
-rasters, side-by-side comparison of epochs and exports to LAS/LAZ, CSV
-and GeoTIFF complete the workflow. A Windows installer is on the GitHub
+rasters, survey measurements (lengths, areas, contours, volumes, ortho
+images, profiles, meshes), side-by-side comparison of epochs in a
+second window and exports to LAS/LAZ, CSV, GeoTIFF, DXF and open QSM
+files complete the workflow. A Windows installer is on the GitHub
 Releases page; macOS and Linux build from source.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
@@ -27,7 +32,7 @@ Releases page; macOS and Linux build from source.
 
 ## Status
 
-Version 0.1.3 is the current release: a Windows installer on the
+Version 0.1.4 is the current release: a Windows installer on the
 [Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page,
 built from this repository. Development continues here. A scientific
 article describing PointCloudLabeler is in preparation; a preprint is
@@ -58,18 +63,88 @@ beside the installer.
 ## Features
 
 ### Editor
+- One door for data: File ▶ Open Data…, the Open data buttons, or a
+  file or folder dropped anywhere on the window. Point clouds go to the
+  import (several one after another), a .zip of point clouds is
+  unpacked into the project first, a PTX goes to its importer, a
+  project folder opens, and trajectories, scan positions, stems,
+  regions, rasters, meshes and QSMs open as layers over the cloud. With
+  no project open, one is made for the data and named after it
+- Projects renamed in place, folder and all, from the project name in
+  the module bar; the recent list follows a project folder renamed or
+  moved outside the program
 - Out-of-core octree streaming — works on >100 M point plots without
   loading everything into RAM
-- Per-point editing with overlays (tree IDs, semantic class, deadwood
-  channels, custom Extra Bytes from LAS)
+- Per-point editing with overlays (tree IDs, semantic class — stem 1,
+  branch 2, leaf 4 — deadwood channels, custom Extra Bytes from LAS)
 - Lasso / rectangular / polygon selection that follows occlusion and
   the visible LOD
 - Auto-segmentation: CHM-watershed individual-tree-crown delineation,
   laying-deadwood detection via PCA + DBSCAN
+- **Forest pass — stems to trees**: the stems found first, as circles
+  in thin slices above the ground and from the flow of every branch
+  down to them, then each tree grown from its stem over the wood, the
+  foliage going with the branch it hangs from; stem, branch and leaf
+  written as semantic labels; trees at the data's edge and understory
+  flagged, never removed; the stems corrected by a click (add, merge,
+  delete, own tree) and every tree re-grown from them in seconds. Tuned
+  and checked against hand-segmented mobile laser scanning reference
+  plots and their field-measured diameters
+- Stem review as in the field: the forest pass's stems one by one, from
+  above in a thin slab at breast height in a parallel view, the doubtful
+  first — moved, fitted with the virtual caliper, added or deleted
+  there. On mobile scans, a review of the branches a tree nearly gave to
+  its neighbour, largest first, each moved to the other tree with one
+  key
 - Tree review workflow with per-tree isolation, height-band slicing
-  and "show neighbouring trees" context
+  and "show neighbouring trees" context; neighbours pulled aside in the
+  view (the picture only, the points keep their coordinates) so
+  interleaved branches come apart, while lasso and set-id still work on
+  what is seen
+- Branches cut out by hand and measured as in the field: a branch's
+  points lassoed into a branch of its own (painted in its colour from
+  then on, so the branches already done stand out), its base diameter
+  read with virtual calipers across a section perpendicular to the
+  branch — one reading or two at right angles, the jaws draggable —
+  and its length clicked along it or followed through its points;
+  everything kept beside the dataset and exported as CSV
+- Stems measured the same way: calipers across the stem at DBH (1.3 m),
+  d6 or any height above the ground — the stem followed up from its
+  foot by fitted circles, so a branch leaving it at that height is not
+  taken for it — a taper series up the stem, the tree's height and the
+  stem's length; on the whole tree, its stem-labelled points, or a stem
+  cut out by hand
 
-### Preprocessing
+### Viewing and measuring
+- **Looks**: a whole display for one job in one click — canopy height,
+  intensity, tree review, stand map by DBH, stems and wood, terrain and
+  classes, deadwood, measuring in parallel — and your own saved beside
+  them; a Display panel in folding sections and an activity bar in
+  folding groups
+- A colour ramp stretched on a histogram of the loaded points (2–98 %
+  in one click), intensity shading over any colour mode, and a legend
+  that hides a class or shows it alone with a click
+- Trees coloured one colour each by a measurement: height, DBH, crown,
+  lean, QC flag, or growth since an earlier epoch
+- Perspective or parallel projection, with a scale bar and a north
+  arrow; a section view straight along the cross-section slab, stepped
+  through the plot by its thickness; named views saved per dataset
+- **Survey**: lengths, areas and heights of a clicked line; contour
+  lines of the ground; cut-and-fill volumes; voxel change against
+  another acquisition; top and side ortho images; section profiles;
+  2.5D and closed 3D meshes; points as DXF
+- **Height** between two points (a root and a top) on a scale drawn in
+  the view, with helper rings that read from any side
+- **Views & video**: X-ray view, fly-through, a slice moved through the
+  cloud, a time lapse of epochs — each recorded as video
+- A **second window** beside the editor with its own dataset and every
+  panel, the two cameras and colour modes linked if wanted; a second
+  cloud in the same view clipped by the same extent filter
+- Layers from files: trajectories, scan positions, targets, stems
+  (CSV), GeoJSON and shapefile regions, ESRI ASCII grids, meshes (OBJ,
+  STL, PLY) and QSMs
+
+### Preprocessing (the Data tab)
 - Import of ASTM E2807 **E57**, Leica Cyclone **PTX / PTS**, and
   generic ASCII **XYZ / CSV / TXT** scans into editor-ready LAS / LAZ,
   with the scan positions and poses they carry
@@ -83,8 +158,11 @@ beside the installer.
   Simulation Filter)
 - DTM / DSM / CHM raster generation (Khosravipour pit-free option) →
   ESRI ASCII grids + **georeferenced GeoTIFFs**
-- Per-tree metrics: height, DBH (algebraic + RANSAC refinement),
-  basal area, crown area, crown diameter, stem centroid
+- Per-tree metrics: height, DBH (algebraic, the forest pass's
+  breast-height circle, or a stem fit refined from circles in thin
+  slices along a straight, possibly leaning axis, scored as a hollow
+  stem with a thin bark shell), basal area, crown area, crown diameter,
+  stem centroid
 - **Quantitative Structure Model (QSM)**:
   - **Slice-based stem fit** with 12-sector angular-coverage
     confidence per slice and an analytical 95 % CI on stem volume
@@ -93,6 +171,13 @@ beside the installer.
     cover-graph walk, branch hierarchy with parent-child + branch
     order, iterative cylinder LSQ fit with MAD outlier rejection,
     monotonic taper enforcement
+  - Fitted to the wood only where leaves are labelled; each cylinder's
+    quality (seen all round, from one side, corrected, a bridged gap),
+    QC flags from the QSM's log and from a height–DBH curve fitted to
+    the plot's own trees
+  - Written as open `.qsm` files with a `.qsf` manifest, an OBJ and a
+    PLY of tubes, drawn as tubes in the view; a `.qsm` / `.qsf` from
+    other QSM software opened beside the cloud
 - **Cloud registration**: two clouds of one plot that do not sit on
   each other — a TLS plot and the ALS epoch over it — are put together
   from the reference's tree skeletons, voted onto the target's stems and
@@ -117,7 +202,9 @@ beside the installer.
   point-to-plane ICP (Rusinkiewicz 2019; GICP, point-to-plane and
   point-to-point as choices) over a pyramid of decimations with a
   robust kernel, started from an automatic coarse search by stems and
-  crowns or a global feature search (FPFH + RANSAC) from any heading,
+  crowns, a global feature search (FPFH + RANSAC) from any heading, or
+  the two clouds' stem maps — where the stems stand and how thick they
+  are, matched pair by pair at any heading and offset, no skeletons —
   the translation and rotation with their standard errors from the
   covariance at the solution and from a spatial block jackknife, the
   observability of the fit (a flat field constrains height and tilt
@@ -133,8 +220,16 @@ beside the installer.
 - LAS / LAZ round-trip with Extra Bytes (tree_id, semantic_class,
   deadwood ids, height-above-ground, …); the same export as text
   (TXT / XYZ / CSV), PLY or E57, every column along
+- LAS 1.2 with the coordinate system as GeoTIFF keys, or LAS 1.4 with
+  it as OGC WKT (the vertical datum joined to it when one is recorded);
+  class names from a file's Classification Lookup kept on import,
+  shown in the legend and filters, and written back on export
 - CSV with all per-tree metrics + QSM uncertainty fields
 - GeoTIFF rasters with EPSG metadata
+- Survey outputs: lines and areas as GeoJSON / DXF / CSV, contour
+  lines, volume difference rasters, ortho images (PNG + world file,
+  GeoTIFF), profiles (CSV / SVG / DXF), meshes (PLY / OBJ / STL / DXF)
+- QSMs as `.qsm` + `.qsf`, OBJ and PLY; videos as MP4 or WebM
 
 ## Installation
 
@@ -234,9 +329,10 @@ parameter.
 
 ```
 Project ▶ New Project…      # picks a folder; project metadata only
-Editor ▶ Import point cloud # LAS / LAZ / TXT / PLY / E57 → out-of-core octree
+File ▶ Open Data…           # or drop it: LAS / LAZ / TXT / PLY / E57 / .zip → octree
 Terrain ▶ Classify ground   # PMF or CSF, then the DTM / DSM / CHM rasters
-Auto-segment ▶ Tree crowns  # CHM-watershed individual-tree delineation
+Auto-segment ▶ Forest       # stems → trees; stem / branch / leaf (TLS / MLS)
+Auto-segment ▶ Tree crowns  # or CHM-watershed individual-tree delineation
 Metrics ▶ Compute           # per-tree height, DBH, basal area, …
 Metrics ▶ Stem QSM          # taper + frustum stem volume + 95 % CI
 Metrics ▶ Biomass & carbon  # density / carbon fraction → kg, kg CO₂e

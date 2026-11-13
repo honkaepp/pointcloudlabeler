@@ -10,12 +10,14 @@
 // editor-ready point clouds. The Editor module continues to own
 // post-import work (segmentation, deadwood, metrics, exports).
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useProject } from '../context/ProjectContext';
 import E57ProjectPanel, { type E57ProjectSummary } from '../components/preprocessing/E57ProjectPanel';
 import PtxProjectPanel, { type PtxProjectSummary } from '../components/preprocessing/PtxProjectPanel';
 import XyzProjectPanel, { type XyzProjectSummary } from '../components/preprocessing/XyzProjectPanel';
 import CoregisterPanel from '../components/preprocessing/CoregisterPanel';
+import ProjectCrs from '../components/preprocessing/ProjectCrs';
+import { pickData, useDataHubFocus } from '../io/dataOpen';
 import { EDITION, preprocessingSources } from '../build/edition';
 
 export default function PreprocessingModule() {
@@ -58,12 +60,18 @@ export default function PreprocessingModule() {
     }
   }, [project?.folder]);
   useEffect(() => { void refresh(); }, [refresh]);
+  // The data door sent a PTX here — bring its panel into view.
+  const hubFocus = useDataHubFocus();
+  const ptxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (hubFocus.target === 'ptx') setTimeout(() => ptxRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+  }, [hubFocus]);
 
   if (!project) {
     return (
       <div className="absolute left-0 right-0 bottom-0 flex items-center justify-center mono text-[12px]"
            style={{ top: 52, color: 'var(--text-mute)', background: 'var(--viewport-bg)' }}>
-        Open a project to import sensor-native data.
+        Open a project, or open data from the welcome screen: a project is made for it.
       </div>
     );
   }
@@ -72,10 +80,22 @@ export default function PreprocessingModule() {
     <div className="absolute left-0 right-0 bottom-0 flex flex-col" style={{ top: 52, background: '#0a110d' }}>
       <div className="px-5 py-3 hairline-b flex items-center gap-3" style={{ background: 'var(--wash-1)' }}>
         <div className="flex-1 min-w-0">
-          <div className="text-[13.5px]" style={{ color: 'var(--text)' }}>Preprocessing</div>
+          <div className="text-[13.5px]" style={{ color: 'var(--text)' }}>Data</div>
           <div className="mono text-[10.5px]" style={{ color: 'var(--text-mute)' }}>
             Sensor-native data into editor-ready point clouds — {preprocessingSources(EDITION).join(', ')}.
           </div>
+          <div className="mt-1"><ProjectCrs /></div>
+        </div>
+        {/* the one door (a drop anywhere does the same) */}
+        <div className="flex gap-1.5 shrink-0">
+          <button className="btn btn-primary !h-8 !px-3 mono text-[11px]" onClick={() => void pickData('file')}
+            title="A point cloud, a .zip of clouds or a PTX — or drop it anywhere">
+            Open data…
+          </button>
+          <button className="btn !h-8 !px-3 mono text-[11px]" onClick={() => void pickData('folder')}
+            title="A folder of point clouds or a project">
+            Folder…
+          </button>
         </div>
         {status && (
           // Bounded and wrapping. A long error in this box used to take
@@ -102,11 +122,13 @@ export default function PreprocessingModule() {
             onStatus={setStatus}
           />
 
-          <PtxProjectPanel
-            projects={ptxProjects}
-            onChange={refresh}
-            onStatus={setStatus}
-          />
+          <div ref={ptxRef} style={{ scrollMarginTop: 12 }}>
+            <PtxProjectPanel
+              projects={ptxProjects}
+              onChange={refresh}
+              onStatus={setStatus}
+            />
+          </div>
 
           <XyzProjectPanel
             projects={xyzProjects}
@@ -116,14 +138,6 @@ export default function PreprocessingModule() {
 
           <CoregisterPanel onStatus={setStatus} />
 
-          {/* Reserved space for future preprocessing workflows
-              (FARO SCENE SDK, ICP fine-refinement across importers). */}
-          <div className="rounded-md p-4" style={{ border: '1px dashed var(--line)', background: 'var(--wash-1)' }}>
-            <div className="chip mb-1">More — coming</div>
-            <div className="mono text-[11px]" style={{ color: 'var(--text-mute)', lineHeight: 1.55 }}>
-              ICP fine-refinement (point-to-plane, once we can read raw points across all importers), ULS trajectories (.POS / .sbet), FARO SCENE SDK.
-            </div>
-          </div>
         </div>
       </div>
     </div>

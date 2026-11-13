@@ -13,13 +13,36 @@
 // XY clips / hide-unassigned, leaves the user's separate Z-range
 // filter untouched, and never depends on a shader recompile.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useOctreeShell } from './OctreeShellContext';
+import { viewer, type Vec3 } from './viewToolsStore'; // The section view
+import { toSceneXYZ } from '../../io/sceneAxes';
+
+/** The camera of a section view — parallel, looking along the
+ *  slab's normal at `target` (world), far enough back that a `w` × `h`
+ *  (world) face of the plot fills a view of `aspect`. Scene coordinates. */
+export function sectionPose(
+  target: [number, number, number], normal: [number, number, number], offset: [number, number, number],
+  w: number, h: number, aspect: number, fovDeg = 45,
+): { position: Vec3; target: Vec3 } {
+  const half = Math.tan((fovDeg * Math.PI) / 360);
+  const dist = (Math.max(h, w / Math.max(1e-6, aspect)) / (2 * half)) * 1.08;
+  const t = toSceneXYZ(target[0] - offset[0], target[1] - offset[1], target[2] - offset[2]);
+  const n = toSceneXYZ(normal[0], normal[1], normal[2]);
+  const len = Math.hypot(n[0], n[1], n[2]) || 1;
+  // Looking along the normal: the camera on its negative side. A view
+  // straight down keeps north up (the camera a hair to the south).
+  const vertical = Math.abs(n[1] / len) > 0.999;
+  const position: Vec3 = vertical
+    ? [t[0], t[1] + dist * Math.sign(n[1]), t[2] + dist * 1e-3]
+    : [t[0] - (n[0] / len) * dist, t[1] - (n[1] / len) * dist, t[2] - (n[2] / len) * dist];
+  return { position, target: t };
+}
 
 type Orientation = 'horizontal' | 'northSouth' | 'eastWest' | 'custom';
 
 export default function SlabPanel() {
-  const { octree, filters, setFilters, api } = useOctreeShell();
+  const { octree, filters, setFilters, api, setDisplay } = useOctreeShell();
 
   const datasetBbox = octree?.meta.boundingBox;
   const xMin = datasetBbox?.min[0] ?? 0;
@@ -171,6 +194,43 @@ export default function SlabPanel() {
     }
   }, [api, datasetBbox, halfHeightCm, orientation, anchor]);
 
+  // The section view — a parallel camera looking along the slab,
+  // the plot's face across it filling the view — and stepping the slab
+  // through the plot one thickness at a time.
+  const lookAlong = useCallback(() => {
+    const v = viewer();
+    if (!v || !octree) return;
+    const aspect = v.canvas.clientWidth / Math.max(1, v.canvas.clientHeight);
+    const cx = (xMin + xMax) * 0.5, cy = (yMin + yMax) * 0.5, cz = (zMin + zMax) * 0.5;
+    const span = Math.max(xMax - xMin, yMax - yMin, zMax - zMin);
+    let target: [number, number, number];
+    let w: number, h: number;
+    if (orientation === 'horizontal') { target = [cx, cy, anchor[2]]; w = xMax - xMin; h = yMax - yMin; }
+    else if (orientation === 'northSouth') { target = [anchor[0], cy, cz]; w = yMax - yMin; h = zMax - zMin; }
+    else if (orientation === 'eastWest') { target = [cx, anchor[1], cz]; w = xMax - xMin; h = zMax - zMin; }
+    else { target = anchor; w = span; h = span; }
+    setDisplay({ projection: 'ortho' });
+    v.setPose(sectionPose(target, normal, octree.meta.offset as [number, number, number], w, h, aspect));
+  }, [octree, xMin, xMax, yMin, yMax, zMin, zMax, orientation, anchor, normal, setDisplay]);
+
+  const step = useCallback((dir: 1 | -1) => {
+    const thickness = halfHeightCm * 0.02;
+    setPos((p) => Math.min(sliderBoundsRef.current.max, Math.max(sliderBoundsRef.current.min, +(p + dir * thickness).toFixed(4))));
+  }, [halfHeightCm]);
+
+  // [ and ] step the slab while it is on (not while typing).
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === '[') { e.preventDefault(); step(-1); }
+      else if (e.key === ']') { e.preventDefault(); step(1); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [active, step]);
+
   // Forestry presets (always horizontal — DBH-band is the workhorse).
   const presets = useMemo(() => [
     { label: 'DBH band (1.30 m ± 5 cm)', set: () => {
@@ -213,6 +273,8 @@ export default function SlabPanel() {
     const diag = Math.hypot(xMax - xMin, yMax - yMin);
     return { min: -diag * 0.5, max: diag * 0.5, unit: 'm', label: 'Distance' };
   }, [orientation, draping, groundOffset, xMin, xMax, yMin, yMax, zMin, zMax]);
+  const sliderBoundsRef = useRef(sliderBounds);
+  sliderBoundsRef.current = sliderBounds;
 
   return (
     // No minimum width: the panel that hosts this is 400 px wide, and a
@@ -236,6 +298,15 @@ export default function SlabPanel() {
         <button className="btn !h-8 !px-2 mono text-[11px]"
           onClick={frameSlab} disabled={!active || !api}
           title="Fly the camera so the slab fills the viewport">↗</button>
+      </div>
+      {/* The section view and stepping */}
+      <div className="flex items-center gap-1.5">
+        <button className="btn !h-8 mono text-[11px] flex-1 justify-center" onClick={lookAlong} disabled={!active}
+          title="A parallel (orthographic) view straight along the slab: the cross-section at true scale, as a profile window shows it. Step it through the plot with [ and ].">
+          Section view
+        </button>
+        <button className="btn !h-8 !px-2.5 mono text-[11px]" onClick={() => step(-1)} disabled={!active} title="Move the slab back one thickness ([)">◀</button>
+        <button className="btn !h-8 !px-2.5 mono text-[11px]" onClick={() => step(1)} disabled={!active} title="Move the slab on one thickness (])">▶</button>
       </div>
 
       {/* Orientation */}

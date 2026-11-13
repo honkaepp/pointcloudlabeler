@@ -11,10 +11,15 @@
 // rest of the editor uses). Two clouds with the same source-CRS bounds
 // therefore overlap perfectly regardless of import order.
 //
-// Per-overlay colouring + optional filter sync. The decoded attribute
-// arrays (treeIds / classification / intensity) are kept in memory per
-// tile so colour-mode and filter changes recolour / re-mask in place
-// without ever re-reading the disk. The shader matches the primary
+// Per-overlay colouring + optional filter sync: all of the primary's
+// filters ("sync filters"), only its X / Y / Z extent ("sync extent" — the
+// height filter clips both clouds at the same elevation without the
+// primary's tree, class and id filters, which mean nothing in another
+// cloud), or none. The ranges are world coordinates, converted through
+// the overlay's own offset. The decoded attribute arrays (treeIds /
+// classification / intensity) are kept in memory per tile so colour-mode
+// and filter changes recolour / re-mask in place without ever re-reading
+// the disk. The shader matches the primary
 // cloud's pattern (per-point aVisible mask that displaces hidden points
 // to a clip-space corner) so a filtered overlay never rasterises stray
 // pixels even on GPUs that clamp gl_PointSize back up to 1.
@@ -23,8 +28,9 @@ import { useEffect, useMemo, useRef } from 'react';
 import { useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { decodeNodePoints, readBlock, type ExtraArray, type OpenOctree } from '../persistence/octreeReader';
-import type { FilterConfig } from '../components/shell/OctreeShellContext';
-import { classColor01, treeIdColor01, hexToRgb01, UNASSIGNED_RGB } from './palette';
+import { DEFAULT_FILTERS, type FilterConfig } from '../components/shell/OctreeShellContext';
+import { classColorIn, namedClassCodes, treeIdColor01, hexToRgb01, UNASSIGNED_RGB } from './palette';
+import { eastRangeToScene, northRangeToScene, upRangeToScene, type Vec3 } from './filterGeometry';
 import type { TerrainDisplay } from './terrain';
 import { useTerrain } from './useTerrain';
 
@@ -36,6 +42,16 @@ const UNASSIGNED_COLOR: [number, number, number] = [
 
 export type OverlayColorMode = 'flat' | 'height' | 'intensity' | 'classification' | 'tree_id' | `extra:${string}`;
 
+/** The filters an overlay draws with — all of the primary's
+ *  (`syncFilters`), only its X / Y / Z extent (`syncExtent`), or none
+ *  (DEFAULT_FILTERS, which hide nothing). The ranges are world
+ *  coordinates, so each cloud converts them through its own offset. */
+export function overlayFilters(primary: FilterConfig, syncFilters: boolean, syncExtent: boolean): FilterConfig {
+  if (syncFilters) return primary;
+  if (!syncExtent || (!primary.xRange && !primary.yRange && !primary.zRange)) return DEFAULT_FILTERS;
+  return { ...DEFAULT_FILTERS, xRange: primary.xRange, yRange: primary.yRange, zRange: primary.zRange };
+}
+
 interface Props {
   octree: OpenOctree;
   /** Primary cloud's metadata.offset — overlay points are displaced by
@@ -46,10 +62,14 @@ interface Props {
    *  high end / accent in the other modes. */
   color: string;
   colorMode: OverlayColorMode;
-  /** When non-null, the primary's filters are mirrored onto this overlay:
-   *  any point hidden by the primary's filter set is also hidden here.
-   *  null disables sync — every overlay point is drawn. */
-  filters: FilterConfig | null;
+  /** The primary's filters; what of them this overlay takes is
+   *  `syncFilters` / `syncExtent` (overlayFilters). */
+  filters: FilterConfig;
+  /** All of them: any point hidden by the primary's filter set is also
+   *  hidden here. */
+  syncFilters: boolean;
+  /** Only the X / Y / Z extent (the height filter among them). */
+  syncExtent: boolean;
   /** Heights above ground: take the ground under each point off its
    *  height, with this cloud's own terrain — or, when it has no ground
    *  classification, the primary's (`fallbackTerrain`): it is the same
@@ -58,16 +78,27 @@ interface Props {
   fallbackTerrain?: TerrainDisplay | null;
 }
 
-/** Per-tile attribute slice kept in memory so colour-mode + filter
- *  changes can repaint / remask the overlay without re-reading disk. */
-interface TileData {
+/** What the filters read of an overlay tile's points. */
+export interface OverlayPoints {
+  /** Scene coordinates in the overlay's own frame (x = east − offset,
+   *  y = height − offset, z = −(north − offset)), heights above ground
+   *  while those are shown. */
   positions: Float32Array;
   treeIds: Int32Array;
   classification: Uint8Array;
+  count: number;
+  /** What was taken off each point's height to show it above ground, so
+   *  the extent tests the stored elevation like the primary's filters;
+   *  null when nothing was. */
+  ground: Float32Array | null;
+}
+
+/** Per-tile attribute slice kept in memory so colour-mode + filter
+ *  changes can repaint / remask the overlay without re-reading disk. */
+interface TileData extends OverlayPoints {
   intensity: Uint16Array;
   /** Numeric extra columns decoded from the overlay's octree, keyed by name. */
   extras: Record<string, ExtraArray>;
-  count: number;
   points: THREE.Points;
 }
 
@@ -93,8 +124,19 @@ varying vec3 vColor;
 void main() { gl_FragColor = vec4(vColor, 1.0); }
 `;
 
-export default function OverlayCloud({ octree, primaryOffset, visible, color, colorMode, filters, flatten = false, fallbackTerrain = null }: Props) {
+export default function OverlayCloud({
+  octree, primaryOffset, visible, color, colorMode, filters: primaryFilters, syncFilters, syncExtent, flatten = false, fallbackTerrain = null,
+}: Props) {
   const { scene } = useThree();
+  const filters = useMemo(
+    () => overlayFilters(primaryFilters, syncFilters, syncExtent),
+    [primaryFilters, syncFilters, syncExtent],
+  );
+  // The class palette with a colour of its own for each class this
+  // cloud's source file named.
+  const named = useMemo(() => namedClassCodes(octree.meta.classNames), [octree.meta.classNames]);
+  const namedRef = useRef(named);
+  namedRef.current = named;
   const own = useTerrain(flatten ? octree.dir : null);
   // Wait for this cloud's own answer before falling back, so the tiles
   // are not decoded once flat to the primary's ground and again to
@@ -162,14 +204,20 @@ export default function OverlayCloud({ octree, primaryOffset, visible, color, co
           if (decoded.count === 0) continue;
           // Heights above ground: the terrain off each point, in this
           // cloud's own scene frame (x = east − offset, z = −(north −
-          // offset)), before the height stats see the points.
+          // offset)), before the height stats see the points. What came
+          // off is kept for the extent filter, which reads the stored
+          // elevation.
+          let ground: Float32Array | null = null;
           if (terrain) {
             const off = octree.meta.offset;
             const ps = decoded.positions;
+            ground = new Float32Array(decoded.count);
             for (let i = 0; i < decoded.count; i++) {
               const x = ps[i * 3], z = ps[i * 3 + 2];
               if (!Number.isFinite(x)) continue;
-              ps[i * 3 + 1] -= terrain.shift(x + off[0], off[1] - z);
+              const g = terrain.shift(x + off[0], off[1] - z);
+              ps[i * 3 + 1] -= g;
+              ground[i] = g;
             }
           }
           // Extend the per-overlay stats with this tile's range so the
@@ -210,14 +258,15 @@ export default function OverlayCloud({ octree, primaryOffset, visible, color, co
             intensity: decoded.intensity,
             extras: decoded.extras,
             count: decoded.count,
+            ground,
             points: obj,
           };
           tilesRef.current.push(tile);
           // Colour + mask this tile immediately so points appear as they
           // load. The final stats pass below repaints everything once the
           // overlay-wide ranges are known.
-          paintTile(tile, colorModeRef.current, colorRef.current, statsRef.current, extraRangesRef.current);
-          maskTile(tile, filtersRef.current);
+          paintTile(tile, colorModeRef.current, colorRef.current, statsRef.current, extraRangesRef.current, namedRef.current);
+          maskTile(tile, filtersRef.current, octree.meta.offset);
         } catch (e) {
           console.warn(`overlay root tile=${t} load failed`, e);
         }
@@ -226,7 +275,7 @@ export default function OverlayCloud({ octree, primaryOffset, visible, color, co
       // Final repaint with the now-tight stats — corrects any tile that
       // was painted before later tiles widened the range.
       for (const tile of tilesRef.current) {
-        paintTile(tile, colorModeRef.current, colorRef.current, statsRef.current, extraRangesRef.current);
+        paintTile(tile, colorModeRef.current, colorRef.current, statsRef.current, extraRangesRef.current, namedRef.current);
       }
     })();
 
@@ -249,13 +298,13 @@ export default function OverlayCloud({ octree, primaryOffset, visible, color, co
   useEffect(() => {
     colorRef.current = color;
     colorModeRef.current = colorMode;
-    for (const tile of tilesRef.current) paintTile(tile, colorMode, color, statsRef.current, extraRangesRef.current);
-  }, [color, colorMode]);
+    for (const tile of tilesRef.current) paintTile(tile, colorMode, color, statsRef.current, extraRangesRef.current, named);
+  }, [color, colorMode, named]);
 
   useEffect(() => {
     filtersRef.current = filters;
-    for (const tile of tilesRef.current) maskTile(tile, filters);
-  }, [filters]);
+    for (const tile of tilesRef.current) maskTile(tile, filters, octree.meta.offset);
+  }, [filters, octree.meta.offset]);
 
   useEffect(() => {
     if (groupRef.current) groupRef.current.visible = visible;
@@ -269,6 +318,8 @@ function paintTile(
   tile: TileData, mode: OverlayColorMode, color: string,
   stats: { hLo: number; hHi: number; iLo: number; iHi: number },
   extraRanges: Record<string, { lo: number; hi: number }> = {},
+  /** The classes this cloud's source file named (classColorIn). */
+  named: readonly number[] = [],
 ) {
   const col = tile.points.geometry.getAttribute('color') as THREE.BufferAttribute | undefined;
   if (!col) return;
@@ -323,8 +374,8 @@ function paintTile(
     case 'classification': {
       const cls = tile.classification;
       for (let i = 0; i < n; i++) {
-        const c = classColor01(cls[i]);
-        cArr[i * 3] = c[0]; cArr[i * 3 + 1] = c[1]; cArr[i * 3 + 2] = c[2];
+        const c = classColorIn(cls[i], named);
+        cArr[i * 3] = c[0] / 255; cArr[i * 3 + 1] = c[1] / 255; cArr[i * 3 + 2] = c[2] / 255;
       }
       break;
     }
@@ -341,21 +392,31 @@ function paintTile(
   col.needsUpdate = true;
 }
 
-/** Recompute one tile's aVisible mask from the (synced) filter config.
- *  Mirrors the primary cloud's applyFilters logic so the overlay hides
- *  exactly the same points the primary would. null → everything visible. */
-function maskTile(tile: TileData, f: FilterConfig | null) {
+/** Recompute one tile's aVisible mask from the (synced) filter config —
+ *  see maskPoints. `offset` is this cloud's own metadata.offset. */
+function maskTile(tile: TileData, f: FilterConfig | null, offset: Vec3) {
   const va = tile.points.geometry.getAttribute('aVisible') as THREE.BufferAttribute | undefined;
   if (!va) return;
-  const arr = va.array as Float32Array;
-  const n = tile.count;
+  maskPoints(va.array as Float32Array, tile, f, offset);
+  va.needsUpdate = true;
+}
+
+/** Which of an overlay tile's points `f` keeps, into `out` (1 drawn,
+ *  0 hidden). Mirrors the primary cloud's applyFilters for what makes
+ *  sense in another cloud: unassigned / isolate / id range / classes, and
+ *  the X / Y / Z extent — world ranges, converted through THIS cloud's
+ *  `offset` (its scene frame), the height tested at the stored elevation
+ *  even while heights are shown above ground. null → everything drawn. */
+export function maskPoints(out: Float32Array, pts: OverlayPoints, f: FilterConfig | null, offset: Vec3): void {
+  const n = pts.count;
   if (f === null) {
-    for (let i = 0; i < n; i++) arr[i] = 1;
-    va.needsUpdate = true;
+    for (let i = 0; i < n; i++) out[i] = 1;
     return;
   }
-  const ids = tile.treeIds;
-  const cls = tile.classification;
+  const ids = pts.treeIds;
+  const cls = pts.classification;
+  const pos = pts.positions;
+  const ground = pts.ground;
   const hideUnassigned = f.hideUnassigned;
   const isolate = f.isolateTreeId;
   const isolateKeepUnassigned = f.isolateShowUnassigned;
@@ -367,6 +428,9 @@ function maskTile(tile: TileData, f: FilterConfig | null) {
     classMask = new Uint8Array(256);
     for (const c of f.hiddenClasses) if (c >= 0 && c < 256) classMask[c] = 1;
   }
+  const xr = f.xRange ? eastRangeToScene(f.xRange, offset) : null;
+  const yr = f.yRange ? northRangeToScene(f.yRange, offset) : null;
+  const zr = f.zRange ? upRangeToScene(f.zRange, offset) : null;
   for (let i = 0; i < n; i++) {
     let pass = true;
     const id = ids[i];
@@ -374,9 +438,14 @@ function maskTile(tile: TileData, f: FilterConfig | null) {
     if (pass && isolate !== null && id !== isolate && !(isolateKeepUnassigned && id <= 0)) pass = false;
     if (pass && range !== null && (id < rangeMin || id > rangeMax)) pass = false;
     if (pass && classMask !== null && classMask[cls[i]]) pass = false;
-    arr[i] = pass ? 1 : 0;
+    if (pass && xr) { const v = pos[i * 3]; if (!(v >= xr[0] && v <= xr[1])) pass = false; }
+    if (pass && yr) { const v = pos[i * 3 + 2]; if (!(v >= yr[0] && v <= yr[1])) pass = false; }
+    if (pass && zr) {
+      const v = pos[i * 3 + 1] + (ground !== null ? ground[i] : 0);
+      if (!(v >= zr[0] && v <= zr[1])) pass = false;
+    }
+    out[i] = pass ? 1 : 0;
   }
-  va.needsUpdate = true;
 }
 
 // ---------- Colour helpers ----------

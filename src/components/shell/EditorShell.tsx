@@ -7,7 +7,7 @@
 // drive the viewer without prop drilling.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { openOctree, type OpenOctree, type OctreeListEntry, type RasterLayer } from '../../persistence/octreeReader';
+import { openOctree, isDeadwoodExtra, type OpenOctree, type OctreeListEntry, type RasterLayer } from '../../persistence/octreeReader';
 import type { SecondaryCloud } from './OctreeShellContext';
 import { readHeightMode, writeHeightMode } from './heightMode';
 import { parsePlotBoundary } from '../../utils/plotBoundary';
@@ -19,6 +19,8 @@ import { canPersistLayers, deleteLayerFiles, listSavedLayers, loadLayerPayload, 
  *  through persistence/ or the individual panels' own Desktop types). */
 interface Desktop extends LayerBridge {
   octreeReadPlot?: (octreeDir: string) => Promise<string>;
+  octreeReadBranches?: (octreeDir: string) => Promise<string>;
+  octreeWriteBranches?: (octreeDir: string, json: string) => Promise<null>;
 }
 
 // A short, distinct palette for overlay tints — visually distinct from
@@ -32,10 +34,17 @@ import CompareView from '../../three/CompareView';
 import type { CompareApi, CompareRequest } from '../../three/comparePose';
 import ColorLegend from './ColorLegend';
 import { menuTarget } from './menuActions';
+import SurveyPanel from './SurveyPanel';
+import { surveyPaletteCommands } from './surveyStore';
+import ViewToolsPanel from './ViewToolsPanel';
+import { viewToolsPaletteCommands } from './viewToolsStore';
+import { looksPaletteCommands } from './looks';
+import { TREE_METRICS } from '../../three/treeMetricColors';
 import {
   OctreeShellContext, DEFAULT_DISPLAY, DEFAULT_TOOLS, DEFAULT_FILTERS, ZERO_STATS, countActiveFilters,
   type DisplayConfig, type ToolsConfig, type FilterConfig, type ViewerStats, type OctreeShellApi,
-  type PanelId, type OctreeShellState,
+  type PanelId, type OctreeShellState, type BranchViewState, type BranchOverlayData, type BranchMarksView,
+  DEFAULT_BRANCH_VIEW,
 } from './OctreeShellContext';
 import TopBar from './TopBar';
 import ActivityBar from './ActivityBar';
@@ -53,6 +62,7 @@ import ThinningPanel from './ThinningPanel';
 import DensityMetricsPanel from './DensityMetricsPanel';
 import ReportPanel from './ReportPanel';
 import CaliperPanel from './CaliperPanel';
+import HeightPanel from './HeightPanel';
 import SlabPanel from './SlabPanel';
 import ScanInspectionPanel from './ScanInspectionPanel';
 import PlotBoundaryPanel from './PlotBoundaryPanel';
@@ -65,6 +75,12 @@ import TreeGrowthPanel from './TreeGrowthPanel';
 import CrossSensorPanel from './CrossSensorPanel';
 import RegistrationPanel from './RegistrationPanel';
 import FineRegistrationPanel from './FineRegistrationPanel';
+import BranchPanel from './BranchPanel';
+import CompareSync from './CompareSync'; // the second window's link
+import StemPanel from './StemPanel';
+import {
+  buildMarks, branchColor, emptyBranchFile, parseBranchFile, serializeBranchFile, type BranchFile,
+} from '../../persistence/branchStore';
 import SegmentPanel from './SegmentPanel';
 import GroundPanel from './GroundPanel';
 import PointQcPanel from './PointQcPanel';
@@ -126,11 +142,14 @@ interface Props {
   /** Re-open the active octree from disk after its on-disk format
    *  changed (normalize / remove-extra rewrites octree.bin). */
   onReloadActiveOctree?: () => void | Promise<void>;
+  /** The dataset is open in the other window too, which holds it —
+   *  nothing changed here is saved (state/compareWindow.ts). */
+  readOnly?: { holder: string } | null;
 }
 
 export default function EditorShell({
   octree, projectName, octreeList, onImport, onOpenOctree, onRemoveDataset, onCloseOctree, onExportLas, onDirtyChange, busy,
-  status, progress, operation, onDismissStatus, onDatasetsChanged, onReloadActiveOctree,
+  status, progress, operation, onDismissStatus, onDatasetsChanged, onReloadActiveOctree, readOnly = null,
 }: Props) {
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
   // The height mode is the one Display choice that holds across
@@ -165,6 +184,75 @@ export default function EditorShell({
   const [compare, setCompare] = useState<CompareRequest | null>(null);
   const [compareApi, setCompareApi] = useState<CompareApi | null>(null);
   useEffect(() => { setCompare(null); }, [octree?.dir]);
+
+  // BRANCHES (Branches panel) — branches.json of the open dataset, read
+  // when it opens and written on every change. Writes are chained so
+  // two quick changes land in order. A file that cannot be read (another
+  // format, broken JSON) is NOT written over: the panel says why and
+  // stays read-only for that dataset until it is dealt with.
+  const [branchFile, setBranchFile] = useState<BranchFile>(emptyBranchFile);
+  const branchFileRef = useRef<BranchFile>(branchFile);
+  const [branchError, setBranchError] = useState<string | null>(null);
+  const branchWritableRef = useRef(false);
+  const branchWriteChain = useRef<Promise<unknown>>(Promise.resolve());
+  const [branchView, setBranchViewState] = useState<BranchViewState>(DEFAULT_BRANCH_VIEW);
+  const [branchOverlay, setBranchOverlay] = useState<BranchOverlayData | null>(null);
+  useEffect(() => {
+    const empty = emptyBranchFile();
+    branchFileRef.current = empty;
+    setBranchFile(empty);
+    setBranchError(null);
+    setBranchViewState(DEFAULT_BRANCH_VIEW);
+    setBranchOverlay(null);
+    branchWritableRef.current = false;
+    const dir = octree?.dir;
+    if (!dir || !desktop?.octreeReadBranches) return;
+    let cancelled = false;
+    desktop.octreeReadBranches(dir).then(json => {
+      if (cancelled) return;
+      const f = parseBranchFile(json);
+      branchFileRef.current = f;
+      setBranchFile(f);
+      branchWritableRef.current = true;
+    }).catch(e => {
+      if (cancelled) return;
+      setBranchError(`branches.json could not be read, so it will not be written over: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    return () => { cancelled = true; };
+  }, [octree?.dir, desktop]);
+  const updateBranches = useCallback((fn: (f: BranchFile) => BranchFile) => {
+    const next = fn(branchFileRef.current);
+    branchFileRef.current = next;
+    setBranchFile(next);
+    const dir = octree?.dir;
+    if (!dir || !branchWritableRef.current || !desktop?.octreeWriteBranches) return;
+    const json = serializeBranchFile(next);
+    const write = desktop.octreeWriteBranches;
+    branchWriteChain.current = branchWriteChain.current
+      .then(() => write(dir, json))
+      .then(() => setBranchError(null), (e: unknown) => setBranchError(`Saving branches.json failed: ${e instanceof Error ? e.message : String(e)}`));
+  }, [octree?.dir, desktop]);
+  const setBranchView = useCallback((patch: Partial<BranchViewState>) => {
+    setBranchViewState(prev => ({ ...prev, ...patch }));
+  }, []);
+  // The marks are rebuilt only when some branch's membership changed —
+  // a saved measurement, a rename or "done" leaves every `members` array
+  // as it was — because a new marks object repaints every loaded node.
+  const branchGeomCache = useRef<{ members: BranchFile['branches'][number]['members'][]; marks: Map<string, Map<number, number>>; colors: Map<number, [number, number, number]> } | null>(null);
+  const branchGeom = useMemo(() => {
+    const members = branchFile.branches.map(b => b.members);
+    const c = branchGeomCache.current;
+    if (c && c.members.length === members.length && c.members.every((m, i) => m === members[i])) return c;
+    const colors = new Map<number, [number, number, number]>();
+    for (const b of branchFile.branches) colors.set(b.id, branchColor(b.id));
+    const next = { members, marks: buildMarks(branchFile), colors };
+    branchGeomCache.current = next;
+    return next;
+  }, [branchFile]);
+  const branchMarks = useMemo<BranchMarksView | null>(() => {
+    if (branchGeom.members.length === 0) return null;
+    return { marks: branchGeom.marks, colors: branchGeom.colors, activeId: branchView.activeId, paint: branchView.paint, filter: branchView.filter };
+  }, [branchGeom, branchView]);
   // Report hand-off summaries — each producing panel writes its own slot on
   // a successful run; the Report panel only reads. See OctreeShellContext's
   // "Report hand-off summaries" section for why these exist (stem taper /
@@ -175,7 +263,9 @@ export default function EditorShell({
   const [registrationError, setRegistrationError] = useState<OctreeShellState['registrationError']>(null);
   const [taperMeasurements, setTaperMeasurements] = useState<OctreeShellState['taperMeasurements']>(null);
   const [secondaryClouds, setSecondaryClouds] = useState<SecondaryCloud[]>([]);
-  const [editMode, setEditMode] = useState(false);
+  const [editModeWanted, setEditMode] = useState(false);
+  // No editing in a dataset the other window holds.
+  const editMode = editModeWanted && !readOnly;
   const [measuring, setMeasuring] = useState(false);
   const [visiblePanels, setVisiblePanels] = useState<Set<PanelId>>(() => new Set<PanelId>(['tools']));
   const [selectedCount, setSelectedCount] = useState(0);
@@ -255,6 +345,7 @@ export default function EditorShell({
       ...apiState,
       apply: () => {},
       applyToSelection: blocked,
+      applyToRecords: blocked,
       selectVisibleUnassigned: blocked,
       undo: () => {},
       redo: () => {},
@@ -283,6 +374,8 @@ export default function EditorShell({
     if (patch.heightMode) writeHeightMode(patch.heightMode);
     setDisplayState(d => ({ ...d, ...patch }));
   }, []);
+  // The view's projection switch (ViewHud), a stable callback
+  const onProjection = useCallback((p: 'perspective' | 'ortho') => setDisplay({ projection: p }), [setDisplay]);
   const setTools = useCallback((patch: Partial<ToolsConfig>) => setToolsState(t => ({ ...t, ...patch })), []);
   const setFilters = useCallback((patch: Partial<FilterConfig>) => setFiltersState(f => ({ ...f, ...patch })), []);
   const togglePanel = useCallback((id: PanelId) => {
@@ -450,6 +543,7 @@ export default function EditorShell({
           color: OVERLAY_PALETTE[prev.length % OVERLAY_PALETTE.length],
           colorMode: 'flat' as const,
           syncFilters: false,
+          syncExtent: true, // the Filters panel's extent clips it too
           octree: loaded,
         }];
       });
@@ -467,7 +561,7 @@ export default function EditorShell({
   const toggleSecondary = useCallback((id: string) =>
     setSecondaryClouds(prev => prev.map(c => c.id === id ? { ...c, visible: !c.visible } : c)),
   []);
-  const updateSecondary = useCallback((id: string, patch: Partial<Pick<SecondaryCloud, 'color' | 'colorMode' | 'syncFilters'>>) =>
+  const updateSecondary = useCallback((id: string, patch: Partial<Pick<SecondaryCloud, 'color' | 'colorMode' | 'syncFilters' | 'syncExtent'>>) =>
     setSecondaryClouds(prev => prev.map(c => c.id === id ? { ...c, ...patch } : c)),
   []);
 
@@ -482,6 +576,9 @@ export default function EditorShell({
     cloudVisible, setCloudVisible,
     subsetPreview, setSubsetPreview,
     worldPicker, setWorldPicker,
+    branchFile, updateBranches, branchError,
+    branchView, setBranchView,
+    branchOverlay, setBranchOverlay,
     plotBoundary, setPlotBoundary,
     analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, saveAnalysisLayer, saveRasterLayer,
     canPersistLayers: canPersistLayers(desktop),
@@ -504,7 +601,7 @@ export default function EditorShell({
     overlayError, clearOverlayError: () => setOverlayError(null),
     refreshDatasets: onDatasetsChanged,
     reloadActiveOctree: onReloadActiveOctree,
-  }), [visiblePanels, togglePanel, editMode, measuring, display, setDisplay, tools, setTools, filters, setFilters, rasterLayers, cloudVisible, subsetPreview, worldPicker, plotBoundary, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, saveAnalysisLayer, saveRasterLayer, desktop, stemCenterlines, skeletonOverlay, setSkeletonOverlay, m3c2Overlay, compare, compareApi, validationSummary, growthSummary, m3c2Summary, registrationError, taperMeasurements, secondaryClouds, addSecondary, removeSecondary, toggleSecondary, updateSecondary, selectedCount, dirty, stats, saveStatus, lastSavedAt, saveError, autosaveEnabled, setAutosaveEnabled, octree, octreeList, api, paletteOpen, datasetBusy, withDatasetBusy, overlayError, onDatasetsChanged, onReloadActiveOctree]);
+  }), [visiblePanels, togglePanel, editMode, measuring, display, setDisplay, tools, setTools, filters, setFilters, rasterLayers, cloudVisible, subsetPreview, worldPicker, branchFile, updateBranches, branchError, branchView, setBranchView, branchOverlay, plotBoundary, analysisLayers, addAnalysisLayer, setAnalysisLayerVisible, removeAnalysisLayer, saveAnalysisLayer, saveRasterLayer, desktop, stemCenterlines, skeletonOverlay, setSkeletonOverlay, m3c2Overlay, compare, compareApi, validationSummary, growthSummary, m3c2Summary, registrationError, taperMeasurements, secondaryClouds, addSecondary, removeSecondary, toggleSecondary, updateSecondary, selectedCount, dirty, stats, saveStatus, lastSavedAt, saveError, autosaveEnabled, setAutosaveEnabled, octree, octreeList, api, paletteOpen, datasetBusy, withDatasetBusy, overlayError, onDatasetsChanged, onReloadActiveOctree]);
 
   // Reset save indicators when the dataset changes — a "saved 4 min ago"
   // from the previous cloud shouldn't be claimed on the new one.
@@ -594,6 +691,7 @@ export default function EditorShell({
         break;
       case 'edit.semStem': api?.apply({ semantic: 1 }); break;
       case 'edit.semBranch': api?.apply({ semantic: 2 }); break;
+      case 'edit.semLeaf': api?.apply({ semantic: 4 }); break;
       case 'edit.semUnlabel': api?.apply({ semantic: 3 }); break;
       case 'mode.toggle': setEditMode(m => !m); break;
       case 'mode.measure': setMeasuring(m => !m); break;
@@ -602,6 +700,7 @@ export default function EditorShell({
       case 'view.front': api?.presetView('front'); break;
       case 'view.side': api?.presetView('side'); break;
       case 'view.edl': setDisplay({ edlEnabled: !display.edlEnabled }); break;
+      case 'view.ortho': setDisplay({ projection: display.projection === 'ortho' ? 'perspective' : 'ortho' }); break;
       case 'filter.hideUnassigned': setFilters({ hideUnassigned: !filters.hideUnassigned }); break;
       case 'filter.isolate':
         if (tools.activeTreeId > 0) {
@@ -666,7 +765,13 @@ export default function EditorShell({
       cmds.push({ id: `panel.${id}`, group: 'Panels', title, run: () => togglePanel(id) });
     // Live shortcut hints from the binding map (reflect any customization).
     const hk = (id: KeyActionId) => formatChordOrEmpty(bindings[id]);
-    cmds.push({ id: 'file.import', group: 'File', title: 'Import point cloud (LAS / LAZ / TXT / PLY / E57)…', hint: hk('file.import'), run: onImport });
+    cmds.push({ id: 'file.import', group: 'File', title: 'Open data — point clouds, archives, PTX, projects…', hint: hk('file.import'), run: onImport });
+    if (api) cmds.push(...surveyPaletteCommands(() => togglePanel('survey'))); // needs an open dataset
+    if (api) cmds.push(...viewToolsPaletteCommands(() => togglePanel('viewtools')));
+    if (api) { // the display looks
+      const names = (octree?.meta.extras ?? []).map(e => e.name);
+      cmds.push(...looksPaletteCommands(display, setDisplay, () => api.colorHistogram(64), { deadwood: names.some(isDeadwoodExtra) }));
+    }
     cmds.push({ id: 'file.export', group: 'File', title: 'Export cloud (LAS / LAZ / TXT / PLY / E57)…', hint: hk('file.export'), disabled: !api, run: () => api?.exportLas() });
     cmds.push({ id: 'file.save', group: 'File', title: 'Save edits', hint: hk('file.save'), disabled: !api, run: () => api?.save() });
     cmds.push({ id: 'edit.undo', group: 'Edit', title: 'Undo', hint: hk('edit.undo'), disabled: !api, run: () => api?.undo() });
@@ -679,10 +784,12 @@ export default function EditorShell({
     cmds.push({ id: 'edit.newtree', group: 'Edit', title: 'New tree id', hint: hk('edit.newTree'), disabled: !api, run: () => api?.newTree() });
     (['height', 'intensity', 'classification', 'tree_id', 'semantic', 'flat'] as const).forEach(m =>
       cmds.push({ id: `colour.${m}`, group: 'Colour', title: `Colour by ${m.replace('_', ' ')}`, hint: hk(`colour.${m}` as KeyActionId), keywords: 'display', run: () => setDisplay({ colorMode: m }) }));
+    TREE_METRICS.forEach(m => cmds.push({ id: `colour.tree.${m.id}`, group: 'Colour', title: `Colour trees by ${m.label}`, keywords: 'tree metric measurement stand map dbh height crown lean qc flag growth', run: () => setDisplay({ colorMode: 'tree_metric', treeMetric: m.id }) }));
     cmds.push({ id: 'view.top', group: 'View', title: 'Top view', hint: hk('view.top'), disabled: !api, run: () => api?.presetView('top') });
     cmds.push({ id: 'view.front', group: 'View', title: 'Front view', hint: hk('view.front'), disabled: !api, run: () => api?.presetView('front') });
     cmds.push({ id: 'view.side', group: 'View', title: 'Side view', hint: hk('view.side'), disabled: !api, run: () => api?.presetView('side') });
     cmds.push({ id: 'view.edl', group: 'View', title: `${display.edlEnabled ? 'Disable' : 'Enable'} Eye-Dome lighting`, run: () => setDisplay({ edlEnabled: !display.edlEnabled }) });
+    cmds.push({ id: 'view.ortho', group: 'View', title: display.projection === 'ortho' ? 'Perspective projection' : 'Parallel (orthographic) projection', hint: hk('view.ortho'), keywords: 'ortho orthographic parallel section profile', run: () => setDisplay({ projection: display.projection === 'ortho' ? 'perspective' : 'ortho' }) });
     panel('tools', 'Toggle Tools panel');
     panel('display', 'Toggle Display panel');
     panel('filters', 'Toggle Filters panel');
@@ -695,7 +802,10 @@ export default function EditorShell({
     panel('thinning', 'Toggle Thinning simulator panel');
     panel('density', 'Toggle Density metrics panel');
     panel('report', 'Toggle Report panel');
+    panel('height', 'Toggle Height panel (two points, a height scale)');
     panel('caliper', 'Toggle Virtual caliper panel');
+    panel('branches', 'Toggle Branches panel');
+    panel('stems', 'Toggle Stems panel');
     panel('slab', 'Toggle Cross-section slab panel');
     panel('scaninspect', 'Toggle Scan inspection panel');
     panel('plotbound', 'Toggle Plot boundary panel');
@@ -739,7 +849,7 @@ export default function EditorShell({
       }),
     });
     return cmds;
-  }, [api, onImport, togglePanel, setDisplay, display.edlEnabled, editMode, measuring, filters, setFilters, tools.activeTreeId, bindings, runAction]);
+  }, [api, onImport, togglePanel, setDisplay, display, octree?.meta.extras, editMode, measuring, filters, setFilters, tools.activeTreeId, bindings, runAction]);
 
   return (
     <OctreeShellContext.Provider value={ctxValue}>
@@ -773,12 +883,15 @@ export default function EditorShell({
               />
             ) : octree ? (
               <OctreeView
+                onProjection={onProjection}
                 octree={octree}
                 display={display}
                 tools={tools}
                 filters={filters}
                 subsetPreview={subsetPreview}
                 worldPicker={worldPicker}
+                branchMarks={branchMarks}
+                branchOverlay={branchOverlay}
                 stemCenterlines={stemCenterlines}
                 skeletonOverlay={skeletonOverlay}
                 m3c2Overlay={m3c2Overlay}
@@ -799,6 +912,16 @@ export default function EditorShell({
             ) : (
               <LandingView list={octreeList} onImport={onImport} onOpen={onOpenOctree} />
             )}
+            {/* The second window — its camera and colour link, and the note
+                that a dataset the other window holds is read-only here. */}
+            {octree && <CompareSync />}
+            {octree && readOnly && (
+              <div className="absolute left-1/2 top-2 -translate-x-1/2 mono text-[10.5px] px-2.5 py-1 rounded-md z-30"
+                style={{ color: '#e6c068', background: 'rgba(30, 24, 8, 0.88)', border: '1px solid rgba(230,192,104,0.5)' }}
+                title="Two windows writing one dataset would each overwrite the other's work">
+                Read-only here: this dataset is open in the {readOnly.holder === 'main' ? 'editor window' : 'second window'} too. Edits and measurements are not saved in this window.
+              </div>
+            )}
 
             {/* Colour-scale legend — sibling of the canvas so it never
                 interferes with orbit controls or the axis gizmo
@@ -807,6 +930,13 @@ export default function EditorShell({
             {octree && !compare && <ColorLegend />}
 
             {octree && (<>
+              {/* the survey tools of the open dataset */}
+              <FloatingPanel id="survey" title="Survey" width={500} initial={{ x: 72, y: 60 }} open={visiblePanels.has('survey')} onClose={() => togglePanel('survey')}>
+                <SurveyPanel />
+              </FloatingPanel>
+              <FloatingPanel id="viewtools" title="Views & video" width={440} initial={{ x: 96, y: 90 }} open={visiblePanels.has('viewtools')} onClose={() => togglePanel('viewtools')}>
+                <ViewToolsPanel />
+              </FloatingPanel>
               <FloatingPanel id="tools" title="Tools" initial={{ x: 16, y: 16 }} open={visiblePanels.has('tools')} onClose={() => togglePanel('tools')}>
                 <ToolsPanel />
               </FloatingPanel>
@@ -851,6 +981,16 @@ export default function EditorShell({
               </FloatingPanel>
               <FloatingPanel id="report" title="Report" width={460} initial={{ x: 920, y: 220 }} open={visiblePanels.has('report')} onClose={() => togglePanel('report')}>
                 <ReportPanel />
+              </FloatingPanel>
+              <FloatingPanel id="branches" title="Branches" width={440} initial={{ x: 700, y: 120 }} open={visiblePanels.has('branches')} onClose={() => togglePanel('branches')}>
+                <BranchPanel />
+              </FloatingPanel>
+              <FloatingPanel id="stems" title="Stems" width={440} initial={{ x: 720, y: 140 }} open={visiblePanels.has('stems')} onClose={() => togglePanel('stems')}>
+                <StemPanel />
+              </FloatingPanel>
+              {/* the height between two clicked points, on a scale */}
+              <FloatingPanel id="height" title="Height" width={400} initial={{ x: 940, y: 220 }} open={visiblePanels.has('height')} onClose={() => togglePanel('height')}>
+                <HeightPanel />
               </FloatingPanel>
               <FloatingPanel id="caliper" title="Virtual caliper" width={380} initial={{ x: 960, y: 240 }} open={visiblePanels.has('caliper')} onClose={() => togglePanel('caliper')}>
                 <CaliperPanel />

@@ -95,7 +95,7 @@ def rust_packages():
         r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', lock)
     out = []
     for name, version in pairs:
-        if name == 'pointcloudlabeler-editor':
+        if name in ('pointcloudlabeler-editor', 'pointcloudlabeler'):  # this program's own crates
             continue
         directory = os.path.join(CARGO_REGISTRY, f'{name}-{version}')
         spdx = 'not built on this platform'

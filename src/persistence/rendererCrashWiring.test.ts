@@ -34,7 +34,8 @@ describe('the reloaded page learns what happened to its predecessor', () => {
 
   it('App shows the notice with or without a project open', () => {
     const app = read('src/App.tsx');
-    expect((app.match(/<RendererCrashNotice \/>/g) ?? []).length).toBe(2);
+    // And in the second window (commands/compare_window.rs).
+    expect((app.match(/<RendererCrashNotice \/>/g) ?? []).length).toBe(3);
   });
 
   it('the Rust side subscribes to WebView2 ProcessFailed on the main window', () => {

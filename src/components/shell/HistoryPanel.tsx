@@ -8,6 +8,7 @@
 import { useEffect, useState } from 'react';
 import { useOctreeShell } from './OctreeShellContext';
 import { confirmDialog } from '../../ui/dialogs';
+import { formatChord } from '../../state/keybindings'; // this platform's shortcuts
 
 export default function HistoryPanel() {
   const { octree, api, dirty, saveStatus, lastSavedAt, saveError, autosaveEnabled, setAutosaveEnabled, reloadActiveOctree } = useOctreeShell();
@@ -95,10 +96,10 @@ export default function HistoryPanel() {
   return (
     <div className="flex flex-col gap-2" style={{ width: 230 }}>
       <div className="grid grid-cols-2 gap-1.5">
-        <button className="btn !h-8 justify-center gap-1.5 mono text-[11px]" disabled={!ready} onClick={() => api?.undo()} title="Undo (⌘Z)">
+        <button className="btn !h-8 justify-center gap-1.5 mono text-[11px]" disabled={!ready} onClick={() => api?.undo()} title={`Undo (${formatChord('mod+z')})`}>
           <UndoIcon /> Undo
         </button>
-        <button className="btn !h-8 justify-center gap-1.5 mono text-[11px]" disabled={!ready} onClick={() => api?.redo()} title="Redo (⌘⇧Z)">
+        <button className="btn !h-8 justify-center gap-1.5 mono text-[11px]" disabled={!ready} onClick={() => api?.redo()} title={`Redo (${formatChord('mod+shift+z')})`}>
           <RedoIcon /> Redo
         </button>
       </div>
@@ -111,7 +112,7 @@ export default function HistoryPanel() {
         title={
           saveStatus === 'error'  ? `Save failed: ${saveError ?? 'unknown error'}. Click to retry.` :
           saveStatus === 'saving' ? 'Writing patches.bin…' :
-          dirty                   ? 'Save edits to patches.bin (⌘S)' :
+          dirty                   ? `Save edits to patches.bin (${formatChord('mod+s')})` :
           lastSavedAt             ? `Last saved at ${new Date(lastSavedAt).toLocaleTimeString()}` :
                                     'No unsaved edits'
         }
@@ -132,7 +133,7 @@ export default function HistoryPanel() {
       <label
         className="flex items-center gap-1.5 mono text-[10px] px-0.5"
         style={{ color: 'var(--text-dim)', cursor: 'pointer', userSelect: 'none' }}
-        title="When on, unsaved edits are flushed to disk in the background after sitting dirty for 2 minutes — protection against a crash or power cut. When off, only manual saves (button / ⌘S) write, and closing without saving discards the session's edits."
+        title={`When on, unsaved edits are flushed to disk in the background after sitting dirty for 2 minutes — protection against a crash or power cut. When off, only manual saves (button / ${formatChord('mod+s')}) write, and closing without saving discards the session's edits.`}
       >
         <input
           type="checkbox"

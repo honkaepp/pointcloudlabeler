@@ -21,7 +21,7 @@ export const TRANSFORM_STAGE = 'transform';
 export type RegisterMethod = 'symmetric' | 'pointToPlane' | 'pointToPoint' | 'gicp';
 export type RegisterKernel = 'welsch' | 'cauchy' | 'tukey' | 'none';
 export type RegisterDof = 'full' | 'levelled' | 'translation';
-export type RegisterInitMode = 'current' | 'auto' | 'skeleton' | 'manual' | 'features';
+export type RegisterInitMode = 'current' | 'auto' | 'skeleton' | 'manual' | 'features' | 'stems';
 
 /** The panel's defaults — the Rust side's `RegisterParams::default()`
  *  and `RegisterInit::default()`, in the panel's units. Pinned to the
@@ -64,6 +64,8 @@ export interface FineRegistrationReport {
     referenceKeypoints: number; movingKeypoints: number; correspondences: number;
     inliers: number; inlierFraction: number; iterations: number; rmse: number; overlap: number;
   };
+  /** The stem-map match (src-tauri commands/stemmap.rs), when it was the start. */
+  stems?: StemMapReport;
   origin: [number, number, number];
   centreWorld: [number, number, number];
   referencePoints: number;
@@ -100,6 +102,39 @@ export interface FineRegistrationReport {
     histBins: number[];
   };
   seconds: number;
+}
+
+/** What the stem-map start found — StemMapReport, camelCased. */
+export interface StemMapReport {
+  referenceStems: number;
+  movingStems: number;
+  /** "forest": the forest pass's stems; "found": found at breast height for this run. */
+  referenceSource: string;
+  movingSource: string;
+  /** Stems paired one to one, and their horizontal RMS, metres. */
+  matched: number;
+  rms: number;
+  yawDeg: number;
+  dx: number;
+  dy: number;
+  dz: number;
+  /** Stems the best answer elsewhere pairs. */
+  runnerUp: number;
+  hypotheses: number;
+}
+
+/** Where a stem map came from, in words. */
+export function stemSourceText(source: string): string {
+  return source === 'forest' ? 'the forest pass’s stems' : 'found at breast height';
+}
+
+/** The stem-map match against its runner-up, as words: the places alone
+ *  decided it, or matched more than one way (a lattice, a plantation's
+ *  rows) and the thicknesses decided. */
+export function stemsVerdict(matched: number, runnerUp: number): string {
+  if (runnerUp * 2 <= matched) return 'unambiguous';
+  if (runnerUp * 4 <= matched * 3) return 'likely';
+  return 'the places match more than one way; the thicknesses decided — check it';
 }
 
 /** A length in the unit it is best read in: millimetres under a
@@ -174,6 +209,7 @@ export function registerStageLabel(pct: number, init: RegisterInitMode): string 
   if (pct < 0.12) {
     if (init === 'auto') return 'Coarse search: rasterising stems and crowns, voting…';
     if (init === 'features') return 'Feature search: histograms, pairing, hypotheses…';
+    if (init === 'stems') return 'Stem maps: the stems at breast height in both, matched by spacing and thickness…';
     return 'Starting…';
   }
   if (pct < 0.32) return 'Reading the reference over the overlap…';

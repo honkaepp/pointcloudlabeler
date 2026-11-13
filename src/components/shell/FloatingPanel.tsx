@@ -26,6 +26,12 @@ interface Props {
 
 const STORAGE_PREFIX = 'pointcloudlabeler.panel.';
 
+/** The fold caret and the close ✕ keep their small icons but
+ *  take a 28 px square to click — the 10 px icon alone was hard to hit.
+ *  The negative margins keep the title row as tall as it was. */
+const HEADER_BUTTON =
+  'shrink-0 w-7 h-7 -my-1.5 -mx-1.5 rounded-md flex items-center justify-center transition-all hover:opacity-100 hover:bg-[var(--wash-2)]';
+
 function loadPos(id: string, fallback: { x: number; y: number }) {
   try {
     const raw = localStorage.getItem(STORAGE_PREFIX + id);
@@ -102,7 +108,7 @@ export default function FloatingPanel({ id, title, initial, width = 280, open, o
         <button
           onClick={(e) => { e.stopPropagation(); setCollapsed(c => !c); }}
           onPointerDown={(e) => e.stopPropagation()}
-          className="opacity-60 hover:opacity-100 transition-opacity"
+          className={`${HEADER_BUTTON} opacity-60`}
           title={collapsed ? 'Expand' : 'Collapse'}
           style={{ color: 'var(--text-dim)' }}
         >
@@ -118,7 +124,7 @@ export default function FloatingPanel({ id, title, initial, width = 280, open, o
           <button
             onClick={(e) => { e.stopPropagation(); onClose(); }}
             onPointerDown={(e) => e.stopPropagation()}
-            className="opacity-50 hover:opacity-100 transition-opacity"
+            className={`${HEADER_BUTTON} opacity-50`}
             style={{ color: 'var(--text-dim)' }}
             title="Hide panel"
           >

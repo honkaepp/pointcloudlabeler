@@ -20,9 +20,9 @@ export type KeyActionId =
   | 'edit.undo' | 'edit.redo'
   | 'edit.assign' | 'edit.reset' | 'edit.newTree'
   | 'edit.delete' | 'edit.restore' | 'edit.clearSelection'
-  | 'edit.semStem' | 'edit.semBranch' | 'edit.semUnlabel'
+  | 'edit.semStem' | 'edit.semBranch' | 'edit.semLeaf' | 'edit.semUnlabel'
   | 'mode.toggle' | 'mode.measure' | 'view.palette'
-  | 'view.top' | 'view.front' | 'view.side' | 'view.edl'
+  | 'view.top' | 'view.front' | 'view.side' | 'view.edl' | 'view.ortho'
   | 'filter.hideUnassigned' | 'filter.isolate'
   | 'colour.tree_id' | 'colour.height' | 'colour.intensity'
   | 'colour.classification' | 'colour.semantic' | 'colour.flat';
@@ -39,7 +39,7 @@ export interface KeyAction {
 
 // The canonical action list — order defines panel order within each group.
 export const KEY_ACTIONS: readonly KeyAction[] = [
-  { id: 'file.import',          group: 'File',   label: 'Import point cloud',            defaultChord: 'o' },
+  { id: 'file.import',          group: 'File',   label: 'Open data (clouds, scanner data)', defaultChord: 'o' },
   { id: 'file.save',            group: 'File',   label: 'Save edits',                  defaultChord: 'mod+s' },
   { id: 'file.export',          group: 'File',   label: 'Export cloud',               defaultChord: '' },
 
@@ -53,6 +53,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   { id: 'edit.redo',            group: 'Edit',   label: 'Redo',                        defaultChord: 'mod+shift+z' },
   { id: 'edit.semStem',         group: 'Edit',   label: 'Label selection as stem',     defaultChord: '1', hint: 'semantic mode' },
   { id: 'edit.semBranch',       group: 'Edit',   label: 'Label selection as branch',   defaultChord: '2', hint: 'semantic mode' },
+  { id: 'edit.semLeaf',         group: 'Edit',   label: 'Label selection as leaf',     defaultChord: '4', hint: 'semantic mode' },
   { id: 'edit.semUnlabel',      group: 'Edit',   label: 'Remove semantic label',       defaultChord: '0', hint: 'semantic mode' },
 
   { id: 'mode.toggle',          group: 'Mode',   label: 'Toggle camera / edit',        defaultChord: 'Space' },
@@ -63,6 +64,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   { id: 'view.front',           group: 'View',   label: 'Front view',                  defaultChord: 'F2' },
   { id: 'view.side',            group: 'View',   label: 'Side view',                   defaultChord: 'F3' },
   { id: 'view.edl',             group: 'View',   label: 'Toggle Eye-Dome lighting',    defaultChord: '' },
+  { id: 'view.ortho',           group: 'View',   label: 'Perspective / parallel projection', defaultChord: '5' },
 
   { id: 'filter.hideUnassigned', group: 'Filter', label: 'Toggle hide unassigned',     defaultChord: 'h' },
   { id: 'filter.isolate',       group: 'Filter', label: 'Isolate active tree',         defaultChord: 'i' },

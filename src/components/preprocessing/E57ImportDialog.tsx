@@ -9,6 +9,7 @@
 
 import { useEffect, useState } from 'react';
 import { useProject } from '../../context/ProjectContext';
+import { formatChord } from '../../state/keybindings'; // this platform's shortcut
 
 interface Props {
   onClose: () => void;
@@ -140,7 +141,7 @@ export default function E57ImportDialog({ onClose, onImported, onStatus }: Props
 
         <div className="flex items-center justify-between gap-2 px-5 py-3.5" style={{ borderTop: '1px solid var(--line)', background: 'var(--wash-1)' }}>
           <span className="mono text-[10px]" style={{ color: 'var(--text-mute)' }}>
-            <span className="kbd">⌘</span><span className="kbd">↵</span> import · <span className="kbd">Esc</span> cancel
+            <span className="kbd">{formatChord('mod+Enter')}</span> import · <span className="kbd">Esc</span> cancel
           </span>
           <div className="flex gap-1.5">
             <button className="btn !px-3" onClick={onClose} disabled={busy}>Cancel</button>

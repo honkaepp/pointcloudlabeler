@@ -11,6 +11,7 @@ import { isDeadwoodExtra } from '../persistence/octreeReader';
 import type { CrsListEntry, EpsgLookupEntry, GeoidStatus, OctreeCrs, VerticalCrs } from '../persistence/octreeReader';
 import type { FilterConfig } from './shell/OctreeShellContext';
 import type { CloudExportFormat } from '../io/pointFile';
+import { formatChord } from '../state/keybindings'; // This platform's shortcut
 
 export interface OctreeExportOptions {
   /** LAS and LAZ are written directly; text, PLY and E57 are transcoded
@@ -137,7 +138,7 @@ export function buildExportFilter(f: FilterConfig): OctreeExportFilter | undefin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-const SEMANTIC_LABEL: Record<number, string> = { 0: 'unlabelled', 1: 'stem', 2: 'branch' };
+const SEMANTIC_LABEL: Record<number, string> = { 0: 'unlabelled', 1: 'stem', 2: 'branch', 4: 'leaf' };
 
 function fmtRange(r: [number, number]): string {
   const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
@@ -574,7 +575,7 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
           <Field label="Attributes">
             <div className="grid grid-cols-2 gap-1.5">
               <Check label="tree_id" sub="instance segmentation" checked={includeTreeId} onChange={setIncludeTreeId} />
-              <Check label="semantic" sub="stem / branch" checked={includeSemantic} onChange={setIncludeSemantic} />
+              <Check label="semantic" sub="stem / branch / leaf" checked={includeSemantic} onChange={setIncludeSemantic} />
               <Check label="classification" sub="ASPRS / ground" checked={keepClassification} onChange={setKeepClassification} />
               <Check label="intensity" sub="return strength" checked={keepIntensity} onChange={setKeepIntensity} />
               {hasStandingDeadwood && (
@@ -772,7 +773,7 @@ export default function OctreeExportDialog({ datasetName, availableExtras = [], 
         {/* Footer */}
         <div className="flex items-center justify-between gap-2 px-5 py-3.5" style={{ borderTop: '1px solid var(--line)', background: 'var(--wash-1)' }}>
           <span className="mono text-[10px]" style={{ color: 'var(--text-mute)' }}>
-            <span className="kbd">⌘</span><span className="kbd">↵</span> export · <span className="kbd">Esc</span> cancel
+            <span className="kbd">{formatChord('mod+Enter')}</span> export · <span className="kbd">Esc</span> cancel
           </span>
           <div className="flex gap-1.5">
             <button className="btn !px-3" onClick={onCancel}>Cancel</button>

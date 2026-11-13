@@ -4,6 +4,7 @@ import { stripComments } from '../../testing/sourceScan';
 import {
   FINE_REG_DEFAULTS, REGISTER_STAGE, TRANSFORM_STAGE, coarseVerdict, constraintVerdict, copyOutDir, defaultCopyName,
   describeTranslation, histogramBars, isWorthApplying, lengthText, plusMinus, quotedStdErr, registerStageLabel, rotationAtPlotEdge,
+  stemSourceText, stemsVerdict,
   type FineRegistrationReport,
 } from './fineRegistration';
 
@@ -61,10 +62,26 @@ describe('the fine registration arithmetic', () => {
     expect(coarseVerdict(1.0)).toMatch(/guess/);
   });
 
+  it('starts from the stem maps: any heading, the verdict from the runner-up, the start offered in the panel', () => {
+    expect(stemsVerdict(40, 6)).toBe('unambiguous');
+    expect(stemsVerdict(40, 28)).toBe('likely');
+    expect(stemsVerdict(9, 9)).toMatch(/thicknesses decided/);
+    expect(stemSourceText('forest')).toMatch(/forest pass/);
+    expect(stemSourceText('found')).toBe('found at breast height');
+    const panel = stripComments(read('src/components/shell/FineRegistrationPanel.tsx'));
+    expect(panel).toContain("['stems', 'Stem maps \u2014 where the stems stand, how thick they are',");
+    expect(panel).toContain('result.stems &&');
+    // the mode the panel sends is one the Rust side takes
+    const octree = read('src-tauri/src/commands/octree.rs');
+    expect(octree).toMatch(/pub enum RegisterInitMode \{[\s\S]*?\bStems,\n\}/);
+    expect(read('src/persistence/desktopBridge.ts')).toContain("'features' | 'stems'");
+  });
+
   it('labels the run\u2019s stages at the milestones the Rust side reports', () => {
     expect(registerStageLabel(0.05, 'auto')).toMatch(/Coarse search/);
     expect(registerStageLabel(0.05, 'current')).toMatch(/Starting/);
     expect(registerStageLabel(0.05, 'features')).toMatch(/Feature search/);
+    expect(registerStageLabel(0.05, 'stems')).toMatch(/Stem maps/);
     expect(registerStageLabel(0.2, 'current')).toMatch(/reference/);
     expect(registerStageLabel(0.4, 'current')).toMatch(/moving/);
     expect(registerStageLabel(0.8, 'current')).toMatch(/Fitting/);

@@ -7,7 +7,7 @@
 // hide editing on top of the streamed point cloud. Edits live in the
 // in-memory PatchStore and get flushed back to patches.bin on save.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { sceneToWorld } from '../io/sceneAxes';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
@@ -34,13 +34,17 @@ import {
   PatchStore,
   savePatches,
   type NodeKey as PatchNodeKey,
-  type PatchEdit,
+  type PatchAction,
 } from '../persistence/octreePatches';
 import EdlPass from './EdlPass';
 import { viewportBackground } from '../ui/theme';
 import { useViewportBackground } from '../ui/useTheme';
 import { type TerrainDisplay, emptyTerrainTexture } from './terrain';
 import { useHeightDisplay } from './useTerrain';
+import SurveyOverlay from './SurveyOverlay';
+import { occupiedZSpan } from '../layers/fileLayers';
+import ForestOverlay from './ForestOverlay';
+import { pickOnPlane, viewRay, type WorldPicker } from './planePick';
 import type { ZAdjust } from './skeletonAlign';
 import { pointInPolygon, flattenRemap, applyRemapInPlace } from './selectionMath';
 import { onOctreeProgress } from '../persistence/octreeStore';
@@ -51,6 +55,9 @@ import {
   slabToScene, isolateBoxToScene, inSlab, inBox, viewDepthSpan,
 } from './filterGeometry';
 import { forcedRecordSet } from './forcedRecords';
+import {
+  drawnPosition, getTreeShift, shiftForView, shiftSlots, subscribeTreeShift, type ShiftView,
+} from './treeShift';
 
 /** See EditApi.isolateStatus. */
 export interface IsolateStatus {
@@ -76,21 +83,33 @@ import {
   detailBoxWorld, bboxOverlapsDetail, EVICT_LIMIT_FACTOR,
 } from './lodPlanner';
 import {
-  rampColor, setCustomRampStops, classColor, treeIdColor, deadwoodColor, hexToRgb255, UNASSIGNED_RGB,
+  rampColor, setCustomRampStops, classColorIn, namedClassCodes, treeIdColor, deadwoodColor, hexToRgb255, UNASSIGNED_RGB,
 } from './palette';
 import { AxisGizmoUpdater, AxisGizmoOverlay, type GizmoDirs } from './AxisGizmo';
 import type {
   ColorMode, ColorRamp, DisplayConfig, ToolsConfig, FilterConfig, GroundParams, SegmentParams, DeadwoodParams,
-  ViewerStats, OctreeShellApi, SkeletonTransferParams, SkeletonTransferResult,
+  ViewerStats, OctreeShellApi, SkeletonTransferParams, SkeletonTransferResult, ColorHistogram,
   LeafWoodParams, TreeIsoParams, Li2012Params, M3C2Params, M3C2Result,
-  StemTaperParams, StemTaperResult,
+  StemTaperParams, StemTaperResult, BranchMarksView, BranchOverlayData,
 } from '../components/shell/OctreeShellContext';
+import type { ForestParams, ForestResult } from '../components/shell/forest';
+import { ViewCamera, isOrtho, orthoHalfHeight, orthoSizingDistance, syncOrtho } from './viewCamera';
+import ViewHud from './ViewHud';
+import { histogramOf } from './colorHistogram';
+import { legendSpan, stretchSpans, type RampSpans, type Span } from './colorStretch';
+import {
+  publishTreeMetrics, subscribeTreeData, treeColorTexture, treeData, treeMetricDef, treeValueRange, treeValues,
+} from './treeMetricColors';
+import { cachedTreeMetrics, type MetricsSource } from '../metrics/loadMetrics';
 
 /** Live subset-preview clip box (world X/Y/Z ranges), shared with the
  *  streamer so freshly-loaded nodes get clipped the same as resident ones. */
 type SubsetPreview = { xRange: [number, number] | null; yRange: [number, number] | null; zRange: [number, number] | null };
 
 interface Props {
+  /** Switch the projection from the view's corner (ViewHud); absent: no
+   *  switch is offered there. */
+  onProjection?: (p: 'perspective' | 'ortho') => void;
   octree: OpenOctree;
   /** Display config, owned by the shell (DisplayPanel drives it). */
   display: DisplayConfig;
@@ -111,6 +130,11 @@ interface Props {
    *  the user clicks "Pick stem point"; the viewport calls the
    *  callback once and the panel clears the picker. */
   worldPicker?: ((hit: [number, number, number]) => void) | null;
+  /** Branches cut out by hand (Branches panel): painted over the colour
+   *  mode and, on request, filtered. Null = none. */
+  branchMarks?: BranchMarksView | null;
+  /** The Branches panel's caliper jaws and length polyline. */
+  branchOverlay?: BranchOverlayData | null;
   /** Stem centreline polylines (one per tree). Drawn as thin yellow
    *  LineSegments depth-test-off overlay over the cloud — pushed by
    *  the Stem Centerline panel + the Click-to-measure-tree panel.
@@ -165,7 +189,7 @@ interface Props {
   cursorRef?: React.MutableRefObject<{ x: number; y: number; z: number } | null>;
 }
 
-interface LoadedNode {
+export interface LoadedNode {
   geom: THREE.BufferGeometry;
   level: number;
   /** Live tree ids, mutated by editing patches. */
@@ -194,8 +218,25 @@ interface LoadedNode {
    *  Filters are non-destructive — flipping this brings the point back
    *  next frame without touching positions / patches / disk. Uint8 (not
    *  float): a non-normalized integer attribute reaches the shader as
-   *  0.0 / 1.0 and costs 1 byte/point of VRAM instead of 4. */
+   *  0.0 / 1.0 and costs 1 byte/point of VRAM instead of 4.
+   *
+   *  2 = drawn, and a STRAY of the isolated tree (beyond the margin ring,
+   *  FilterConfig.isolateHighlightStrays): the shader draws it at least
+   *  STRAY_PX across and colorNode paints it STRAY_RGB. Every reader
+   *  that asks "is it drawn" tests `!== 0`, so a stray counts as drawn. */
   visibility: Uint8Array;
+  /** How many of this node's points the last applyFilters marked as
+   *  strays (visibility 2), so the colouring knows whether to look. */
+  strays: number;
+  /** Tree Review's pull-apart (treeShift.ts): per point, the slot of its
+   *  tree's view offset in the shared offset texture (0 = not moved).
+   *  Backs the `aShift` attribute; allocated only once a moved tree's
+   *  point is found in the node, and read by the shader only while the
+   *  node's own uShiftOn is set. */
+  shiftSlot: Uint16Array | null;
+  /** The node's bounding-sphere radius from its own extents — widened by
+   *  the pull-apart's reach while it holds moved points (frustum culling). */
+  baseRadius: number;
   /** Per-point depth-cue flag (1 = grey background point that fades with
    *  view depth while a tree is isolated; 0 = full-strength colour).
    *  Backs the `aDim` shader attribute; rewritten by colorNode — set for
@@ -234,6 +275,8 @@ interface LoadedNode {
   tile: number;
   record: number;
   recIdx: number;
+  /** The streamer's branch-marks holder (SharedShaderUniforms.branch). */
+  branchRef?: { current: BranchMarksView | null };
   numPoints: number;
   spacing: number;
   heightMin: number;
@@ -277,6 +320,9 @@ const FADE_OUT_MS = 120;
 const PREFETCH_LOOKAHEAD_S = 0.3;
 const PREFETCH_MIN_SPEED = 0.5;          // scene units (m) per second
 const PREFETCH_MAX_NODES = 32;           // cap per plan so prefetch can't starve real loads
+// How long after opening the whole-cloud max tree id is asked for
+// (NodeStreamer's cloudMaxTreeIdRef).
+const CLOUD_MAX_ID_DELAY_MS = 4000;
 
 /** Tiny inlined binary max-heap. Used for the LOD priority queue —
  *  pop returns the highest-weight node (largest projected radius)
@@ -294,6 +340,44 @@ export interface HeightSpan {
   hi: number;
   shift?: (sceneX: number, sceneZ: number) => number;
 }
+
+/** Every span the scalar ramps run over, in the units the CPU colouring
+ *  reads: height in scene y (or height above ground), x as scene x
+ *  (easting − offset), y as northing − offset (the ramp runs south to
+ *  north), intensity raw (null: not recorded, ramped per node), and
+ *  each extra column. */
+interface ColorSpans extends RampSpans<HeightSpan> {
+  extra: Record<string, Span>;
+}
+
+/** What the CPU colouring reads besides the mode and the spans. */
+export interface PaintExtras {
+  /** Intensity shading over any mode but intensity: strength 0–1, and
+   *  the intensity span it reads (lo, 1 / (hi − lo)). Null: off. */
+  shade: { strength: number; lo: number; inv: number } | null;
+  /** The 'tree_metric' colours: RGBA per tree id (treeColorTexture's
+   *  texels; alpha 0 = not measured), `count` texels. Null: none. */
+  treeColors: { data: Uint8Array; count: number } | null;
+  /** RGB per class code, 256 × 3: the ASPRS palette with a colour of its
+   *  own for each class the dataset's source file named (classColorIn). */
+  classLut: Uint8Array;
+}
+
+/** The class colours of a dataset whose source file named `named`. */
+function classLutFor(named: readonly number[]): Uint8Array {
+  const lut = new Uint8Array(256 * 3);
+  for (let c = 0; c < 256; c++) {
+    const [r, g, b] = classColorIn(c, named);
+    lut[c * 3] = r; lut[c * 3 + 1] = g; lut[c * 3 + 2] = b;
+  }
+  return lut;
+}
+const ASPRS_LUT = classLutFor([]);
+
+/** A stray of the isolated tree (visibility 2): bright yellow, and drawn
+ *  at least this many pixels across. */
+const STRAY_RGB: [number, number, number] = [255, 219, 38];
+const STRAY_PX = 6;
 
 interface SharedShaderUniforms {
   uSize: { value: number };
@@ -322,11 +406,32 @@ interface SharedShaderUniforms {
    *  height — the terrain's relief, metres — so the planner grows each
    *  node's sphere by it for the frustum test. 0 while not flattening. */
   relief: number;
-  /** Not a uniform: the span the 'height' colour ramp runs over, and,
-   *  when the ramp is over height above ground, the terrain to take off
+  /** Not a uniform: the branch marks this streamer's nodes are painted
+   *  and filtered with (Branches panel). Every node it loads keeps a
+   *  reference to this holder; null = none. */
+  branch: { current: BranchMarksView | null };
+  /** Tree Review's pull-apart (treeShift.ts): the view offset of each
+   *  moved tree, one RGBA float texel per slot (slot 0 = none), read by
+   *  the vertex shader through the per-point slot (aShift). uShiftTexSize
+   *  is its width × height. Shared objects, so one write reaches every
+   *  node; whether a node reads it at all is its own uShiftOn. */
+  uShiftTex: { value: THREE.DataTexture };
+  uShiftTexSize: { value: THREE.Vector2 };
+  /** Not a uniform: the pull-apart as this streamer draws it — the slot
+   *  of each moved tree id and the offsets — or null while nothing is
+   *  moved here. `reach` is the longest offset (metres); the planner and
+   *  the culling spheres grow by it like by the relief. */
+  shift: { view: ShiftView; slotOf: Map<number, number>; table: Uint16Array | null; ids: string } | null;
+  shiftReach: number;
+  /** Not a uniform: the spans the ramps run over — the cloud's own, or
+   *  the stretch the user set (DisplayConfig.rampRanges) — and, when the
+   *  height ramp is over height above ground, the terrain to take off
    *  each point first. Here so a node loaded later is coloured like the
    *  ones on screen. Null before the streamer sets it. */
-  heightSpan: HeightSpan | null;
+  spans: ColorSpans | null;
+  /** Not a uniform: the rest of what the CPU colouring reads besides the
+   *  mode and the spans (see PaintExtras). */
+  paint: PaintExtras;
   /** Not a shader uniform — shared render state threaded alongside the
    *  uniforms so node colouring (incl. freshly-streamed nodes) can paint
    *  the active-instance highlight without re-threading every loader
@@ -377,7 +482,13 @@ function createSharedUniforms(): SharedShaderUniforms {
     uDtmCell: { value: 1 },
     uDtmSize: { value: new THREE.Vector2(1, 1) },
     relief: 0,
-    heightSpan: null,
+    branch: { current: null },
+    uShiftTex: { value: shiftTexture(new Float32Array(4), 1, 1) },
+    uShiftTexSize: { value: new THREE.Vector2(1, 1) },
+    shift: null,
+    shiftReach: 0,
+    spans: null,
+    paint: { shade: null, treeColors: null, classLut: ASPRS_LUT },
     activeTreeId: 0,
     activeStandingId: 0,
     activeLayingId: 0,
@@ -421,11 +532,26 @@ function writeTreemap(dir: string, raw: Map<number, number>): Promise<void> {
   return Promise.resolve(d.octreeWriteTreemap(dir, JSON.stringify(obj))).then(() => undefined);
 }
 
+/** A float RGBA texture of `w` × `h` texels, NEAREST, for exact texel
+ *  reads in the vertex shader (the pull-apart's offsets). */
+function shiftTexture(data: Float32Array<ArrayBuffer>, w: number, h: number): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat, THREE.FloatType);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 const POINT_VERTEX_SHADER = /* glsl */ `
 attribute vec3 color;
 attribute float aVisible;
 attribute float aDim;
+attribute float aShift;
 uniform float uSize;
+uniform float uShiftOn;
+uniform highp sampler2D uShiftTex;
+uniform vec2 uShiftTexSize;
 uniform vec3 uQOrigin;
 uniform vec3 uQSize;
 uniform float uDimEnabled;
@@ -457,6 +583,12 @@ float dtmShift(vec2 sceneXZ) {
   float b = mix(dtmTexel(vec2(i0.x, i1.y)), dtmTexel(vec2(i1.x, i1.y)), f.x);
   return mix(a, b, f.y);
 }
+// Tree Review's pull-apart: the view offset of the point's tree, by its
+// slot (the texel; slot 0 is no offset). Exact texel reads (NEAREST).
+vec3 treeShift(float slot) {
+  vec2 ij = vec2(mod(slot, uShiftTexSize.x), floor(slot / uShiftTexSize.x));
+  return texture2D(uShiftTex, (ij + 0.5) / uShiftTexSize).xyz;
+}
 void main() {
   // Filter mask: a hidden point is sent to a clip-space corner where it
   // is guaranteed to be culled, and its size is zeroed. Belt-and-braces
@@ -483,6 +615,7 @@ void main() {
   // height, so the ground is drawn flat at its reference level and a
   // tree stands at its height over it. The stored position is untouched.
   if (uFlatten > 0.5) pos.y -= dtmShift(pos.xz);
+  if (uShiftOn > 0.5 && aShift > 0.5) pos += treeShift(aShift);
   vec4 viewPos = modelViewMatrix * vec4(pos, 1.0);
   // Depth-cue the flagged (grey background) points: nearer = lighter,
   // farther = darker across the isolate neighbourhood's depth span, so
@@ -505,7 +638,9 @@ void main() {
   // density seams blew the points up into huge boxes, so we keep the
   // fixed-size look the cloud reads best with; uSize is an absolute
   // pixel count from the Display panel's Point-size slider.
-  gl_PointSize = uSize;
+  // A stray of the isolated tree (aVisible 2) is drawn large, so a few
+  // points ten metres off are seen at all.
+  gl_PointSize = aVisible > 1.5 ? max(uSize, ${STRAY_PX.toFixed(1)}) : uSize;
 }
 `;
 
@@ -534,7 +669,7 @@ function makeNodeMaterial(
   shared: SharedShaderUniforms, spacing: number,
   qOrigin: [number, number, number], qSize: [number, number, number],
 ): THREE.ShaderMaterial {
-  return new THREE.ShaderMaterial({
+  const material = new THREE.ShaderMaterial({
     uniforms: {
       uSize: shared.uSize,
       uProjFactor: shared.uProjFactor,
@@ -551,6 +686,11 @@ function makeNodeMaterial(
       uDtmOrigin: shared.uDtmOrigin,
       uDtmCell: shared.uDtmCell,
       uDtmSize: shared.uDtmSize,
+      // Per node: set only while this node holds a tree the pull-apart
+      // moves (and so carries an aShift attribute).
+      uShiftOn: { value: 0 },
+      uShiftTex: shared.uShiftTex,
+      uShiftTexSize: shared.uShiftTexSize,
     },
     vertexShader: POINT_VERTEX_SHADER,
     fragmentShader: POINT_FRAGMENT_SHADER,
@@ -558,6 +698,10 @@ function makeNodeMaterial(
     depthTest: true,
     depthWrite: true,
   });
+  // A node without the attribute reads this constant (never used: its
+  // uShiftOn is 0).
+  material.defaultAttributeValues = { ...material.defaultAttributeValues, aShift: [0] };
+  return material;
 }
 
 /** Re-encode a node's live float positions into its uint16 GPU buffer.
@@ -622,15 +766,18 @@ export interface EditApi {
    *  point (default Infinity); the rotation pivot passes a small cap so
    *  the per-press pick stays cheap. */
   pickScenePointAt: (x: number, y: number, maxSamples?: number) => [number, number, number] | null;
-  /** Largest tree_id across loaded nodes + patches — used by the
-   *  toolbar's "New tree" button. Out-of-core so it can only see loaded
-   *  data, but that's the same set the user is looking at. */
+  /** See OctreeShellApi.colorHistogram. */
+  colorHistogram: (bins?: number) => ColorHistogram | null;
+  /** Largest tree_id across the whole cloud (the backend's tally, once
+   *  it has answered), the loaded nodes and the patches — used by the
+   *  toolbar's "New tree" button, so a new id is never one that only
+   *  unloaded nodes hold. */
   maxTreeId: () => number;
   /** Apply an action to every currently-selected point across loaded
    *  nodes. Returns the number of patch records written. */
   applyToSelection: (action: {
     treeId?: number;
-    semantic?: 0 | 1 | 2 | 3;
+    semantic?: 0 | 1 | 2 | 3 | 4;
     deleted?: 0 | 1 | 2;
     standingDeadwood?: number;
     layingDeadwood?: number;
@@ -671,6 +818,14 @@ export interface EditApi {
    *  Used to warn before a destructive re-segmentation. Tile roots hold a
    *  whole-tile sample, so an imported tree_id column is reliably seen. */
   hasTreeIds: () => boolean;
+  /** A copy of the session selection: node key → point indices. */
+  getSelection: () => Map<string, number[]>;
+  /** World positions of the listed points whose node is resident; the
+   *  rest (and deleted points) are counted in `missing`. */
+  pointsWorld: (members: Array<{ tile: number; record: number; points: number[] }>) => { xyz: Float64Array; missing: number };
+  /** World positions of tree `treeId`'s resident points (only those
+   *  with semantic label `semantic` when given). */
+  treePointsWorld: (treeId: number, semantic?: number) => Float64Array;
 }
 
 /** Even-odd point-in-polygon test in screen space. Identical to the
@@ -684,7 +839,8 @@ const STAGE_LABEL: Record<string, string> = { tst: 'skeleton build', qsm: 'QSM r
 
 export default function OctreeView({
   octree, display, tools, filters, subsetPreview, worldPicker, stemCenterlines, skeletonOverlay, m3c2Overlay, rasterLayers, cloudVisible, secondaryClouds, editMode, measuring, onStats, onSelectedCount, onDirtyChange,
-  onApiReady, onActiveTreeId, onActiveDeadwoodId, onExportLas, cursorRef,
+  onApiReady, onActiveTreeId, onActiveDeadwoodId, onExportLas, cursorRef, branchMarks = null, branchOverlay = null,
+  onProjection,
 }: Props) {
   const bbMin = octree.meta.boundingBox.min;
   const bbMax = octree.meta.boundingBox.max;
@@ -706,6 +862,10 @@ export default function OctreeView({
     sceneCenter[2] + extent * 0.8,
   ], [sceneCenter, extent]);
   const targetVec = useMemo(() => new THREE.Vector3(...sceneCenter), [sceneCenter]);
+
+  // The heights a layer file's points and lines without one are drawn at
+  // (layers/fileLayers.ts occupiedZSpan).
+  const layerZSpan = useMemo(() => occupiedZSpan(octree.meta.tiles ?? [], octree.meta.boundingBox), [octree.meta]);
 
   // Heights: the cloud's terrain while they are shown above ground, and
   // the skeleton overlay's move onto this cloud's height frame — a
@@ -756,6 +916,20 @@ export default function OctreeView({
   // remedy for a lost context. A new key is exactly what a change of
   // dataset does, and that path is exercised on every switch.
   const [canvasEpoch, setCanvasEpoch] = useState(0);
+  // The viewer's camera, perspective or parallel (viewCamera.ts): a new
+  // one with each canvas (the Canvas key below), and only then. A reload
+  // of the same cloud (the forest pass, a save, a classification) gives
+  // the bounding box new arrays; a camera made again for the SAME canvas
+  // would be taken by react-three-fiber without its aspect (it sets that
+  // on a resize), and the view drawn stretched sideways until the window
+  // was resized.
+  const viewCamera = useMemo(() => {
+    const c = new ViewCamera(45, 1, Math.max(extent * 0.002, 0.01), extent * 8);
+    c.position.set(...startCamera);
+    c.ortho = display.projection === 'ortho';
+    return c;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [octree.dir, canvasEpoch]);
   // Which long backend operation is running, if any. The viewport
   // stops drawing continuously while one is, because a frame that
   // takes seconds is what loses the context in the first place.
@@ -1039,6 +1213,11 @@ export default function OctreeView({
     ctl.object.up.set(0, 1, 0);
     ctl.update();
   }, [sceneCenter, bbMin, bbMax]);
+  // A click on the orientation gizmo's axis looks along it: Z from above,
+  // Y from the south, X from the east.
+  const onGizmoAxis = useCallback((axis: 'x' | 'y' | 'z') => {
+    presetView(axis === 'z' ? 'top' : axis === 'y' ? 'front' : 'side');
+  }, [presetView]);
 
   // Frame the camera on a world-space (source-CRS) bbox, preserving the
   // current view direction. Tree Review hands us a tree's footprint; we
@@ -1075,7 +1254,7 @@ export default function OctreeView({
   // the just-edited points stay painted selection-red and it looks like
   // nothing happened (this was the "assign does nothing" report). Matches
   // the in-memory editor, which also commits + clears.
-  const apply = (action: { treeId?: number; semantic?: 0 | 1 | 2 | 3; deleted?: 0 | 1 | 2; standingDeadwood?: number; layingDeadwood?: number }) => {
+  const apply = (action: { treeId?: number; semantic?: 0 | 1 | 2 | 3 | 4; deleted?: 0 | 1 | 2; standingDeadwood?: number; layingDeadwood?: number }) => {
     const n = editApiRef.current?.applyToSelection(action) ?? 0;
     if (n > 0) {
       editApiRef.current?.clearSelection();
@@ -1280,9 +1459,9 @@ export default function OctreeView({
     return res;
   }, [onSave, octree.dir]);
 
-  // Geometric leaf–wood separation. Writes the semantic column (1 = wood,
-  // 2 = leaf), so the same flush / clear-semantic / reload dance as the
-  // skeleton transfer (which also rewrites semantic).
+  // Geometric leaf–wood separation. Writes the semantic column (1 = stem,
+  // 2 = branch, 4 = leaf), so the same flush / clear-semantic / reload
+  // dance as the skeleton transfer (which also rewrites semantic).
   const doLeafWood = useCallback(async (params: LeafWoodParams): Promise<{ woodPoints: number; leafPoints: number }> => {
     const d = (window as unknown as {
       desktop?: { octreeLeafWood?: (dir: string, p: LeafWoodParams) => Promise<{ woodPoints: number; leafPoints: number }> };
@@ -1291,6 +1470,24 @@ export default function OctreeView({
     await onSave();
     const res = await d.octreeLeafWood(octree.dir, params);
     storeRef.current.clearAttribute('semantic');
+    setStoreVersion(storeRef.current.version);
+    await onSave();
+    editApiRef.current?.reloadNodes();
+    return res;
+  }, [onSave, octree.dir]);
+
+  // The forest pass (stems → trees, wood / leaf) rewrites tree_id and,
+  // when asked, semantic — the same flush / clear / reload dance as the
+  // other segmenters.
+  const doSegmentForest = useCallback(async (params: ForestParams): Promise<ForestResult> => {
+    const d = (window as unknown as {
+      desktop?: { octreeSegmentForest?: (dir: string, p: ForestParams) => Promise<ForestResult> };
+    }).desktop;
+    if (!d?.octreeSegmentForest) throw new Error('The forest pass needs the desktop build.');
+    await onSave();
+    const res = await d.octreeSegmentForest(octree.dir, params);
+    storeRef.current.clearAttribute('tree_id');
+    if (params.writeSemantic) storeRef.current.clearAttribute('semantic');
     setStoreVersion(storeRef.current.version);
     await onSave();
     editApiRef.current?.reloadNodes();
@@ -1317,8 +1514,21 @@ export default function OctreeView({
       countSelected: () => editApiRef.current?.countSelected() ?? 0,
       maxTreeId: () => editApiRef.current?.maxTreeId() ?? 0,
       applyToSelection: (a) => editApiRef.current?.applyToSelection(a) ?? 0,
+      // Points named by record, loaded or not, as one undo step (the
+      // branch review moves a branch to the other tree with it).
+      applyToRecords: (groups, action) => {
+        const tileOf = octree.index.tileOf;
+        const keyed = groups.map(([rec, idx]) => [patchNodeKey(tileOf[rec], rec), idx] as const);
+        const n = storeRef.current.applyAction(keyed, action);
+        if (n > 0) {
+          setStoreVersion(storeRef.current.version);
+          setDirty(true);
+        }
+        return n;
+      },
       selectVisibleUnassigned: () => editApiRef.current?.selectVisibleUnassigned() ?? 0,
       pickScenePointAt: (x, y, maxSamples) => editApiRef.current?.pickScenePointAt(x, y, maxSamples) ?? null,
+      colorHistogram: (bins) => editApiRef.current?.colorHistogram(bins) ?? null,
       classifyGround: (params) => doClassifyGround(params),
       resetClassification: (from, to) => doResetClassification(from, to),
       resetAttribute: (attr) => doResetAttribute(attr),
@@ -1329,8 +1539,12 @@ export default function OctreeView({
       stemTaper: (clickX, clickY, clickZ, params) => doStemTaper(clickX, clickY, clickZ, params),
       segmentDeadwood: (params) => doSegmentDeadwood(params),
       leafWood: (params) => doLeafWood(params),
+      segmentForest: (params) => doSegmentForest(params),
       skeletonTransfer: (baselineDir, targetDir, params) => doSkeletonTransfer(baselineDir, targetDir, params),
       hasTreeIds: () => editApiRef.current?.hasTreeIds() ?? false,
+      getSelection: () => editApiRef.current?.getSelection() ?? new Map(),
+      pointsWorld: (members) => editApiRef.current?.pointsWorld(members) ?? { xyz: new Float64Array(0), missing: members.reduce((n, m) => n + m.points.length, 0) },
+      treePointsWorld: (treeId, semantic) => editApiRef.current?.treePointsWorld(treeId, semantic) ?? new Float64Array(0),
       isolateStatus: () => editApiRef.current?.isolateStatus() ?? null,
       maxDeadwoodId: (channel) => editApiRef.current?.maxDeadwoodId(channel) ?? 0,
     };
@@ -1339,7 +1553,7 @@ export default function OctreeView({
     // `apply` is a stable-enough inline closure; we intentionally rebuild
     // the api when the stable callbacks change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearSel, onSave, doExport, onUndo, onRedo, presetView, frameBox, newTree, doClassifyGround, doResetClassification, doResetAttribute, doSegmentChm, doTreeIsolation, doM3C2, doStemTaper, doSegmentDeadwood, doLeafWood, doSkeletonTransfer, onApiReady]);
+  }, [clearSel, onSave, doExport, onUndo, onRedo, presetView, frameBox, newTree, doClassifyGround, doResetClassification, doResetAttribute, doSegmentChm, doTreeIsolation, doM3C2, doStemTaper, doSegmentDeadwood, doLeafWood, doSegmentForest, doSkeletonTransfer, onApiReady, octree.index]);
 
   return (
     // Dark backdrop so a momentarily blank GL canvas (e.g. a context
@@ -1423,8 +1637,9 @@ export default function OctreeView({
         // far of hundreds of metres destroys depth-buffer precision, and
         // the EDL pass (which reads depth) then renders white once you
         // zoom in close. Keep far/near to a sane ratio (~4000) so depth
-        // stays usable at every zoom level.
-        camera={{ position: startCamera, fov: 45, near: Math.max(extent * 0.002, 0.01), far: extent * 8 }}
+        // stays usable at every zoom level. The camera is perspective or
+        // parallel (viewCamera.ts), the one made for this canvas above.
+        camera={viewCamera}
         onCreated={({ gl }) => {
           gl.setClearColor(viewportBackground(), 1);
         }}
@@ -1460,7 +1675,9 @@ export default function OctreeView({
           zoomToCursor
         />
         <AdaptiveClip orbitRef={orbitRef} extent={extent} />
+        <ProjectionSync projection={display.projection ?? 'perspective'} orbitRef={orbitRef} extent={extent} />
         <NodeStreamer
+          primary
           octree={octree}
           display={display}
           filters={filters}
@@ -1478,6 +1695,7 @@ export default function OctreeView({
           releasedRef={releasedRef}
           terrain={heights.flattenWith}
           colorTerrain={heights.colorWith}
+          branchMarks={branchMarks}
         />
         <RasterLayers layers={rasterLayers} offset={octree.meta.offset} terrain={heights.flattenWith} />
         {secondaryClouds.map(c => (
@@ -1488,7 +1706,9 @@ export default function OctreeView({
             visible={c.visible}
             color={c.color}
             colorMode={c.colorMode}
-            filters={c.syncFilters ? filters : null}
+            filters={filters}
+            syncFilters={c.syncFilters}
+            syncExtent={c.syncExtent}
             flatten={display.heightMode === 'above_ground'}
             fallbackTerrain={heights.flattenWith}
           />
@@ -1507,8 +1727,11 @@ export default function OctreeView({
         />
         <MeasureController active={measuring} editApiRef={editApiRef} />
         <CenterlineOverlay centerlines={stemCenterlines} offset={octree.meta.offset} terrain={heights.flattenWith} />
+        <BranchMeasureOverlay overlay={branchOverlay} offset={octree.meta.offset} terrain={heights.flattenWith} />
         <SkeletonPointsOverlay skeleton={skeletonOverlay} offset={octree.meta.offset} solid={!cloudVisible} zAdjust={heights.skeletonZAdjust} />
         <M3C2PointsOverlay overlay={m3c2Overlay} offset={octree.meta.offset} terrain={heights.flattenWith} />
+        <SurveyOverlay offset={octree.meta.offset} terrain={heights.flattenWith} zSpan={layerZSpan} />
+        <ForestOverlay offset={octree.meta.offset} terrain={heights.flattenWith} />
         <AxisGizmoUpdater dirsRef={gizmoDirsRef} />
         <EdlPass
           enabled={display.edlEnabled}
@@ -1516,9 +1739,12 @@ export default function OctreeView({
           radius={1.5}
         />
       </Canvas>
+      {/* North arrow, scale bar and the projection switch (ViewHud.tsx). */}
+      <ViewHud orbitRef={orbitRef} projection={display.projection ?? 'perspective'} onProjection={onProjection} />
       {/* Orientation gizmo, bottom-right (CloudCompare-style). Pointer-
-          transparent so it never blocks orbiting. */}
-      <AxisGizmoOverlay dirsRef={gizmoDirsRef} />
+          transparent so it never blocks orbiting; a click on an axis
+          looks along it. */}
+      <AxisGizmoOverlay dirsRef={gizmoDirsRef} onAxis={onGizmoAxis} />
     </div>
   );
 }
@@ -1593,16 +1819,83 @@ export function ContextLossWatch({ onLost, onRestored }: { onLost: () => void; o
   return null;
 }
 
+/** The display's projection on the viewer's camera (viewCamera.ts), and
+ *  the wheel of a parallel view. The orbit controls' dolly would only
+ *  move the camera, which a parallel view does not show, so the wheel
+ *  zooms here instead: towards the cursor's point on the target plane,
+ *  camera and target together, which keeps that point under the cursor
+ *  (the parallel view's size follows the target distance). */
+export function ProjectionSync({ projection, orbitRef, extent }: {
+  projection: 'perspective' | 'ortho';
+  orbitRef: React.RefObject<OrbitControlsImpl | null>;
+  extent: number;
+}) {
+  const { camera, gl, invalidate } = useThree();
+  const ortho = projection === 'ortho';
+  useEffect(() => {
+    const cam = camera as ViewCamera;
+    const ctl = orbitRef.current;
+    if (cam.ortho !== ortho) {
+      cam.ortho = ortho;
+      if (ortho && ctl) syncOrtho(cam, cam.position.distanceTo(ctl.target), extent);
+      cam.updateProjectionMatrix();
+      invalidate();
+    }
+    if (!ctl) return;
+    ctl.enableZoom = !ortho;
+    if (!ortho) return;
+    const el = gl.domElement;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.deltaY === 0) return;
+      const target = ctl.target;
+      const d = cam.position.distanceTo(target);
+      if (!(d > 0)) return;
+      // the controls' own step: 0.95 ^ zoomSpeed a notch
+      const step = Math.pow(0.95, ctl.zoomSpeed ?? 1);
+      const d2 = Math.min(extent * 50, Math.max(extent * 1e-5, e.deltaY < 0 ? d * step : d / step));
+      const r = el.getBoundingClientRect();
+      const nx = ((e.clientX - r.left) / Math.max(1, r.width)) * 2 - 1;
+      const ny = 1 - ((e.clientY - r.top) / Math.max(1, r.height)) * 2;
+      const halfH = orthoHalfHeight({ orthoDistance: d, fov: cam.fov, zoom: cam.zoom });
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
+      const q = target.clone().addScaledVector(right, nx * halfH * cam.aspect).addScaledVector(up, ny * halfH);
+      const f = 1 - d2 / d;
+      cam.position.lerp(q, f);
+      target.lerp(q, f);
+      syncOrtho(cam, d2, extent);
+      ctl.update();
+      invalidate();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      ctl.enableZoom = true;
+    };
+  }, [ortho, camera, gl, orbitRef, extent, invalidate]);
+  return null;
+}
+
 export function AdaptiveClip({ orbitRef, extent }: {
   orbitRef: React.RefObject<OrbitControlsImpl | null>;
   extent: number;
 }) {
-  const { camera } = useThree();
-  useFrame(() => {
-    const cam = camera as THREE.PerspectiveCamera;
+  useFrame((state) => {
+    const cam = state.camera as THREE.PerspectiveCamera;
+    // The camera's aspect is the canvas's, whatever replaced the camera
+    // since the last resize (react-three-fiber sets it only then).
+    const { width, height } = state.size;
+    if (width > 0 && height > 0 && Math.abs(cam.aspect - width / height) > 1e-6) {
+      cam.aspect = width / height;
+      cam.updateProjectionMatrix();
+    }
     const ctl = orbitRef.current;
     if (!ctl) return;
     const d = cam.position.distanceTo(ctl.target);
+    // A parallel view matches the perspective one at the target, and
+    // sees the whole scene, behind the camera too (viewCamera.ts).
+    if (isOrtho(cam)) syncOrtho(cam, d, extent);
     // near: 2 % of pivot distance, floored so it never hits zero.
     const near = Math.max(d * 0.02, extent * 1e-4, 0.002);
     // far: reach past the pivot by the cloud span so nothing clips when
@@ -1655,8 +1948,14 @@ function OctreeSelectController({
    *  every backend command works in. */
   sceneOffset: [number, number, number];
 }) {
-  const { gl } = useThree();
+  const { gl, camera } = useThree();
   const activeRef = useRef<ActiveShape | null>(null);
+  // A panel's world picker has the viewport's presses while it is set:
+  // the lasso must not start a shape under it (both listen in the capture
+  // phase on the canvas, so stopping propagation in one does not keep the
+  // press from the other).
+  const pickerOnRef = useRef(false);
+  pickerOnRef.current = !!worldPicker;
   const additiveRef = useRef(true);
   const lastClickRef = useRef({ t: 0, x: 0, y: 0 });
   const overlayRef = useRef<{ layer: HTMLElement; svg: SVGSVGElement } | null>(null);
@@ -1815,6 +2114,17 @@ function OctreeSelectController({
       if (len < 1e-6) return;
       dir.multiplyScalar(1 / len);
       const depth = new THREE.Vector3(hit[0], hit[1], hit[2]).sub(cam.position).dot(dir);
+      if (isOrtho(cam)) {
+        // A parallel view's size follows the target distance, so moving
+        // only the target would zoom it on every press. Camera and target
+        // move along the view axis together: the same picture, pivoting
+        // at the point's depth (behind the camera too — it sees that).
+        const along = depth - len;
+        cam.position.addScaledVector(dir, along);
+        ctl.target.addScaledVector(dir, along);
+        ctl.update();
+        return;
+      }
       if (depth <= 1e-4) return;
       ctl.target.copy(cam.position).addScaledVector(dir, depth);
       ctl.update();
@@ -1833,24 +2143,53 @@ function OctreeSelectController({
     if (!worldPicker) return;
     const dom = gl.domElement;
     const prevCursor = dom.style.cursor;
-    dom.style.cursor = 'crosshair';
+    // A picker that takes drags (Tree Review's pull-apart) gets the
+    // press, every move and the release, as view rays.
+    const drag = (worldPicker as WorldPicker).drag ?? null;
+    dom.style.cursor = drag ? 'grab' : 'crosshair';
     const prevOrbit = orbitRef.current?.enabled ?? true;
     if (orbitRef.current) orbitRef.current.enabled = false;
-    let downX = 0, downY = 0, dragged = false, down = false;
+    let downX = 0, downY = 0, dragged = false, down = false, grabbing = false;
+    const rayAt = (e: PointerEvent) => {
+      const r = dom.getBoundingClientRect();
+      return viewRay(camera, e.clientX - r.left, e.clientY - r.top, r.width, r.height, sceneOffset);
+    };
     const onDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       down = true; dragged = false; downX = e.clientX; downY = e.clientY;
+      if (drag) {
+        grabbing = drag.start(rayAt(e));
+        if (grabbing) {
+          dom.style.cursor = 'grabbing';
+          try { dom.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
+        }
+      }
       e.stopPropagation(); e.preventDefault();
     };
     const onMove = (e: PointerEvent) => {
       if (!down) return;
       if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) dragged = true;
+      if (drag && grabbing) { drag.move(rayAt(e)); e.stopPropagation(); }
     };
     const onUp = (e: PointerEvent) => {
       if (!down) return;
       down = false;
+      if (drag) {
+        if (grabbing) { grabbing = false; drag.end(); dom.style.cursor = 'grab'; }
+        e.stopPropagation(); e.preventDefault();
+        return;
+      }
       if (dragged) return; // a drag means "I changed my mind" — ignore
       const r = dom.getBoundingClientRect();
+      // A picker with a plane takes the click where the view ray meets
+      // it (the stem review: into a stem's hollow, from above).
+      const plane = (worldPicker as WorldPicker).plane;
+      if (plane) {
+        const at = pickOnPlane(camera, e.clientX - r.left, e.clientY - r.top, r.width, r.height, plane, sceneOffset);
+        if (at) worldPicker(at);
+        e.stopPropagation(); e.preventDefault();
+        return;
+      }
       // The pick is a SCENE point. It went to the panels as it was, and
       // the caliper, click-to-measure, the scan-inspection viewpoint and
       // the plot-boundary centre all searched survey coordinates for a
@@ -1869,10 +2208,11 @@ function OctreeSelectController({
       dom.removeEventListener('pointerdown', onDown, true);
       dom.removeEventListener('pointermove', onMove, true);
       dom.removeEventListener('pointerup', onUp, true);
+      if (drag && grabbing) drag.end();
       dom.style.cursor = prevCursor;
       if (orbitRef.current) orbitRef.current.enabled = prevOrbit;
     };
-  }, [worldPicker, gl, editApiRef, sceneOffset]);
+  }, [worldPicker, gl, camera, editApiRef, sceneOffset]);
 
   useEffect(() => {
     if (!editMode) return;
@@ -1897,6 +2237,7 @@ function OctreeSelectController({
       // so the camera is always reachable, and Shift+click eyedrops the
       // tree id (handled in the always-on pick effect above).
       if (e.shiftKey) return;
+      if (pickerOnRef.current) return; // a world picker has the press
       if (selectTool === 'poly') {
         const p = toLocal(e);
         const a = activeRef.current;
@@ -2248,6 +2589,91 @@ function CenterlineOverlay({
   return null;
 }
 
+// ====================== Branch measurement overlay ================
+
+/** The Branches panel's measurement graphics: caliper jaws, the section
+ *  ring and the length polyline as coloured line segments, and the
+ *  clicked / end points as dots. Depth-test off so a jaw inside the
+ *  branch's points still shows. World coords in, swap-and-negate (and
+ *  the terrain shift while heights are drawn above ground) applied
+ *  here, like the centreline overlay. */
+function BranchMeasureOverlay({
+  overlay, offset, terrain = null,
+}: {
+  overlay?: BranchOverlayData | null;
+  offset: [number, number, number];
+  terrain?: TerrainDisplay | null;
+}) {
+  const { scene } = useThree();
+  const groupRef = useRef<THREE.Group | null>(null);
+  const linesRef = useRef<THREE.LineSegments | null>(null);
+  const dotsRef = useRef<THREE.Points | null>(null);
+
+  useEffect(() => {
+    const group = new THREE.Group();
+    group.renderOrder = 998;
+    group.visible = false;
+    const lgeo = new THREE.BufferGeometry();
+    lgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+    lgeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+    const lmat = new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false, transparent: true });
+    const lines = new THREE.LineSegments(lgeo, lmat);
+    lines.frustumCulled = false;
+    lines.renderOrder = 999;
+    const dgeo = new THREE.BufferGeometry();
+    dgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+    dgeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+    const dmat = new THREE.PointsMaterial({ vertexColors: true, size: 8, sizeAttenuation: false, depthTest: false, transparent: true });
+    const dots = new THREE.Points(dgeo, dmat);
+    dots.frustumCulled = false;
+    dots.renderOrder = 1000;
+    group.add(lines);
+    group.add(dots);
+    scene.add(group);
+    groupRef.current = group; linesRef.current = lines; dotsRef.current = dots;
+    return () => {
+      scene.remove(group);
+      lgeo.dispose(); lmat.dispose(); dgeo.dispose(); dmat.dispose();
+      groupRef.current = null; linesRef.current = null; dotsRef.current = null;
+    };
+  }, [scene]);
+
+  useEffect(() => {
+    const group = groupRef.current, lines = linesRef.current, dots = dotsRef.current;
+    if (!group || !lines || !dots) return;
+    const segs = overlay?.segments ?? [];
+    const pts = overlay?.dots ?? [];
+    if (segs.length === 0 && pts.length === 0) { group.visible = false; return; }
+    const toScene = (p: [number, number, number], out: Float32Array, o: number) => {
+      out[o] = p[0] - offset[0];
+      out[o + 1] = p[2] - (terrain ? terrain.shift(p[0], p[1]) : 0) - offset[2];
+      out[o + 2] = -(p[1] - offset[1]);
+    };
+    const col = new THREE.Color();
+    const lp = new Float32Array(segs.length * 6), lc = new Float32Array(segs.length * 6);
+    segs.forEach((sg, i) => {
+      toScene(sg.a, lp, i * 6); toScene(sg.b, lp, i * 6 + 3);
+      col.set(sg.color);
+      lc.set([col.r, col.g, col.b, col.r, col.g, col.b], i * 6);
+    });
+    const dp = new Float32Array(pts.length * 3), dc = new Float32Array(pts.length * 3);
+    pts.forEach((d, i) => {
+      toScene(d.p, dp, i * 3);
+      col.set(d.color);
+      dc.set([col.r, col.g, col.b], i * 3);
+    });
+    lines.geometry.setAttribute('position', new THREE.BufferAttribute(lp, 3));
+    lines.geometry.setAttribute('color', new THREE.BufferAttribute(lc, 3));
+    lines.geometry.computeBoundingSphere();
+    dots.geometry.setAttribute('position', new THREE.BufferAttribute(dp, 3));
+    dots.geometry.setAttribute('color', new THREE.BufferAttribute(dc, 3));
+    dots.geometry.computeBoundingSphere();
+    group.visible = true;
+  }, [overlay, offset, terrain]);
+
+  return null;
+}
+
 // ====================== Skeleton points overlay ===================
 
 /** Per-cylinder skeleton sample points as a single THREE.Points
@@ -2530,6 +2956,13 @@ function clampPointSize(s: number): number {
 }
 
 interface StreamerProps {
+  /** The editor's own view of the cloud (not a Compare pane or a figure):
+   *  it asks the backend for the whole cloud's largest tree id and draws
+   *  Tree Review's pull-apart. Optional: false when absent. */
+  primary?: boolean;
+  /** Branches to paint / filter (the editor's view only). Undefined
+   *  leaves them off entirely. */
+  branchMarks?: BranchMarksView | null;
   octree: OpenOctree;
   display: DisplayConfig;
   filters: FilterConfig;
@@ -2577,9 +3010,9 @@ const lastPickSpacing: { current: number | null } = { current: null };
 export function NodeStreamer({
   octree, display, filters, subsetPreview, cloudVisible, activeTreeId, activeStandingId, activeLayingId, storeRef, selectionStoreRef, storeVersion,
   onSelectionChange, onStatsChange,
-  editApiRef, releasedRef, planOverrideRef, terrain, colorTerrain,
+  editApiRef, releasedRef, planOverrideRef, terrain, colorTerrain, branchMarks, primary = false,
 }: StreamerProps) {
-  const { camera, scene, size, gl } = useThree();
+  const { camera, scene, size, gl, invalidate } = useThree();
   const groupRef = useRef<THREE.Group>(new THREE.Group());
   // Whole-cloud per-axis spans in SCENE coords, so the height / X / Y
   // ramps run ONCE edge-to-edge across the dataset instead of
@@ -2610,23 +3043,17 @@ export function NodeStreamer({
     return { lo: box.min[2] - off[2], hi: box.max[2] - off[2] };
   }, [octree.meta.boundingBox, octree.meta.offset, colorTerrain]);
   const heightSpanRef = useRef(heightSpan);
-  useEffect(() => {
-    heightSpanRef.current = heightSpan;
-    sharedUniformsRef.current.heightSpan = heightSpan;
-  }, [heightSpan]);
+  heightSpanRef.current = heightSpan;
   const xSpan = useMemo<{ lo: number; hi: number }>(() => ({
     lo: octree.meta.boundingBox.min[0] - octree.meta.offset[0],
     hi: octree.meta.boundingBox.max[0] - octree.meta.offset[0],
   }), [octree.meta.boundingBox, octree.meta.offset]);
-  const ySpan = useMemo<{ lo: number; hi: number }>(() => {
-    const lo = -(octree.meta.boundingBox.max[1] - octree.meta.offset[1]);
-    const hi = -(octree.meta.boundingBox.min[1] - octree.meta.offset[1]);
-    return { lo, hi };
-  }, [octree.meta.boundingBox, octree.meta.offset]);
-  const xSpanRef = useRef(xSpan);
-  const ySpanRef = useRef(ySpan);
-  useEffect(() => { xSpanRef.current = xSpan; }, [xSpan]);
-  useEffect(() => { ySpanRef.current = ySpan; }, [ySpan]);
+  // Over northings (less the offset): the colouring reads −scene z, so
+  // the ramp runs south to north and the legend reads northings.
+  const ySpan = useMemo<{ lo: number; hi: number }>(() => ({
+    lo: octree.meta.boundingBox.min[1] - octree.meta.offset[1],
+    hi: octree.meta.boundingBox.max[1] - octree.meta.offset[1],
+  }), [octree.meta.boundingBox, octree.meta.offset]);
   // Cloud-wide intensity span, from the converter's recorded
   // metadata.intensityRange (see octree.rs write_metadata /
   // octree_intensity_range). Unlike height/x/y this has no bounding-box
@@ -2639,8 +3066,6 @@ export function NodeStreamer({
       ? { lo: octree.meta.intensityRange[0], hi: octree.meta.intensityRange[1] }
       : null
   ), [octree.meta.intensityRange]);
-  const intensitySpanRef = useRef(intensitySpan);
-  useEffect(() => { intensitySpanRef.current = intensitySpan; }, [intensitySpan]);
   // Cloud-wide range per extra column. Starts from the converter's
   // metadata.extras (observed min/max), and a user-set override from
   // display.extraRangeOverrides wins for that column — letting the user
@@ -2659,8 +3084,6 @@ export function NodeStreamer({
     }
     return out;
   }, [octree.meta.extras, display.extraRangeOverrides]);
-  const extraRangesRef = useRef(extraRanges);
-  useEffect(() => { extraRangesRef.current = extraRanges; }, [extraRanges]);
   /** Loaded nodes keyed by their record index in oct.records / oct.index. */
   const loadedRef = useRef<Map<number, LoadedNode>>(new Map());
   /** In-flight loads keyed by recIdx so we don't double-fetch. */
@@ -2704,10 +3127,7 @@ export function NodeStreamer({
    *  rather than published. */
   const loadGenRef = useRef(0);
   const deepSelPendingRef = useRef(0);
-  const deepSelReapplyRef = useRef<{
-    treeId?: number; semantic?: 0 | 1 | 2 | 3; deleted?: 0 | 1 | 2;
-    standingDeadwood?: number; layingDeadwood?: number;
-  } | null>(null);
+  const deepSelReapplyRef = useRef<PatchAction | null>(null);
   const displayRef = useRef(display);
   displayRef.current = display;
   const filtersRef = useRef(filters);
@@ -2728,6 +3148,176 @@ export function NodeStreamer({
   sharedUniformsRef.current.activeTreeRgb = activeRgb;
   const unlabeledRgb = useMemo(() => hexToRgb(display.unlabeledColor), [display.unlabeledColor]);
   sharedUniformsRef.current.unlabeledRgb = unlabeledRgb;
+
+  // ---- What the CPU colouring reads besides the mode ----------------
+  // The spans the ramps run over: the cloud's own, or the stretch the
+  // user set in the Display panel or the legend (DisplayConfig.rampRanges,
+  // in the units the legend shows — colorStretch.ts converts).
+  const heightAboveGround = !!colorTerrain;
+  const colorTerrainRef = useRef(colorTerrain ?? null);
+  colorTerrainRef.current = colorTerrain ?? null;
+  const spans = useMemo<ColorSpans>(() => ({
+    ...stretchSpans(
+      { height: heightSpan, x: xSpan, y: ySpan, intensity: intensitySpan },
+      display.rampRanges, octree.meta.offset, heightAboveGround,
+    ),
+    extra: extraRanges,
+  }), [heightSpan, xSpan, ySpan, intensitySpan, extraRanges, display.rampRanges, octree.meta.offset, heightAboveGround]);
+  sharedUniformsRef.current.spans = spans;
+  const spansRef = useRef(spans);
+  spansRef.current = spans;
+
+  // Each tree by what was measured of it ('tree_metric'): a colour per
+  // tree id over the ramp and the range (the set one, else the measured
+  // trees' 2–98 %), or the flag colours (treeMetricColors.ts), looked up
+  // per point by its tree id. The measurements of this dataset come from
+  // the store the Display, QC and growth panels publish to.
+  const treeStore = useSyncExternalStore(subscribeTreeData, treeData);
+  const treeColours = useMemo(() => {
+    if (display.colorMode !== 'tree_metric' || treeStore.dir !== octree.dir) return null;
+    const def = treeMetricDef(display.treeMetric);
+    const values = treeValues(def.id, treeStore.rows, treeStore.pairs, treeStore.qc);
+    const set = display.treeRanges?.[def.id];
+    const range = def.kind === 'ramp' ? (set && set.hi > set.lo ? set : treeValueRange(values)) : null;
+    // the custom ramp's colours, before the trees' are read off it
+    setCustomRampStops(display.customRamp[0], display.customRamp[1]);
+    const tex = treeColorTexture(values, def.kind, display.ramp, range, def.id);
+    return {
+      metric: def.id, values, range: range ? { lo: range.lo, hi: range.hi } : null,
+      colors: { data: tex.data, count: tex.width * tex.height },
+    };
+  }, [display.colorMode, display.treeMetric, display.treeRanges, display.ramp, display.customRamp, treeStore, octree.dir]);
+  const treeColoursRef = useRef(treeColours);
+  treeColoursRef.current = treeColours;
+  // Measurements another panel has already made are used straight away;
+  // measuring is the Display panel's button, never a side effect of
+  // looking.
+  useEffect(() => {
+    if (display.colorMode !== 'tree_metric') return;
+    const d = treeData();
+    if (d.dir === octree.dir && d.rows) return;
+    let cancelled = false;
+    const desktop = (window as unknown as { desktop?: MetricsSource }).desktop;
+    void cachedTreeMetrics(desktop, octree.dir).then((hit) => { if (!cancelled && hit) publishTreeMetrics(octree.dir, hit.rows); });
+    return () => { cancelled = true; };
+  }, [display.colorMode, octree.dir]);
+
+  // The class colours, with a colour of its own for each class the
+  // dataset's source file named (metadata.classNames).
+  const classLut = useMemo(() => {
+    const named = namedClassCodes(octree.meta.classNames);
+    return named.length > 0 ? classLutFor(named) : ASPRS_LUT;
+  }, [octree.meta.classNames]);
+
+  // Shading by intensity over any colour mode (DisplayConfig.shade): over
+  // the intensity stretch the user set, else the loaded points' 2–98 %
+  // (read when the shading is turned on, and again a few seconds later as
+  // the cloud streams in — the colours are baked per node, so not on
+  // every frame), else the cloud's recorded range.
+  const shadeOn = (display.shade ?? 0) > 0;
+  const shadeSet = display.rampRanges?.intensity ?? null;
+  const [shadeSeen, setShadeSeen] = useState<Span | null>(null);
+  useEffect(() => {
+    if (!shadeOn || shadeSet) return;
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const measure = (): void => {
+      tries++;
+      const h = histogramOf([...loadedRef.current.values()], (ln) => ln.numPoints, (ln, i) => ln.intensity[i], 'intensity', 16, 200_000);
+      if (h) {
+        const lo = h.p.p2, hi = h.p.p98;
+        // a small drift is not worth recolouring every node for
+        setShadeSeen((prev) => (prev && Math.abs(prev.lo - lo) + Math.abs(prev.hi - hi) <= 0.02 * Math.max(1e-6, hi - lo) ? prev : { lo, hi }));
+      }
+      // once more after the first read; until something is loaded, a few
+      if (tries < 2 || (!h && tries < 6)) timer = setTimeout(measure, 3000);
+    };
+    measure();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [shadeOn, shadeSet, octree.dir]);
+  const shade = useMemo<PaintExtras['shade']>(() => {
+    const k = display.shade ?? 0;
+    if (!(k > 0)) return null;
+    const r = shadeSet ?? shadeSeen ?? intensitySpan;
+    return r && r.hi > r.lo ? { strength: Math.min(1, k), lo: r.lo, inv: 1 / (r.hi - r.lo) } : null;
+  }, [display.shade, shadeSet, shadeSeen, intensitySpan]);
+  const paint = useMemo<PaintExtras>(
+    () => ({ shade, treeColors: treeColours?.colors ?? null, classLut }),
+    [shade, treeColours, classLut],
+  );
+  sharedUniformsRef.current.paint = paint;
+
+  // The largest tree id in the whole cloud, from the backend's tree
+  // tally (one scan, cached per dataset). "New tree" and split must not
+  // reuse an id only unloaded nodes hold: of a large cloud the viewer has
+  // loaded a few percent. Asked a few seconds after opening, so the scan
+  // does not compete with the first view's loads; until it answers, the
+  // loaded nodes and the patches decide as before. The editor's view only.
+  const cloudMaxTreeIdRef = useRef(0);
+  // Whether the last deep selection stopped at its cap (the status bar
+  // says so).
+  const deepTruncRef = useRef(false);
+  useEffect(() => {
+    cloudMaxTreeIdRef.current = 0;
+    if (!primary) return;
+    const d = (window as unknown as { desktop?: { octreeMaxTreeId?: (dir: string) => Promise<number> } }).desktop;
+    if (!d?.octreeMaxTreeId) return;
+    let live = true;
+    const timer = setTimeout(() => {
+      d.octreeMaxTreeId!(octree.dir)
+        .then((v) => { if (live && Number.isFinite(v)) cloudMaxTreeIdRef.current = v; })
+        .catch((e) => console.warn('[octree] whole-cloud max tree id unavailable', e));
+    }, CLOUD_MAX_ID_DELAY_MS);
+    return () => { live = false; clearTimeout(timer); };
+  }, [octree.dir, primary]);
+
+  // Tree Review's pull-apart (treeShift.ts): the neighbours drawn aside in
+  // this cloud — the editor's own view only, and only while the tree the
+  // shift was made around is isolated here. A drag changes only the
+  // offsets (the shared texture); a new set of moved trees writes every
+  // resident node's slots, and a node loaded later gets its own on load.
+  // shiftLookupRef is what the CPU picks and selections move a point by.
+  const shiftLookupRef = useRef<ShiftView['lookup'] | null>(null);
+  const isolateId = filters.isolateTreeId;
+  useEffect(() => {
+    const su = sharedUniformsRef.current;
+    const apply = (): void => {
+      const view = primary ? shiftForView(getTreeShift(), octree.dir, isolateId) : null;
+      if (!view) {
+        if (su.shift) {
+          su.shift = null;
+          su.shiftReach = 0;
+          shiftLookupRef.current = null;
+          for (const ln of loadedRef.current.values()) writeShiftSlots(ln, su);
+          invalidate();
+        }
+        return;
+      }
+      // Each moved tree's slot, and the offsets one texel a slot.
+      const slots = shiftSlots(view.lookup);
+      const same = su.shift !== null && su.shift.ids === slots.key;
+      const slotOf = same ? su.shift!.slotOf : slots.slotOf;
+      const table = same ? su.shift!.table : slotTable(slotOf);
+      const old = su.uShiftTex.value;
+      if (old.image.width === slots.width && old.image.height === slots.height) {
+        (old.image.data as unknown as Float32Array).set(slots.data);
+        old.needsUpdate = true;
+      } else {
+        su.uShiftTex.value = shiftTexture(slots.data, slots.width, slots.height);
+        su.uShiftTexSize.value.set(slots.width, slots.height);
+        old.dispose();
+      }
+      su.shift = { view, slotOf, table, ids: slots.key };
+      su.shiftReach = view.reach;
+      shiftLookupRef.current = view.lookup;
+      for (const ln of loadedRef.current.values()) {
+        if (same) fitShiftSphere(ln, su); else writeShiftSlots(ln, su);
+      }
+      invalidate();
+    };
+    apply();
+    return subscribeTreeShift(apply);
+  }, [octree.dir, isolateId, primary, invalidate]);
 
   // Tree-id merge overlay. Raw { from → to } pairs live here; the
   // flattened version is mirrored onto shared.remap so freshly-streamed
@@ -2759,14 +3349,14 @@ export function NodeStreamer({
     const entries = store.map.get(key);
     applyToNode(ln.treeIds, ln.semantic, ln.deleted, ln.positions, ln.originalPositions, entries, ln.standingDeadwood, ln.layingDeadwood);
     applyRemapInPlace(ln.treeIds, sharedUniformsRef.current.remap);
-    {
-      const su = sharedUniformsRef.current;
-      colorNode(ln, displayRef.current.colorMode, displayRef.current.ramp, { tree: su.activeTreeId, standing: su.activeStandingId, laying: su.activeLayingId }, su.activeTreeRgb, heightSpanRef.current, extraRangesRef.current, su.unlabeledRgb, { x: xSpanRef.current, y: ySpanRef.current }, intensitySpanRef.current ?? undefined);
-    }
     // A tree_id edit / merge can flip the filter result (isolate / range
-    // / hide-unassigned all key on tree_id), so re-mask after folding.
+    // / hide-unassigned all key on tree_id), so re-mask after folding —
+    // before the colours, which paint the isolated tree's strays.
     ln.filterPass = applyFilters(ln, filtersRef.current, octree.meta.offset);
     applyPreviewClip(ln, subsetPreviewRef.current, octree.meta.offset);
+    paintNode(ln, sharedUniformsRef.current, displayRef.current);
+    // A point whose tree id changed is drawn where its new tree is.
+    if (sharedUniformsRef.current.shift) writeShiftSlots(ln, sharedUniformsRef.current);
     // Live positions changed (delete / unhide replay) — re-encode the
     // quantised GPU copy before flagging the upload.
     syncQuantizedPositions(ln);
@@ -2800,6 +3390,8 @@ export function NodeStreamer({
   terrainRef.current = terrain ?? null;
   const emptyDtmRef = useRef<THREE.Texture>(sharedUniformsRef.current.uDtm.value);
   useEffect(() => () => { emptyDtmRef.current.dispose(); }, []);
+  // The pull-apart's offset texture goes with the streamer too.
+  useEffect(() => () => { sharedUniformsRef.current.uShiftTex.value.dispose(); }, []);
   useEffect(() => {
     const su = sharedUniformsRef.current;
     const off = octree.meta.offset;
@@ -2865,8 +3457,7 @@ export function NodeStreamer({
     // always paints with whatever is CURRENT when it completes, not what
     // was active when the effect fired.
     const recolor = (ln: LoadedNode): void => {
-      const su = sharedUniformsRef.current;
-      colorNode(ln, displayRef.current.colorMode, displayRef.current.ramp, { tree: su.activeTreeId, standing: su.activeStandingId, laying: su.activeLayingId }, su.activeTreeRgb, heightSpanRef.current, extraRangesRef.current, su.unlabeledRgb, { x: xSpanRef.current, y: ySpanRef.current }, intensitySpanRef.current ?? undefined);
+      paintNode(ln, sharedUniformsRef.current, displayRef.current);
       const ca = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
       if (ca) ca.needsUpdate = true;
     };
@@ -2878,7 +3469,7 @@ export function NodeStreamer({
       if (extraName && !ln.extras[extraName]) missing.push(ln);
     }
     if (extraName && missing.length > 0) void hydrateExtraColumn(missing, extraName, recolor);
-  }, [display.colorMode, display.ramp, display.customRamp, activeTreeId, activeStandingId, activeLayingId, activeRgb, unlabeledRgb, extraRanges, hydrateExtraColumn, heightSpan]);
+  }, [display.colorMode, display.ramp, display.customRamp, activeTreeId, activeStandingId, activeLayingId, activeRgb, unlabeledRgb, spans, paint, hydrateExtraColumn]);
 
   // Load the merge overlay (treemap.json) when the dataset changes, then
   // re-fold via the remapVersion bump below.
@@ -2899,6 +3490,15 @@ export function NodeStreamer({
     for (const ln of loadedRef.current.values()) refreshNode(ln);
   }, [remapVersion, refreshNode]);
 
+  // Repaint and re-mask every loaded node when the branches, their
+  // colours or how they are shown change. Nodes loaded later read the
+  // same holder (see loadNode), so they come in painted.
+  useEffect(() => {
+    if (branchMarks === undefined) return;
+    sharedUniformsRef.current.branch.current = branchMarks;
+    for (const ln of loadedRef.current.values()) refreshNode(ln);
+  }, [branchMarks, refreshNode]);
+
   // Re-mask every loaded node when the filter config changes. Filters
   // are evaluated against the *current* (post-edit) tree_ids and
   // classifications, so isolating a tree always reflects the latest
@@ -2917,11 +3517,19 @@ export function NodeStreamer({
     // transient tool — the tally is about the FILTERS only, so preview
     // clipping is deliberately excluded from it.
     const apply = (ln: LoadedNode): number => {
+      const hadStrays = ln.strays > 0;
       const pass = applyFilters(ln, filters, off);
       ln.filterPass = pass;
       applyPreviewClip(ln, subsetPreview ?? null, off);
       const va = ln.geom?.attributes.aVisible as THREE.BufferAttribute | undefined;
       if (va) va.needsUpdate = true;
+      // The isolated tree's strays are painted in their own colour: a
+      // node that had or has some is coloured again.
+      if (hadStrays || ln.strays > 0) {
+        paintNode(ln, sharedUniformsRef.current, displayRef.current);
+        const ca = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
+        if (ca) ca.needsUpdate = true;
+      }
       return pass;
     };
     // Each apply() stashes its pass count on the node (ln.filterPass);
@@ -3241,34 +3849,31 @@ export function NodeStreamer({
 
     // Legend bounds (see ViewerStats.rampLo/rampHi) — MUST be the exact
     // values colorNode() ramped this frame's active mode over, or the
-    // legend lies. height / x / y / extra:<name> read the identical ref
-    // objects colorNode() is called with a few lines above (heightSpanRef
-    // / xSpanRef / ySpanRef / extraRangesRef) — there is no separate
-    // computation to drift out of sync. intensity reads intensitySpanRef
-    // the same way: when metadata.intensityRange is known (recorded at
-    // import, or backfilled on demand via octree_intensity_range),
-    // colorNode ramped over that SAME cloud-wide span, so it's published
-    // here too. When it's absent, colorNode fell back to a per-node scan
-    // instead — no single pair of numbers describes every tile in that
-    // case, so publishing nothing beats publishing a value the painting
-    // doesn't actually obey. Categorical / flat modes carry no numeric
-    // scale either — null, and the legend hides itself.
+    // legend lies. height / x / y / intensity / extra:<name> read the
+    // identical span object colorNode() is called with (spansRef — the
+    // cloud's own or the stretch the user set), only spoken in the units
+    // the legend shows: elevations, eastings and northings rather than
+    // numbers relative to the dataset offset (colorStretch.legendSpan).
+    // intensity: when metadata.intensityRange is known (recorded at
+    // import, or backfilled on demand via octree_intensity_range) or a
+    // stretch is set, colorNode ramped over that SAME span, so it's
+    // published here too. When neither is, colorNode fell back to a
+    // per-node scan instead — no single pair of numbers describes every
+    // tile in that case, so publishing nothing beats publishing a value
+    // the painting doesn't actually obey. A tree metric's ramp is over
+    // the trees' range. Categorical / flat modes carry no numeric scale
+    // either — null, and the legend hides itself.
     const rampMode = displayRef.current.colorMode;
-    let rampLo: number | null = null;
-    let rampHi: number | null = null;
-    if (rampMode === 'height') {
-      rampLo = heightSpanRef.current.lo; rampHi = heightSpanRef.current.hi;
-    } else if (rampMode === 'x') {
-      rampLo = xSpanRef.current.lo; rampHi = xSpanRef.current.hi;
-    } else if (rampMode === 'y') {
-      rampLo = ySpanRef.current.lo; rampHi = ySpanRef.current.hi;
-    } else if (rampMode === 'intensity') {
-      const span = intensitySpanRef.current;
-      if (span) { rampLo = span.lo; rampHi = span.hi; }
+    let legend: Span | null = null;
+    if (rampMode === 'tree_metric') {
+      legend = treeColoursRef.current?.range ?? null;
     } else if (typeof rampMode === 'string' && rampMode.startsWith('extra:')) {
-      const r = extraRangesRef.current[rampMode.slice('extra:'.length)];
-      if (r) { rampLo = r.lo; rampHi = r.hi; }
+      legend = spansRef.current.extra[rampMode.slice('extra:'.length)] ?? null;
+    } else {
+      legend = legendSpan(rampMode, spansRef.current, octree.meta.offset, !!colorTerrainRef.current);
     }
+    const rampLo = legend ? legend.lo : null;
+    const rampHi = legend ? legend.hi : null;
 
     onStatsChange({
       loadedNodes: loadedRef.current.size,
@@ -3283,6 +3888,7 @@ export function NodeStreamer({
       filterTotalPoints: filterTotal,
       rampLo,
       rampHi,
+      deepSelectTruncated: deepTruncRef.current,
     });
   });
 
@@ -3299,6 +3905,12 @@ export function NodeStreamer({
       const t = terrainRef.current;
       return t ? sy - t.shift(sx + offDraw[0], offDraw[1] - sz) : sy;
     };
+    // …and moved with its tree while Tree Review draws trees aside
+    // (treeShift.ts), as the vertex shader does: the drawn x y z land in
+    // DRAWN. Each projection below passes its point's current tree id.
+    const DRAWN = new Float64Array(3);
+    const drawnAt = (sx: number, sy: number, sz: number, id: number): Float64Array =>
+      drawnPosition(DRAWN, sx, sy, sz, id, drawnY(sx, sy, sz), shiftLookupRef.current);
 
     const countAll = (): number => {
       let n = 0;
@@ -3316,10 +3928,7 @@ export function NodeStreamer({
         ln.selection.fill(0);
         for (const i of set) if (i < ln.selection.length) ln.selection[i] = 1;
       }
-      {
-        const su = sharedUniformsRef.current;
-        colorNode(ln, displayRef.current.colorMode, displayRef.current.ramp, { tree: su.activeTreeId, standing: su.activeStandingId, laying: su.activeLayingId }, su.activeTreeRgb, heightSpanRef.current, extraRangesRef.current, su.unlabeledRgb, { x: xSpanRef.current, y: ySpanRef.current }, intensitySpanRef.current ?? undefined);
-      }
+      paintNode(ln, sharedUniformsRef.current, displayRef.current);
       const ca = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
       if (ca) ca.needsUpdate = true;
     };
@@ -3365,9 +3974,9 @@ export function NodeStreamer({
         for (let i = 0; i < arr.length; i++) {
           if (vis[i] === 0) continue;
           const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-          const dy = drawnY(px, py, pz);
+          const d = drawnAt(px, py, pz, ln.treeIds[i]);
           if (!Number.isFinite(px)) continue;
-          v.set(px, dy, pz, 1).applyMatrix4(m);
+          v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
           if (v.w <= 0) continue;
           const iw = 1 / v.w;
           const ndz = v.z * iw;
@@ -3375,7 +3984,7 @@ export function NodeStreamer({
           const sx = (v.x * iw * 0.5 + 0.5) * W;
           const sy = (-v.y * iw * 0.5 + 0.5) * H;
           if (Math.abs(sx - x) > radiusPx || Math.abs(sy - y) > radiusPx) continue;
-          vView.set(px, dy, pz, 1).applyMatrix4(mv);
+          vView.set(d[0], d[1], d[2], 1).applyMatrix4(mv);
           const zLin = -vView.z;
           if (zLin < bestDepth) { bestDepth = zLin; bestId = arr[i]; }
         }
@@ -3387,11 +3996,7 @@ export function NodeStreamer({
     // entry in the session store — loaded or not; patches replay onto
     // unloaded nodes when they stream in. Shared by the public
     // applyToSelection and by the deep-pass late-reapply below.
-    const applyToSelectionImpl = (action: {
-      treeId?: number; semantic?: 0 | 1 | 2 | 3; deleted?: 0 | 1 | 2;
-      standingDeadwood?: number; layingDeadwood?: number;
-    }): number => {
-      const edits: PatchEdit[] = [];
+    const applyToSelectionImpl = (action: PatchAction): number => {
       // Freeze the selection that produced this batch onto the undo
       // entry, so Ctrl+Z after a wrong-button apply (Assign when Reset
       // was meant) hands the hand-picked points back still selected.
@@ -3399,23 +4004,11 @@ export function NodeStreamer({
       for (const [key, set] of selStore) {
         if (set.size === 0) continue;
         snapshot.push([key as PatchNodeKey, [...set]]);
-        const sep = key.indexOf(':');
-        const tile = parseInt(key.slice(0, sep), 10);
-        const record = parseInt(key.slice(sep + 1), 10);
-        for (const idx of set) {
-          edits.push({
-            tile, record, pointIdx: idx,
-            treeId: action.treeId,
-            semantic: action.semantic,
-            deleted: action.deleted,
-            standingDeadwood: action.standingDeadwood,
-            layingDeadwood: action.layingDeadwood,
-          });
-        }
       }
-      if (edits.length === 0) return 0;
-      storeRef.current.applyEdits(edits, snapshot);
-      return edits.length;
+      if (snapshot.length === 0) return 0;
+      // One action over each node's indices — no object per point
+      // (PatchStore.applyAction), one undo step.
+      return storeRef.current.applyAction(snapshot, action, snapshot);
     };
 
     // ---- Deep selection: extend a paint selection to the points that
@@ -3450,6 +4043,9 @@ export function NodeStreamer({
       const v = new THREE.Vector4();
       const fr = new THREE.Frustum().setFromProjectionMatrix(args.m);
       const sceneBox = new THREE.Box3();
+      // Points drawn aside by Tree Review's pull-apart lie up to its
+      // reach beyond their node's box, sideways.
+      const reach = sharedUniformsRef.current.shiftReach;
       // Conservative screen-space overlap of a record's source bbox vs
       // the shape's bbox. A corner behind the near plane makes the
       // projected bbox unreliable — but the old "any corner behind ⇒
@@ -3465,8 +4061,8 @@ export function NodeStreamer({
         let anyBehind = false;
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (let c = 0; c < 8; c++) {
-          const wx = (c & 1) ? b[o + 3] : b[o];
-          const wy = (c & 2) ? b[o + 4] : b[o + 1];
+          const wx = (c & 1) ? b[o + 3] + reach : b[o] - reach;
+          const wy = (c & 2) ? b[o + 4] + reach : b[o + 1] - reach;
           const wz = (c & 4) ? b[o + 5] : b[o + 2];
           v.set(wx - off[0], wz - off[2], -(wy - off[1]), 1).applyMatrix4(args.m);
           if (v.w <= 0) { anyBehind = true; continue; }
@@ -3479,8 +4075,8 @@ export function NodeStreamer({
         if (anyBehind) {
           // Source → scene: sceneX = x−off0, sceneY = z−off2,
           // sceneZ = −(y−off1) (the negation swaps that axis' min/max).
-          sceneBox.min.set(b[o] - off[0], b[o + 2] - off[2], -(b[o + 4] - off[1]));
-          sceneBox.max.set(b[o + 3] - off[0], b[o + 5] - off[2], -(b[o + 1] - off[1]));
+          sceneBox.min.set(b[o] - off[0] - reach, b[o + 2] - off[2], -(b[o + 4] - off[1]) - reach);
+          sceneBox.max.set(b[o + 3] - off[0] + reach, b[o + 5] - off[2], -(b[o + 1] - off[1]) + reach);
           return fr.intersectsBox(sceneBox);
         }
         return !(maxX < args.sb[0] || minX > args.sb[2] || maxY < args.sb[1] || minY > args.sb[3]);
@@ -3503,7 +4099,10 @@ export function NodeStreamer({
         if (!overlaps(rec)) continue;
         if (r.byteSize > 0 && !loadedRef.current.has(rec)) {
           if (candPts + r.numPoints > MAX_DEEP_POINTS || candidates.length >= MAX_DEEP_NODES) {
+            // Stop walking: on a cloud of a million nodes the rest of
+            // the walk alone is a long main-thread stall.
             truncated = true;
+            break;
           } else {
             candidates.push(rec);
             candPts += r.numPoints;
@@ -3522,6 +4121,8 @@ export function NodeStreamer({
       if (truncated) {
         console.warn(`deep selection truncated at ${MAX_DEEP_POINTS.toLocaleString()} unloaded points — zoom in to cover the rest`);
       }
+      // …and the status bar says "partial — zoom in".
+      deepTruncRef.current = truncated;
       if (candidates.length === 0) return;
 
       deepSelPendingRef.current++;
@@ -3560,11 +4161,12 @@ export function NodeStreamer({
             const deleted = new Uint8Array(count);
             const entries = storeRef.current.map.get(key);
             if (entries) {
-              for (const e of entries) {
-                if (e.pointIdx >= count) continue;
-                if (e.treeId >= 0) data.treeIds[e.pointIdx] = e.treeId;
-                if (e.deleted === 1) deleted[e.pointIdx] = 1;
-                else if (e.deleted === 2) deleted[e.pointIdx] = 0;
+              for (let k = 0; k < entries.count; k++) {
+                const pi = entries.pointIdx[k];
+                if (pi >= count) continue;
+                if (entries.treeId[k] >= 0) data.treeIds[pi] = entries.treeId[k];
+                if (entries.deleted[k] === 1) deleted[pi] = 1;
+                else if (entries.deleted[k] === 2) deleted[pi] = 0;
               }
             }
             applyRemapInPlace(data.treeIds, sharedUniformsRef.current.remap);
@@ -3583,8 +4185,8 @@ export function NodeStreamer({
             for (let p = 0; p < count; p++) {
               if (vis[p] === 0) continue;
               const px = pos[p * 3], py = pos[p * 3 + 1], pz = pos[p * 3 + 2];
-              const dy = drawnY(px, py, pz);
-              v2.set(px, dy, pz, 1).applyMatrix4(args.m);
+              const d = drawnAt(px, py, pz, data.treeIds[p]);
+              v2.set(d[0], d[1], d[2], 1).applyMatrix4(args.m);
               if (v2.w <= 0) continue;
               const iw = 1 / v2.w;
               const ndz = v2.z * iw;
@@ -3594,7 +4196,7 @@ export function NodeStreamer({
               if (sx < args.sb[0] || sx > args.sb[2] || sy < args.sb[1] || sy > args.sb[3]) continue;
               if (!args.hitTest(sx, sy)) continue;
               if (args.nearest) {
-                vv.set(px, dy, pz, 1).applyMatrix4(args.mv);
+                vv.set(d[0], d[1], d[2], 1).applyMatrix4(args.mv);
                 const zLin = -vv.z;
                 const bx = Math.max(0, Math.min(args.bw - 1, (sx / args.bin) | 0));
                 const by = Math.max(0, Math.min(args.bh - 1, (sy / args.bin) | 0));
@@ -3669,9 +4271,9 @@ export function NodeStreamer({
             for (let i = 0; i < ln.treeIds.length; i++) {
               if (vis[i] === 0) continue;
               const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-              const dy = drawnY(px, py, pz);
+              const d = drawnAt(px, py, pz, ln.treeIds[i]);
               if (!Number.isFinite(px)) continue;
-              v.set(px, dy, pz, 1).applyMatrix4(m);
+              v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
               if (v.w <= 0) continue;
               const iw = 1 / v.w;
               const ndz = v.z * iw;
@@ -3725,9 +4327,9 @@ export function NodeStreamer({
           for (let i = 0; i < cnt; i++) {
             if (vis[i] === 0) continue;
             const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-            const dy = drawnY(px, py, pz);
+            const d = drawnAt(px, py, pz, nodesArr[ni].treeIds[i]);
             if (!Number.isFinite(px)) continue;
-            v.set(px, dy, pz, 1).applyMatrix4(m);
+            v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
             if (v.w <= 0) continue;
             const iw = 1 / v.w;
             const ndz = v.z * iw;
@@ -3736,7 +4338,7 @@ export function NodeStreamer({
             const sy = (-v.y * iw * 0.5 + 0.5) * H;
             if (sx < sbx1 || sx > sbx2 || sy < sby1 || sy > sby2) continue;
             if (!hitTest(sx, sy)) continue;
-            vView.set(px, dy, pz, 1).applyMatrix4(mv);
+            vView.set(d[0], d[1], d[2], 1).applyMatrix4(mv);
             const zLin = -vView.z;
             const bx = Math.max(0, Math.min(bw - 1, (sx / bin) | 0));
             const by = Math.max(0, Math.min(bh - 1, (sy / bin) | 0));
@@ -3765,9 +4367,9 @@ export function NodeStreamer({
             for (let i = 0; i < cnt; i++) {
               if (vis[i] === 0) continue;
               const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-              const dy = drawnY(px, py, pz);
+              const d = drawnAt(px, py, pz, nodesArr[ni].treeIds[i]);
               if (!Number.isFinite(px)) continue;
-              v.set(px, dy, pz, 1).applyMatrix4(m);
+              v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
               if (v.w <= 0) continue;
               const iw = 1 / v.w;
               const ndz = v.z * iw;
@@ -3776,7 +4378,7 @@ export function NodeStreamer({
               const sy = (-v.y * iw * 0.5 + 0.5) * H;
               if (sx < sbx1 || sx > sbx2 || sy < sby1 || sy > sby2) continue;
               if (!hitTest(sx, sy)) continue;
-              vView.set(px, dy, pz, 1).applyMatrix4(mv);
+              vView.set(d[0], d[1], d[2], 1).applyMatrix4(mv);
               const zLin = -vView.z;
               const bx = Math.max(0, Math.min(bw - 1, (sx / bin) | 0));
               const by = Math.max(0, Math.min(bh - 1, (sy / bin) | 0));
@@ -3825,9 +4427,9 @@ export function NodeStreamer({
           for (let i = 0; i < cnt; i += stride) {
             if (vis[i] === 0) continue;
             const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-            const dy = drawnY(px, py, pz);
+            const d = drawnAt(px, py, pz, ln.treeIds[i]);
             if (!Number.isFinite(px)) continue;
-            v.set(px, dy, pz, 1).applyMatrix4(m);
+            v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
             if (v.w <= 0) continue;
             const iw = 1 / v.w;
             const ndz = v.z * iw;
@@ -3835,7 +4437,7 @@ export function NodeStreamer({
             const sx = (v.x * iw * 0.5 + 0.5) * W;
             const sy = (-v.y * iw * 0.5 + 0.5) * H;
             if (Math.abs(sx - x) > radiusPx || Math.abs(sy - y) > radiusPx) continue;
-            vView.set(px, dy, pz, 1).applyMatrix4(mv);
+            vView.set(d[0], d[1], d[2], 1).applyMatrix4(mv);
             const zLin = -vView.z;
             if (zLin < bestDepth) {
               bestDepth = zLin;
@@ -3846,6 +4448,35 @@ export function NodeStreamer({
           }
         }
         return best;
+      },
+      colorHistogram: (bins = 96) => {
+        const mode = displayRef.current.colorMode;
+        // A tree metric's histogram is over the trees.
+        if (mode === 'tree_metric') {
+          const tc = treeColoursRef.current;
+          if (!tc || !tc.range) return null;
+          const vals = [[...tc.values.values()]];
+          return histogramOf(vals, (a) => a.length, (a, i) => a[i], `tree:${tc.metric}`, bins);
+        }
+        // The other ramps' values over the loaded points, in the units the
+        // legend shows (colorStretch.ts).
+        const off = octree.meta.offset;
+        const hag = mode === 'height' && !!colorTerrainRef.current;
+        const shift = heightSpanRef.current.shift;
+        let value: ((ln: LoadedNode, i: number) => number) | null = null;
+        if (mode === 'height') value = hag && shift
+          ? (ln, i) => ln.positions[i * 3 + 1] - shift(ln.positions[i * 3], ln.positions[i * 3 + 2])
+          : (ln, i) => ln.positions[i * 3 + 1] + off[2];
+        else if (mode === 'x') value = (ln, i) => ln.positions[i * 3] + off[0];
+        else if (mode === 'y') value = (ln, i) => off[1] - ln.positions[i * 3 + 2];
+        else if (mode === 'intensity') value = (ln, i) => ln.intensity[i];
+        else if (mode.startsWith('extra:')) {
+          const name = mode.slice('extra:'.length);
+          value = (ln, i) => { const a = ln.extras[name]; return a ? Number(a[i]) : NaN; };
+        }
+        if (!value) return null;
+        const key = mode === 'height' ? (hag ? 'heightAboveGround' : 'height') : mode;
+        return histogramOf([...loadedRef.current.values()], (ln) => ln.numPoints, value, key, bins);
       },
       pickScenePointAt: (x, y, maxSamples = Infinity) => {
         const W = Math.max(1, size.width);
@@ -3882,9 +4513,9 @@ export function NodeStreamer({
           for (let i = 0; i < cnt; i += stride) {
             if (vis[i] === 0) continue;
             const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
-            const dy = drawnY(px, py, pz);
+            const d = drawnAt(px, py, pz, ln.treeIds[i]);
             if (!Number.isFinite(px)) continue;
-            v.set(px, dy, pz, 1).applyMatrix4(m);
+            v.set(d[0], d[1], d[2], 1).applyMatrix4(m);
             if (v.w <= 0) continue;
             const iw = 1 / v.w;
             const ndz = v.z * iw;
@@ -3892,7 +4523,7 @@ export function NodeStreamer({
             const sx = (v.x * iw * 0.5 + 0.5) * W;
             const sy = (-v.y * iw * 0.5 + 0.5) * H;
             if (Math.abs(sx - x) > radiusPx || Math.abs(sy - y) > radiusPx) continue;
-            vView.set(px, dy, pz, 1).applyMatrix4(mv);
+            vView.set(d[0], d[1], d[2], 1).applyMatrix4(mv);
             const zLin = -vView.z;
             if (zLin < bestDepth) { bestDepth = zLin; best = [px, py, pz]; bestSpacing = ln.spacing; }
           }
@@ -3900,14 +4531,70 @@ export function NodeStreamer({
         lastPickSpacing.current = best ? bestSpacing : null;
         return best;
       },
+      getSelection: () => {
+        const out = new Map<string, number[]>();
+        for (const [key, set] of selStore) if (set.size > 0) out.set(key, Array.from(set));
+        return out;
+      },
+      pointsWorld: (members) => {
+        const byKey = new Map<string, LoadedNode>();
+        for (const ln of loadedRef.current.values()) byKey.set(patchNodeKey(ln.tile, ln.record), ln);
+        const off = octree.meta.offset;
+        let total = 0;
+        for (const m of members) total += m.points.length;
+        const xyz = new Float64Array(total * 3);
+        let k = 0, missing = 0;
+        for (const m of members) {
+          const ln = byKey.get(patchNodeKey(m.tile, m.record));
+          if (!ln) { missing += m.points.length; continue; }
+          const pos = ln.positions;
+          const n = ln.treeIds.length;
+          for (const i of m.points) {
+            if (i >= n) { missing++; continue; }
+            const sx = pos[i * 3], sy = pos[i * 3 + 1], sz = pos[i * 3 + 2];
+            if (!Number.isFinite(sx)) { missing++; continue; }
+            // Scene → world (io/sceneAxes): east, north = −sceneZ, up.
+            xyz[k * 3] = sx + off[0];
+            xyz[k * 3 + 1] = off[1] - sz;
+            xyz[k * 3 + 2] = sy + off[2];
+            k++;
+          }
+        }
+        return { xyz: k === total ? xyz : xyz.slice(0, k * 3), missing };
+      },
+      treePointsWorld: (treeId, semantic) => {
+        const off = octree.meta.offset;
+        let n = 0;
+        for (const ln of loadedRef.current.values()) {
+          const ids = ln.treeIds;
+          for (let i = 0; i < ids.length; i++) if (ids[i] === treeId) n++;
+        }
+        const xyz = new Float64Array(n * 3);
+        let k = 0;
+        for (const ln of loadedRef.current.values()) {
+          const ids = ln.treeIds, pos = ln.positions, sem = ln.semantic;
+          for (let i = 0; i < ids.length; i++) {
+            if (ids[i] !== treeId) continue;
+            if (semantic !== undefined && (!sem || sem[i] !== semantic)) continue;
+            const sx = pos[i * 3], sy = pos[i * 3 + 1], sz = pos[i * 3 + 2];
+            if (!Number.isFinite(sx)) continue;
+            xyz[k * 3] = sx + off[0];
+            xyz[k * 3 + 1] = off[1] - sz;
+            xyz[k * 3 + 2] = sy + off[2];
+            k++;
+          }
+        }
+        return k === n ? xyz : xyz.slice(0, k * 3);
+      },
       maxTreeId: () => {
-        let mx = 0;
+        let mx = cloudMaxTreeIdRef.current;
         for (const [, ln] of loadedRef.current) {
           const t = ln.treeIds;
           for (let i = 0; i < t.length; i++) if (t[i] > mx) mx = t[i];
         }
         for (const entries of storeRef.current.map.values()) {
-          for (const e of entries) if (e.treeId > mx) mx = e.treeId;
+          const t = entries.treeId;
+          for (let i = 0; i < entries.count; i++) if (t[i] > mx) mx = t[i];
         }
         return mx;
       },
@@ -3916,6 +4603,7 @@ export function NodeStreamer({
         // belong to the selection that was just discarded.
         deepSelGenRef.current++;
         deepSelReapplyRef.current = null;
+        deepTruncRef.current = false;
         selStore.clear();
         for (const [, ln] of loadedRef.current) {
           const key = patchNodeKey(ln.tile, ln.record);
@@ -3985,10 +4673,8 @@ export function NodeStreamer({
           for (let i = 0; i < arr.length; i++) if (arr[i] > mx) mx = arr[i];
         }
         for (const entries of storeRef.current.map.values()) {
-          for (const e of entries) {
-            const v = channel === 'standing' ? e.standingDeadwood : e.layingDeadwood;
-            if (v > mx) mx = v;
-          }
+          const arr = channel === 'standing' ? entries.standingDeadwood : entries.layingDeadwood;
+          for (let i = 0; i < entries.count; i++) if (arr[i] > mx) mx = arr[i];
         }
         return mx;
       },
@@ -4137,6 +4823,9 @@ function planAndStream(
   // diameter) and in the shader (point size).
   const projFactor = projFactorFor(camera.fov, size.height);
   shared.uProjFactor.value = projFactor;
+  // A parallel view draws every node at the size it would have at the
+  // orbit target (viewCamera.ts); 0 in a perspective view.
+  const orthoDist = orthoSizingDistance(camera);
 
   const vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   const frustum = new THREE.Frustum().setFromProjectionMatrix(vp);
@@ -4197,14 +4886,15 @@ function planAndStream(
     const r = idx.radius[rec];
     sphere.center.set(sx, sy, sz);
     // Grown by the terrain's relief: a flattened node's points are drawn
-    // up to that far from their stored height (see shared.relief).
-    sphere.radius = r + shared.relief;
+    // up to that far from their stored height (see shared.relief), and by
+    // Tree Review's pull-apart: a moved tree is drawn that far aside.
+    sphere.radius = r + shared.relief + shared.shiftReach;
     // intersectsSphere tests `distance < -radius`, which is FALSE for a
     // NaN centre or radius — a degenerate node is reported inside the
     // frustum rather than culled. pixelDiameter catches it.
     if (!frustum.intersectsSphere(sphere)) return NOT_VISIBLE;
     const dx = sx - camX, dy = sy - camY, dz = sz - camZ;
-    return pixelDiameter(r, Math.sqrt(dx * dx + dy * dy + dz * dz), projFactor);
+    return pixelDiameter(r, orthoDist > 0 ? orthoDist : Math.sqrt(dx * dx + dy * dy + dz * dz), projFactor);
   };
 
   // Hysteresis: nodes that were visible in the PREVIOUS plan get a
@@ -4362,11 +5052,11 @@ function planAndStream(
         idx.centre[rec * 3], idx.centre[rec * 3 + 1], idx.centre[rec * 3 + 2], off,
       );
       sphere.center.set(sx, sy, sz);
-      sphere.radius = idx.radius[rec] + shared.relief;
+      sphere.radius = idx.radius[rec] + shared.relief + shared.shiftReach;
       if (!predFrustum.intersectsSphere(sphere)) return NOT_VISIBLE;
       const ddx = sx - pCamX, ddy = sy - pCamY, ddz = sz - pCamZ;
       return pixelDiameter(
-        idx.radius[rec], Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz), projFactor,
+        idx.radius[rec], orthoDist > 0 ? orthoDist : Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz), projFactor,
       );
     };
     const ph = new MaxHeap();
@@ -4661,6 +5351,7 @@ async function loadNode(
 
     const ln: LoadedNode = {
       geom, level,
+      branchRef: shared.branch,
       treeIds: decoded.treeIds,
       intensity: decoded.intensity,
       classification: decoded.classification,
@@ -4671,6 +5362,9 @@ async function loadNode(
       standingDeadwood, layingDeadwood,
       originalStandingDeadwood, originalLayingDeadwood,
       visibility,
+      strays: 0,
+      shiftSlot: null,
+      baseRadius: geom.boundingSphere.radius,
       dim,
       positions: decoded.positions,
       qPositions, qOrigin, qSize,
@@ -4686,54 +5380,19 @@ async function loadNode(
     // Encode the (post-patch) live positions into the GPU buffer.
     syncQuantizedPositions(ln);
     applyRemapInPlace(ln.treeIds, shared.remap);
-    // Whole-cloud Z range in scene-Y (positions[1] = sourceZ − offset[2]),
-    // so the height ramp runs once bottom-to-top across the entire cloud
-    // instead of per-node — otherwise every tile remapped its own thin Z
-    // slab to the full ramp and the cloud looked banded.
-    // …or, when the streamer has set one, ITS span — the 'height' ramp
-    // over height above ground needs the terrain the streamer holds.
-    const globalHeightSpan: HeightSpan = shared.heightSpan ?? {
-      lo: octree.meta.boundingBox.min[2] - octree.meta.offset[2],
-      hi: octree.meta.boundingBox.max[2] - octree.meta.offset[2],
-    };
-    // Cloud-wide X / Y spans in SCENE coords (sceneZ = −northSource) so
-    // 'x' and 'y' colour modes ramp once edge-to-edge across the whole
-    // dataset instead of remapping each tile's local slab to the full
-    // ramp (the visible-banding bug).
-    const globalAxisSpans = {
-      x: {
-        lo: octree.meta.boundingBox.min[0] - octree.meta.offset[0],
-        hi: octree.meta.boundingBox.max[0] - octree.meta.offset[0],
-      },
-      y: {
-        lo: -(octree.meta.boundingBox.max[1] - octree.meta.offset[1]),
-        hi: -(octree.meta.boundingBox.min[1] - octree.meta.offset[1]),
-      },
-    };
-    // Cloud-wide intensity span (metadata.intensityRange) — absent on
-    // datasets imported before this field existed, or whose intensity had
-    // no usable spread; colorNode falls back to a per-node scan then.
-    const globalIntensitySpan = octree.meta.intensityRange
-      ? { lo: octree.meta.intensityRange[0], hi: octree.meta.intensityRange[1] }
-      : undefined;
-    // Cloud-wide extras min/max from metadata so `extra:<name>` mode maps
-    // every tile through the same value→colour bucket; a user override
-    // from displayRef.current.extraRangeOverrides wins on a per-extra
-    // basis (lets the user squeeze the ramp into a sub-range when
-    // outliers compress the useful band). Cheap object — recomputed per
-    // node load but iterates only the few extras the file carries.
-    const globalExtraRanges: Record<string, { lo: number; hi: number }> = {};
-    for (const e of octree.meta.extras ?? []) {
-      globalExtraRanges[e.name] = { lo: e.min, hi: e.max };
-    }
-    for (const [name, r] of Object.entries(displayRef.current.extraRangeOverrides ?? {})) {
-      if (Number.isFinite(r.lo) && Number.isFinite(r.hi) && r.hi > r.lo) {
-        globalExtraRanges[name] = { lo: r.lo, hi: r.hi };
-      }
-    }
-    colorNode(ln, displayRef.current.colorMode, displayRef.current.ramp, { tree: shared.activeTreeId, standing: shared.activeStandingId, laying: shared.activeLayingId }, shared.activeTreeRgb, globalHeightSpan, globalExtraRanges, shared.unlabeledRgb, globalAxisSpans, globalIntensitySpan);
+    // Masked first, then coloured (the colours paint the isolated tree's
+    // strays). The colours use the streamer's spans (shared.spans, set
+    // as it renders): the whole cloud's, so the height / X / Y ramps run
+    // once edge-to-edge across the dataset instead of re-stretching to
+    // each tile's local slab (the banding bug), or the stretch the user
+    // set; and, for the 'height' ramp over height above ground, the
+    // terrain the streamer holds.
     ln.filterPass = applyFilters(ln, filtersRef.current, octree.meta.offset);
     applyPreviewClip(ln, previewRef.current, octree.meta.offset);
+    paintNode(ln, shared, displayRef.current);
+    // Tree Review's pull-apart, when something is moved: this node's
+    // points of the moved trees are drawn aside too.
+    if (shared.shift) writeShiftSlots(ln, shared);
     (geom.attributes.color as THREE.BufferAttribute).needsUpdate = true;
     (geom.attributes.aVisible as THREE.BufferAttribute).needsUpdate = true;
 
@@ -4787,6 +5446,9 @@ function refreshNodeColors(
    *  the pre-existing per-node behaviour, kept for datasets that haven't
    *  had the range computed yet (see the intensity branch below). */
   intensitySpan?: { lo: number; hi: number },
+  /** The class palette and the tree-metric colours (PaintExtras);
+   *  absent: the ASPRS classes and no tree measured. */
+  paint?: PaintExtras,
 ): void {
   const colorAttr = ln.geom.attributes.color as THREE.BufferAttribute | undefined;
   if (!colorAttr) return;
@@ -4908,10 +5570,36 @@ function refreshNodeColors(
     return;
   }
   if (mode === 'classification') {
+    // The ASPRS colours, and one of its own for each class the dataset's
+    // source file named (classColorIn).
+    const lut = paint?.classLut ?? ASPRS_LUT;
     for (let i = 0; i < count; i++) {
       if (ln.selection && ln.selection[i]) { colors[i * 3] = 230; colors[i * 3 + 1] = 30; colors[i * 3 + 2] = 50; continue; }
-      const [r, g, b] = classColor(ln.classification[i]);
-      colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+      const c = ln.classification[i] * 3;
+      colors[i * 3] = lut[c]; colors[i * 3 + 1] = lut[c + 1]; colors[i * 3 + 2] = lut[c + 2];
+    }
+    return;
+  }
+  if (mode === 'tree_metric') {
+    // Each tree in the colour of what was measured of it (its texel by
+    // tree id, treeMetricColors.ts); a tree not measured a lighter grey
+    // than the unassigned points.
+    const tc = paint?.treeColors ?? null;
+    const tex = tc ? tc.data : null;
+    const n = tc ? tc.count : 0;
+    const nm0 = ur0 + Math.round((255 - ur0) * 0.3);
+    const nm1 = ur1 + Math.round((255 - ur1) * 0.3);
+    const nm2 = ur2 + Math.round((255 - ur2) * 0.3);
+    for (let i = 0; i < count; i++) {
+      if (ln.selection && ln.selection[i]) { colors[i * 3] = 230; colors[i * 3 + 1] = 30; colors[i * 3 + 2] = 50; continue; }
+      const id = ln.treeIds[i];
+      if (id <= 0) { colors[i * 3] = ur0; colors[i * 3 + 1] = ur1; colors[i * 3 + 2] = ur2; continue; }
+      const t = id * 4;
+      if (tex !== null && id < n && tex[t + 3] > 127) {
+        colors[i * 3] = tex[t]; colors[i * 3 + 1] = tex[t + 1]; colors[i * 3 + 2] = tex[t + 2];
+      } else {
+        colors[i * 3] = nm0; colors[i * 3 + 1] = nm1; colors[i * 3 + 2] = nm2;
+      }
     }
     return;
   }
@@ -4925,15 +5613,17 @@ function refreshNodeColors(
     return;
   }
   if (mode === 'semantic') {
-    // 1 = stem (warm brown), 2 = branch (green), 0 = unlabelled (the
-    // user-pickable unlabeledColor). Matches the Stem / Branch toolbar
-    // buttons so the user sees what they're labelling.
+    // 1 = stem (warm brown), 2 = branch wood (tan), 4 = leaf (green),
+    // 0 = unlabelled (the user-pickable unlabeledColor). Matches the
+    // Stem / Branch / Leaf toolbar buttons so the user sees what they're
+    // labelling.
     const sem = ln.semantic;
     for (let i = 0; i < count; i++) {
       if (ln.selection && ln.selection[i]) { colors[i * 3] = 230; colors[i * 3 + 1] = 30; colors[i * 3 + 2] = 50; continue; }
       const s = sem ? sem[i] : 0;
       if (s === 1)       { colors[i * 3] = 175; colors[i * 3 + 1] = 110; colors[i * 3 + 2] = 60;  }
-      else if (s === 2)  { colors[i * 3] = 70;  colors[i * 3 + 1] = 180; colors[i * 3 + 2] = 90;  }
+      else if (s === 2)  { colors[i * 3] = 225; colors[i * 3 + 1] = 165; colors[i * 3 + 2] = 95;  }
+      else if (s === 4)  { colors[i * 3] = 70;  colors[i * 3 + 1] = 180; colors[i * 3 + 2] = 90;  }
       else               { colors[i * 3] = ur0; colors[i * 3 + 1] = ur1; colors[i * 3 + 2] = ur2; }
     }
     return;
@@ -4964,14 +5654,17 @@ function refreshNodeColors(
     }
     return;
   }
-  // 'x' / 'y' ramp over the axis (scene coords). sceneX = positions[0]
-  // (east), sceneZ = positions[2] (−north — the editor's right-handed
-  // remap). Use the cloud-wide span when the caller supplied it so the
-  // ramp paints the whole dataset edge-to-edge in ONE pass instead of
-  // re-stretching to each tile's local slab (which produced visible
-  // banding intervals per tile — the original bug report).
+  // 'x' / 'y' ramp over the axis. 'x' reads sceneX = positions[0]
+  // (easting − offset); 'y' reads −sceneZ = −positions[2] (northing −
+  // offset — the editor's right-handed remap negates north), so the ramp
+  // runs south to north and the legend reads northings. Use the
+  // cloud-wide span when the caller supplied it so the ramp paints the
+  // whole dataset edge-to-edge in ONE pass instead of re-stretching to
+  // each tile's local slab (which produced visible banding intervals per
+  // tile — the original bug report).
   if (mode === 'x' || mode === 'y') {
     const axis = mode === 'x' ? 0 : 2;
+    const sign = mode === 'x' ? 1 : -1;
     const global = mode === 'x' ? axisSpans?.x : axisSpans?.y;
     let aLo: number, aHi: number;
     if (global && Number.isFinite(global.lo) && Number.isFinite(global.hi) && global.hi > global.lo) {
@@ -4979,7 +5672,7 @@ function refreshNodeColors(
     } else {
       aLo = Infinity; aHi = -Infinity;
       for (let i = 0; i < count; i++) {
-        const v = positions[i * 3 + axis];
+        const v = sign * positions[i * 3 + axis];
         if (!Number.isFinite(v)) continue;
         if (v < aLo) aLo = v; if (v > aHi) aHi = v;
       }
@@ -4988,7 +5681,7 @@ function refreshNodeColors(
     const aSpan = Math.max(aHi - aLo, 1e-6);
     for (let i = 0; i < count; i++) {
       if (ln.selection && ln.selection[i]) { colors[i * 3] = 230; colors[i * 3 + 1] = 30; colors[i * 3 + 2] = 50; continue; }
-      const v = positions[i * 3 + axis];
+      const v = sign * positions[i * 3 + axis];
       const t = Number.isFinite(v) ? (v - aLo) / aSpan : 0;
       rampColor(ramp, t, rgb);
       colors[i * 3] = rgb[0]; colors[i * 3 + 1] = rgb[1]; colors[i * 3 + 2] = rgb[2];
@@ -5016,7 +5709,159 @@ function refreshNodeColors(
  *  stay pure. The active id per channel is plumbed through
  *  `activeIds`. This is the single entry point all callers use so a
  *  freshly-streamed node and a recolour-on-change behave identically. */
-function colorNode(
+// ---- Branches (Branches panel) ----------------------------------------
+
+/** Paint the points of every marked branch in the branch's colour, the
+ *  active branch brighter. Selection red still wins. The marks reach the
+ *  node through its streamer's shared state (`ln.branchRef`), so only the
+ *  editor's own view paints them — not a compare or figure view of some
+ *  other dataset whose node addresses happen to coincide. */
+function paintBranches(ln: LoadedNode): void {
+  const bm = ln.branchRef?.current ?? null;
+  if (!bm || !bm.paint) return;
+  const inner = bm.marks.get(patchNodeKey(ln.tile, ln.record));
+  if (!inner || inner.size === 0) return;
+  const colorAttr = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
+  if (!colorAttr) return;
+  const colors = colorAttr.array as Uint8Array;
+  const sel = ln.selection;
+  const n = ln.treeIds.length;
+  for (const [i, id] of inner) {
+    if (i >= n) continue;
+    if (sel && sel[i]) continue;
+    const c = bm.colors.get(id);
+    if (!c) continue;
+    if (id === bm.activeId) {
+      colors[i * 3] = Math.min(255, c[0] + ((255 - c[0]) >> 1));
+      colors[i * 3 + 1] = Math.min(255, c[1] + ((255 - c[1]) >> 1));
+      colors[i * 3 + 2] = Math.min(255, c[2] + ((255 - c[2]) >> 1));
+    } else {
+      colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+    }
+    if (ln.dim) ln.dim[i] = 0;
+  }
+}
+
+/** Colour a node with everything its streamer's shared state holds —
+ *  the spans, the active ids and colours, the paint extras. The entry
+ *  point every caller uses, so a freshly-streamed node and a recolour on
+ *  change behave identically. */
+function paintNode(ln: LoadedNode, shared: SharedShaderUniforms, display: DisplayConfig): void {
+  const s = shared.spans;
+  colorNode(
+    ln, display.colorMode, display.ramp,
+    { tree: shared.activeTreeId, standing: shared.activeStandingId, laying: shared.activeLayingId },
+    shared.activeTreeRgb, s?.height, s?.extra, shared.unlabeledRgb,
+    s ? { x: s.x, y: s.y } : undefined, s?.intensity ?? undefined, shared.paint,
+  );
+}
+
+/** The return strength over the colour: weak returns darker, strong ones
+ *  brighter, so stems, branches and surfaces read where the colour alone
+ *  is flat. Selected points keep their red. */
+function shadeByIntensity(ln: LoadedNode, shade: { strength: number; lo: number; inv: number }): void {
+  const colorAttr = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
+  if (!colorAttr) return;
+  const colors = colorAttr.array as Uint8Array;
+  const inten = ln.intensity;
+  const sel = ln.selection;
+  const k = shade.strength;
+  const n = ln.treeIds.length;
+  for (let i = 0; i < n; i++) {
+    if (sel && sel[i]) continue;
+    let t = (inten[i] - shade.lo) * shade.inv;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const f = 1 + k * (0.35 + 1.3 * t - 1);
+    const o = i * 3;
+    colors[o] = Math.min(255, Math.round(colors[o] * f));
+    colors[o + 1] = Math.min(255, Math.round(colors[o + 1] * f));
+    colors[o + 2] = Math.min(255, Math.round(colors[o + 2] * f));
+  }
+}
+
+/** The isolated tree's points beyond the margin ring (visibility 2, see
+ *  applyFilters) in bright yellow — a few points ten metres off are
+ *  otherwise a pixel or two. The selection's red still wins. */
+function paintStrays(ln: LoadedNode): void {
+  if (!(ln.strays > 0)) return;
+  const colorAttr = ln.geom?.attributes.color as THREE.BufferAttribute | undefined;
+  if (!colorAttr) return;
+  const colors = colorAttr.array as Uint8Array;
+  const vis = ln.visibility;
+  const sel = ln.selection;
+  for (let i = 0; i < vis.length; i++) {
+    if (vis[i] !== 2 || (sel && sel[i])) continue;
+    colors[i * 3] = STRAY_RGB[0]; colors[i * 3 + 1] = STRAY_RGB[1]; colors[i * 3 + 2] = STRAY_RGB[2];
+    if (ln.dim) ln.dim[i] = 0;
+  }
+}
+
+/** A direct-indexed slot table for the moved tree ids while they are
+ *  small (tree ids this app writes are 1..T); null past a megabyte's
+ *  worth, when the map answers instead (an imported id is any i32). */
+function slotTable(slotOf: Map<number, number>): Uint16Array | null {
+  let hi = 0;
+  for (const id of slotOf.keys()) if (id > hi) hi = id;
+  if (hi >= 1 << 20) return null;
+  const t = new Uint16Array(hi + 1);
+  for (const [id, k] of slotOf) if (id > 0) t[id] = k;
+  return t;
+}
+
+/** Write a node's pull-apart slots (LoadedNode.shiftSlot) from its
+ *  current tree ids, and whether its shader reads them. A node with no
+ *  moved tree's point reads nothing and gets no attribute. */
+function writeShiftSlots(ln: LoadedNode, shared: SharedShaderUniforms): void {
+  const on = ln.material.uniforms.uShiftOn as { value: number } | undefined;
+  if (!on) return;
+  const s = shared.shift;
+  if (!s) {
+    on.value = 0;
+    fitShiftSphere(ln, shared);
+    return;
+  }
+  const ids = ln.treeIds;
+  const n = ids.length;
+  const table = s.table;
+  const slotOf = s.slotOf;
+  let slots = ln.shiftSlot;
+  let any = false;
+  for (let i = 0; i < n; i++) {
+    const id = ids[i];
+    const k = id <= 0 ? 0 : table !== null ? (id < table.length ? table[id] : 0) : (slotOf.get(id) ?? 0);
+    if (k !== 0) {
+      if (!slots) slots = new Uint16Array(n);
+      slots[i] = k;
+      any = true;
+    } else if (slots) {
+      slots[i] = 0;
+    }
+  }
+  if (slots && !ln.shiftSlot) {
+    ln.shiftSlot = slots;
+    const attr = new THREE.BufferAttribute(slots, 1);
+    attr.setUsage(THREE.DynamicDrawUsage);
+    ln.geom.setAttribute('aShift', attr);
+  } else if (slots) {
+    (ln.geom.attributes.aShift as THREE.BufferAttribute).needsUpdate = true;
+  }
+  on.value = any ? 1 : 0;
+  fitShiftSphere(ln, shared);
+}
+
+/** A node's culling sphere: its own, grown by the pull-apart's reach
+ *  while it holds a moved tree's points (they are drawn that far aside). */
+function fitShiftSphere(ln: LoadedNode, shared: SharedShaderUniforms): void {
+  const bs = ln.geom?.boundingSphere;
+  if (!bs) return;
+  const on = (ln.material.uniforms.uShiftOn as { value: number } | undefined)?.value === 1;
+  bs.radius = ln.baseRadius + (on ? shared.shiftReach : 0);
+}
+
+/** Colour a node for `mode`, then overlay the intensity shading, the
+ *  active-id highlight, the branches and the isolated tree's strays.
+ *  Callers in the viewer go through paintNode; exported for the tests. */
+export function colorNode(
   ln: LoadedNode, mode: ColorMode, ramp: ColorRamp,
   activeIds: { tree: number; standing: number; laying: number },
   activeRgb: [number, number, number],
@@ -5027,9 +5872,15 @@ function colorNode(
   /** Cloud-wide intensity span (metadata.intensityRange) — see
    *  refreshNodeColors for how it's used. */
   intensitySpan?: { lo: number; hi: number },
+  /** The class palette, the tree-metric colours and the intensity
+   *  shading (PaintExtras); absent: none of them. */
+  paint?: PaintExtras,
 ): void {
-  refreshNodeColors(ln, mode, ramp, heightSpan, extraRanges, unlabeledRgb, axisSpans, intensitySpan);
-  if (mode === 'tree_id' && activeIds.tree > 0) {
+  refreshNodeColors(ln, mode, ramp, heightSpan, extraRanges, unlabeledRgb, axisSpans, intensitySpan, paint);
+  // Shading by intensity over the mode's colours (not over the
+  // selection, the highlight, the branches or the strays painted next).
+  if (paint?.shade && mode !== 'intensity') shadeByIntensity(ln, paint.shade);
+  if ((mode === 'tree_id' || mode === 'tree_metric') && activeIds.tree > 0) {
     applyActiveHighlight(ln, ln.treeIds, activeIds.tree, activeRgb);
   } else if (mode === 'standing_deadwood' && activeIds.standing > 0 && ln.standingDeadwood) {
     applyActiveHighlight(ln, ln.standingDeadwood, activeIds.standing, activeRgb);
@@ -5043,7 +5894,7 @@ function colorNode(
   // isolate, so the flag write is unconditional and cheap.
   if (ln.dim) {
     const dim = ln.dim;
-    if (mode === 'tree_id') {
+    if (mode === 'tree_id' || mode === 'tree_metric') {
       const ids = ln.treeIds;
       const sel = ln.selection;
       for (let i = 0; i < dim.length; i++) {
@@ -5052,6 +5903,14 @@ function colorNode(
     } else {
       dim.fill(0);
     }
+  }
+  // Branches over everything but the selection; their points never fade
+  // into the depth-cued background.
+  paintBranches(ln);
+  // The isolated tree's strays over everything but the selection, never
+  // faded either.
+  paintStrays(ln);
+  if (ln.dim) {
     const da = ln.geom?.attributes.aDim as THREE.BufferAttribute | undefined;
     if (da) da.needsUpdate = true;
   }
@@ -5070,7 +5929,7 @@ function colorNode(
  *
  *  Returns how many of this node's points passed, so callers can tally a
  *  live match count (Filters panel) without a second per-point pass. */
-function applyFilters(ln: LoadedNode, f: FilterConfig, offset: [number, number, number]): number {
+export function applyFilters(ln: LoadedNode, f: FilterConfig, offset: [number, number, number]): number {
   const v = ln.visibility;
   const ids = ln.treeIds;
   const cls = ln.classification;
@@ -5252,6 +6111,12 @@ function applyFilters(ln: LoadedNode, f: FilterConfig, offset: [number, number, 
   // Raw stored-intensity range. ln.intensity is always allocated on a real
   // node but — like the columns above — absent on the pseudo node, so it
   // gets the same existence guard rather than being assumed present.
+  // Branch filter (Branches panel). The pseudo node of the deep-selection
+  // pass has no tile/record, finds no marks, and so — like an unloaded
+  // point should — passes only under 'all' or 'hideMarked'.
+  const bmAll = ln.branchRef?.current ?? null;
+  const bm = bmAll && bmAll.filter !== 'all' ? bmAll : null;
+  const bInner = bm ? bm.marks.get(patchNodeKey(ln.tile, ln.record)) : undefined;
   const intensityArr = ln.intensity;
   const ir = f.intensityRange;
   const irLo = ir ? ir[0] : 0;
@@ -5260,6 +6125,11 @@ function applyFilters(ln: LoadedNode, f: FilterConfig, offset: [number, number, 
   // effect tallies this across every loaded node for the Filters panel's
   // live match-count readout.
   let passCount = 0;
+  // The isolated tree's strays: its points beyond the margin ring,
+  // horizontally (a height band never makes the crown a stray), drawn
+  // large and bright — visibility 2 (FilterConfig.isolateHighlightStrays).
+  const strayBox = ibox !== null && f.isolateHighlightStrays !== false ? ibox : null;
+  let strayCount = 0;
   for (let i = 0; i < n; i++) {
     // Deleted points are always hidden. This used to ride implicitly on
     // their NaN positions (NaN never rasterises), but the GPU now draws
@@ -5379,9 +6249,27 @@ function applyFilters(ln: LoadedNode, f: FilterConfig, offset: [number, number, 
         if (Number.isFinite(binDepth) && range > binDepth + vpTol) pass = false;
       }
     }
-    v[i] = pass ? 1 : 0;
-    if (pass) passCount++;
+    if (pass && bm) {
+      const id = bInner ? bInner.get(i) : undefined;
+      if (bm.filter === 'onlyActive') {
+        if (id === undefined || id !== bm.activeId) pass = false;
+      } else if (id !== undefined && id !== bm.activeId) {
+        pass = false;
+      }
+    }
+    if (!pass) { v[i] = 0; continue; }
+    passCount++;
+    if (strayBox !== null && id === isolate) {
+      const sx = pos[i * 3], sz = pos[i * 3 + 2];
+      if (sx < strayBox.x0 || sx > strayBox.x1 || sz < strayBox.z0 || sz > strayBox.z1) {
+        v[i] = 2;
+        strayCount++;
+        continue;
+      }
+    }
+    v[i] = 1;
   }
+  ln.strays = strayCount;
   return passCount;
 }
 

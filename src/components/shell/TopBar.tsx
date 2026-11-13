@@ -4,6 +4,7 @@
 // so the title always matches what's in the viewport.
 
 import { useOctreeShell } from './OctreeShellContext';
+import { formatChord } from '../../state/keybindings';
 
 interface Props {
   projectName: string | null;
@@ -99,7 +100,7 @@ export default function TopBar({ projectName, onCloseOctree, busy }: Props) {
       >
         <SearchIcon />
         <span>Search…</span>
-        <span className="kbd" style={{ marginLeft: 6 }}>⌘K</span>
+        <span className="kbd" style={{ marginLeft: 6 }}>{formatChord('mod+k')}</span>
       </button>
 
       {onCloseOctree && octree && (

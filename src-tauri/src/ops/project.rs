@@ -25,7 +25,7 @@ use serde_json::Value;
 use super::{non_empty, OpContext, OpDef};
 use crate::commands::octree::{
     octree_dataset_fingerprint, octree_list, octree_realign_to_source, octree_remove_dataset, octree_set_crs,
-    run_convert, run_filter_outliers, run_import_pointfile, run_voxel_downsample, CleanResult, OctreeImportResult,
+    run_convert, run_filter_outliers, run_import_pointfile, run_voxel_downsample_with, CleanResult, OctreeImportResult,
     OctreeListEntry, RealignResult, HARD_MAX_DEPTH,
 };
 use crate::commands::pointfile::{probe, PointFileKind, PointFileMapping, PointFileProbe};
@@ -33,6 +33,7 @@ use crate::commands::project::{
     close_project, create_project, current_project, open_project, recent_projects, CreateOptions, ProjectState,
     RecentProject,
 };
+use crate::commands::project_rename::{rename_project, RenameOutcome};
 use crate::state::CoordinateSystem;
 
 fn f_zero() -> f64 { 0.0 }
@@ -124,7 +125,7 @@ pub struct ProjectOpen {
 
 fn project_open(ctx: &OpContext, p: ProjectOpen) -> Result<ProjectState, String> {
     non_empty(&p.folder, "folder")?;
-    open_project(&ctx.state, Path::new(&p.folder)).map_err(|e| e.to_string())
+    open_project(&ctx.state, &crate::fsgrant::os_path(&p.folder)).map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -143,6 +144,22 @@ fn project_close(ctx: &OpContext, _p: NoParams) -> Result<bool, String> {
 
 fn project_recent(_ctx: &OpContext, _p: NoParams) -> Result<Vec<RecentProject>, String> {
     Ok(recent_projects())
+}
+
+// Rename Project… (commands/project_rename.rs)
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectRename {
+    /// The project folder. Defaults to the open project.
+    #[serde(default)]
+    pub project_folder: Option<String>,
+    /// The new name, which is the folder's new name too (beside where it is).
+    pub name: String,
+}
+
+fn project_rename(ctx: &OpContext, p: ProjectRename) -> Result<RenameOutcome, String> {
+    let folder = project_folder(ctx, &p.project_folder)?;
+    rename_project(&ctx.state, &crate::fsgrant::os_path(&folder), &p.name).map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -191,7 +208,7 @@ fn dataset_info(_ctx: &OpContext, p: DatasetParams) -> Result<DatasetInfo, Strin
     let size = |name: &str| std::fs::metadata(dir.join(name)).map(|m| m.len()).ok();
     let mut sidecars = std::collections::BTreeMap::new();
     for name in [
-        "patches.bin", "treemap.json", "review.json", "species.json", "plot.json", "stems.json", "qsm.json",
+        "patches.bin", "treemap.json", "review.json", "species.json", "plot.json", "branches.json", "stems.json", "qsm.json",
         "skeletons.bin", "qsm_cylinders.csv", "skeleton_alignment.json", "terrain.bin", "compare_views.json",
     ] {
         if let Some(n) = size(name) {
@@ -460,6 +477,9 @@ pub struct DownsampleParams {
     pub scanner_type: String,
     /// One point kept per voxel of this size, metres.
     pub voxel_size: f64,
+    /// Which point a voxel keeps: "first" (the default) or "centroid" (the one nearest the voxel's centroid).
+    #[serde(default)]
+    pub keep: Option<String>,
 }
 
 fn dataset_downsample(ctx: &OpContext, p: DownsampleParams) -> Result<CleanResult, String> {
@@ -469,7 +489,12 @@ fn dataset_downsample(ctx: &OpContext, p: DownsampleParams) -> Result<CleanResul
         return Err("voxelSize must be a positive number of metres".into());
     }
     let out_dir = derived_out_dir(&p.src_dir, &p.name, &p.out_dir)?;
-    run_voxel_downsample(&ctx.progress, &p.src_dir, &out_dir, &p.name, &p.scanner_type, p.voxel_size)
+    let centroid = match p.keep.as_deref() {
+        None | Some("first") => false,
+        Some("centroid") => true,
+        Some(k) => return Err(format!("keep must be \"first\" or \"centroid\", not {k:?}")),
+    };
+    run_voxel_downsample_with(&ctx.progress, &p.src_dir, &out_dir, &p.name, &p.scanner_type, p.voxel_size, centroid)
 }
 
 pub(super) fn ops() -> Vec<OpDef> {
@@ -484,6 +509,8 @@ pub(super) fn ops() -> Vec<OpDef> {
             "Close the open project.", NoParams, project_close),
         op!("project.recent", Project, mutates: false, stage: None,
             "Recently opened projects, newest first, each checked for still existing.", NoParams, project_recent),
+        op!("project.rename", Project, mutates: true, stage: None,
+            "Rename a project: its folder (beside where it is) and its name together, with the paths stored inside it moved along.", ProjectRename, project_rename),
         op!("project.datasets", Project, mutates: false, stage: None,
             "The datasets under a project's octrees/ folder.", ProjectFolderParams, project_datasets),
         op!("dataset.probe", Dataset, mutates: false, stage: None,

@@ -14,6 +14,11 @@ use crate::state::{
 pub struct ProjectState {
     pub folder: String,
     pub meta: ProjectMeta,
+    /// Set when the project was opened from a folder other than
+    /// the one it was last opened from (renamed, moved or copied), so the
+    /// renderer moves its per-project storage keys too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocated: Option<crate::commands::project_rename::Relocation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +57,8 @@ pub struct RecentProject {
 const RECENT_PROJECTS_FILE: &str = "recentProjects.json";
 const RECENT_MAX: usize = 12;
 
-fn read_meta(folder: &std::path::Path) -> AppResult<ProjectMeta> {
+// These helpers are pub(crate) for commands/project_rename.rs
+pub(crate) fn read_meta(folder: &std::path::Path) -> AppResult<ProjectMeta> {
     let raw = fs::read_to_string(folder.join(PROJECT_FILE))
         .map_err(|e| AppError::msg(format!("read project.json: {e}")))?;
     let meta: ProjectMeta = serde_json::from_str(&raw)
@@ -67,7 +73,7 @@ fn read_meta(folder: &std::path::Path) -> AppResult<ProjectMeta> {
 /// does not damage one dataset, it makes the entire project unopenable. The
 /// window is small because the file is tiny, but the blast radius is not, and
 /// the tmp+rename pattern is already used everywhere else in this codebase.
-fn write_meta(folder: &std::path::Path, meta: &ProjectMeta) -> AppResult<()> {
+pub(crate) fn write_meta(folder: &std::path::Path, meta: &ProjectMeta) -> AppResult<()> {
     let s = serde_json::to_string_pretty(meta)?;
     let path = folder.join(PROJECT_FILE);
     let tmp = folder.join(format!("{PROJECT_FILE}.tmp"));
@@ -80,7 +86,7 @@ fn is_project_folder(folder: &std::path::Path) -> bool {
     folder.join(PROJECT_FILE).is_file()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -100,6 +106,7 @@ fn payload(proj: &OpenProject) -> ProjectState {
     ProjectState {
         folder: proj.folder.to_string_lossy().to_string(),
         meta: proj.meta.clone(),
+        relocated: proj.relocated.clone(),
     }
 }
 
@@ -114,7 +121,7 @@ fn recent_projects_path() -> AppResult<PathBuf> {
     Ok(dir.join(RECENT_PROJECTS_FILE))
 }
 
-fn load_recent() -> Vec<String> {
+pub(crate) fn load_recent() -> Vec<String> {
     let Ok(p) = recent_projects_path() else {
         return Vec::new();
     };
@@ -129,7 +136,7 @@ fn load_recent() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn save_recent(list: &[String]) {
+pub(crate) fn save_recent(list: &[String]) {
     if let Ok(p) = recent_projects_path() {
         if let Ok(text) = serde_json::to_string(list) {
             let _ = fs::write(p, text);
@@ -153,7 +160,7 @@ fn add_recent(folder: &str) {
 /// Tell the renderer and the native menu that the open project changed.
 /// GUI only: the headless surfaces have no window to tell and no menu.
 #[cfg(feature = "gui")]
-fn emit_changed(app: &AppHandle, state: &AppState) {
+pub(crate) fn emit_changed(app: &AppHandle, state: &AppState) {
     use tauri::Emitter;
     let payload_value = current_project(state);
     let _ = app.emit("project:changed", payload_value);
@@ -182,7 +189,7 @@ pub fn create_project(state: &AppState, opts: CreateOptions) -> AppResult<Projec
     if opts.name.is_empty() {
         return Err(AppError::msg("name is required"));
     }
-    let folder = PathBuf::from(&opts.folder);
+    let folder = crate::fsgrant::os_path(&opts.folder);
     if folder.join(PROJECT_FILE).exists() {
         return Err(AppError::msg(format!(
             "A project already exists in {}",
@@ -204,6 +211,7 @@ pub fn create_project(state: &AppState, opts: CreateOptions) -> AppResult<Projec
         }),
         default_cloud_format: opts.default_cloud_format.unwrap_or_else(|| "txt".into()),
         notes: opts.notes.unwrap_or_default(),
+        last_folder: Some(folder.to_string_lossy().into_owned()),
     };
     write_meta(&folder, &meta)?;
     // Initialise DB.
@@ -231,16 +239,24 @@ pub fn open_project(state: &AppState, folder: &std::path::Path) -> AppResult<Pro
         }
     }
     ensure_clouds_dir(folder)?;
-    let meta = read_meta(folder)?;
+    let mut meta = read_meta(folder)?;
+    // A folder renamed, moved or copied outside the application
+    // gets its name from the folder and its stored paths moved with it.
+    let relocated = crate::commands::project_rename::adopt_folder(folder, &mut meta);
     let db = open_db(folder)?;
     let proj = OpenProject {
         folder: folder.to_path_buf(),
         meta,
         db,
+        relocated,
     };
     let snapshot = payload(&proj);
     *state.current.lock() = Some(proj);
 
+    // The entry it was listed under before a move is stale
+    if let Some(r) = snapshot.relocated.as_ref().filter(|r| !r.kept) {
+        crate::commands::project_rename::forget_recent(&r.from);
+    }
     add_recent(&snapshot.folder);
     Ok(snapshot)
 }
@@ -283,15 +299,33 @@ pub fn save_meta(state: &AppState, patch: MetaPatch) -> AppResult<ProjectMeta> {
 /// The recent projects, newest first, each checked for still being
 /// there. Used by the Recent submenu, the landing view and the console.
 pub fn recent_projects() -> Vec<RecentProject> {
-    load_recent()
-        .into_iter()
-        .take(RECENT_MAX)
+    // A project renamed in place outside the application is
+    // found again beside where it was, and listed under its new folder
+    // and name (commands/project_rename.rs).
+    let stored = load_recent();
+    let mut list: Vec<String> = Vec::with_capacity(stored.len());
+    for folder in stored.iter().take(RECENT_MAX) {
+        let path = PathBuf::from(folder);
+        let found = if path.join(PROJECT_FILE).is_file() {
+            None
+        } else {
+            crate::commands::project_rename::find_renamed(&path)
+        };
+        let now = found.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| folder.clone());
+        if !list.iter().any(|f| crate::commands::project_rename::same_folder(f, &now)) {
+            list.push(now);
+        }
+    }
+    if list != stored.iter().take(RECENT_MAX).cloned().collect::<Vec<_>>() && !cfg!(test) {
+        save_recent(&list);
+    }
+    list.into_iter()
         .map(|folder| {
             let path = PathBuf::from(&folder);
             match read_meta(&path) {
                 Ok(meta) => RecentProject {
+                    name: crate::commands::project_rename::shown_name(&meta, &path),
                     folder,
-                    name: meta.name,
                     updated_at: meta.updated_at,
                     exists: true,
                 },
@@ -347,7 +381,7 @@ pub fn project_open(
     state: State<'_, AppState>,
     folder: String,
 ) -> AppResult<ProjectState> {
-    let snapshot = open_project(&state, &PathBuf::from(folder))?;
+    let snapshot = open_project(&state, &crate::fsgrant::os_path(&folder))?;
     emit_changed(&app, &state);
     Ok(snapshot)
 }

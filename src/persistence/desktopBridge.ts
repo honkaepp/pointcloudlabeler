@@ -12,6 +12,7 @@ import type { TreeSummaryEntry, TerrainResult, TreeMetric, StemFit, QsmResult, D
 import { withDatasetBusy } from '../state/datasetBusy';
 import { decodeSkeletonPlanar } from './skeletonPlanar';
 import type { RendererFailure } from './rendererFailure';
+import { blocksWrite, dirKey, COMPARE_EVENT, READ_ONLY_MESSAGE, type CompareMessage, type OutgoingCompareMessage } from '../state/compareWindow';
 
 type ProjectChangedHandler = (action: string, payload?: unknown) => void;
 
@@ -28,6 +29,10 @@ interface BridgeCtx {
   invoke: <T = unknown>(cmd: string, args?: InvokeArgs, options?: { headers: HeadersInit }) => Promise<T>;
   listen: <T = unknown>(event: string, cb: (e: { payload: T }) => void) => Promise<() => void>;
   getCurrentWebview: () => { onDragDropEvent: (cb: (e: { payload: DragDropPayload }) => void) => Promise<() => void> };
+  /** A broadcast to every window, and this window's label —
+   *  the second window (commands/compare_window.rs). */
+  emit: (event: string, payload?: unknown) => Promise<void>;
+  label: string;
 }
 
 type DragDropPayload =
@@ -54,10 +59,14 @@ async function loadTauri(): Promise<BridgeCtx | null> {
     const core = await import(/* @vite-ignore */ '@tauri-apps/api/core');
     const event = await import(/* @vite-ignore */ '@tauri-apps/api/event');
     const webview = await import(/* @vite-ignore */ '@tauri-apps/api/webview');
+    let label = 'main';
+    try { label = webview.getCurrentWebview().label; } catch { /* older API: the one window */ }
     return {
       invoke: core.invoke as BridgeCtx['invoke'],
       listen: event.listen as BridgeCtx['listen'],
       getCurrentWebview: webview.getCurrentWebview as BridgeCtx['getCurrentWebview'],
+      emit: event.emit as BridgeCtx['emit'],
+      label,
     };
   } catch (e) {
     console.warn('Tauri API not available', e);
@@ -86,8 +95,35 @@ interface SkeletonAlignmentRecord {
   targetShifted?: [number, number];
 }
 
-function installShim(ctx: BridgeCtx) {
+/** A for-one-window event's target, when it names one. */
+function windowOf(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const w = (payload as { window?: unknown }).window;
+  return typeof w === 'string' ? w : undefined;
+}
+
+function headersOf(options?: { headers: HeadersInit }): Record<string, string> | undefined {
+  const h = options?.headers;
+  if (!h || typeof h !== 'object' || Array.isArray(h) || h instanceof Headers) return undefined;
+  return h as Record<string, string>;
+}
+
+function installShim(rawCtx: BridgeCtx) {
   const menuHandlers = new Set<ProjectChangedHandler>();
+
+  // With a second window open, a dataset open in both is
+  // read-only in the one that opened it second (state/compareWindow.ts).
+  // The commands that would write into it are refused here, whatever
+  // panel asks — one place rather than a guard in each.
+  const readOnlyKeys = new Set<string>();
+  const ctx: BridgeCtx = {
+    ...rawCtx,
+    invoke: ((cmd: string, args?: InvokeArgs, options?: { headers: HeadersInit }) => (
+      blocksWrite(cmd, args, headersOf(options), readOnlyKeys)
+        ? Promise.reject(new Error(READ_ONLY_MESSAGE))
+        : rawCtx.invoke(cmd, args, options)
+    )) as BridgeCtx['invoke'],
+  };
 
   // Every native-menu click arrives as ONE event, `menu`, whose payload
   // names the item (`action`) and, for a recent project, its folder
@@ -97,6 +133,10 @@ function installShim(ctx: BridgeCtx) {
   // this used to hold had to be kept in step with menu.rs by hand, and
   // every item it was missing did nothing when clicked.
   ctx.listen<{ action: string; folder?: string }>('menu', (e) => {
+    // A click on the other window's menu bar is that window's
+    // (menu.rs names the focused window).
+    const w = windowOf(e.payload);
+    if (w !== undefined && w !== ctx.label) return;
     for (const cb of menuHandlers) cb(`menu:${e.payload.action}`, e.payload.folder);
   }).catch(() => { /* ignore */ });
   // …and the backend's own announcement that the open project changed.
@@ -105,14 +145,15 @@ function installShim(ctx: BridgeCtx) {
   }).catch(() => { /* ignore */ });
 
   // Native file drag-drop. Tauri intercepts the drop, so the browser's onDrop
-  // never sees the file paths; we forward the dropped path as menu:open-file
-  // which App.tsx already routes to handleNativeFilePath().
+  // never sees the file paths. PointCloudLabeler: the paths themselves come from the
+  // Rust side ('data-drop', commands/dataopen.rs), which grants them first;
+  // here only whether something is being dragged over the window, for the
+  // drop overlay.
+  const dragHandlers = new Set<(over: boolean) => void>();
   try {
     ctx.getCurrentWebview().onDragDropEvent((e) => {
-      if (e.payload.type !== 'drop') return;
-      const path = e.payload.paths[0];
-      if (!path) return;
-      for (const cb of menuHandlers) cb('menu:open-file', path);
+      const over = e.payload.type === 'enter' || e.payload.type === 'over';
+      for (const cb of dragHandlers) cb(over);
     }).catch(() => { /* ignore */ });
   } catch { /* webview API not available in this Tauri version */ }
 
@@ -299,6 +340,18 @@ function installShim(ctx: BridgeCtx) {
       ctx.invoke<unknown>('octree_list', { projectFolder }),
     octreeReadMeta: (octreeDir: string) =>
       ctx.invoke<unknown>('octree_read_meta', { octreeDir }),
+    // The largest tree id in the whole cloud (NodeStreamer).
+    octreeMaxTreeId: (octreeDir: string) =>
+      ctx.invoke<number>('octree_max_tree_id', { octreeDir }),
+    // Metadata alone and the hierarchy raw (octreeReader.openOctree).
+    octreeReadMetadata: (octreeDir: string) =>
+      ctx.invoke<unknown>('octree_read_metadata', { octreeDir }),
+    octreeReadHierarchy: async (octreeDir: string): Promise<ArrayBuffer> => {
+      const bytes = await ctx.invoke<ArrayBuffer | Uint8Array>('octree_read_hierarchy', { octreeDir });
+      if (bytes instanceof ArrayBuffer) return bytes;
+      const v = bytes as Uint8Array;
+      return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer;
+    },
     octreeReadBlock: async (octreeDir: string, byteOffset: number, byteSize: number): Promise<ArrayBuffer> => {
       const bytes = await ctx.invoke<ArrayBuffer | Uint8Array>('octree_read_block', {
         octreeDir, byteOffset, byteSize,
@@ -504,6 +557,13 @@ function installShim(ctx: BridgeCtx) {
       ctx.invoke<string>('octree_read_review', { octreeDir }),
     octreeWriteReview: (octreeDir: string, json: string) =>
       ctx.invoke<null>('octree_write_review', { octreeDir, json }),
+    // Branches cut out of trees by hand and measured (branches.json) —
+    // see persistence/branchStore.ts. Read returns the raw JSON string
+    // ("{}" when absent). Bookkeeping only — never touches points.
+    octreeReadBranches: (octreeDir: string) =>
+      ctx.invoke<string>('octree_read_branches', { octreeDir }),
+    octreeWriteBranches: (octreeDir: string, json: string) =>
+      ctx.invoke<null>('octree_write_branches', { octreeDir, json }),
     // Per-tree species assignment overlay (species.json). Read returns
     // the raw JSON string ("{}" when absent); write persists a flat
     // { treeId: speciesKey }. Bookkeeping only — never touches points.
@@ -622,6 +682,8 @@ function installShim(ctx: BridgeCtx) {
       name: string;
       scannerType: string;
       voxelSize: number;
+      /** Keep the point nearest each voxel's centroid. */
+      keepCentroid?: boolean;
     }) => ctx.invoke<{ outDir: string; pointCountIn: number; pointCountOut: number; durationMs: number }>('octree_voxel_downsample', args),
     // Virtual caliper — click any point on a rendered stem, fit a
     // Kåsa circle in a horizontal slab at the clicked Z, get the
@@ -850,7 +912,7 @@ function installShim(ctx: BridgeCtx) {
     // the observability of the fit. Reports; nothing moves.
     octreeRegister: (
       referenceDir: string, movingDir: string,
-      init: { mode: 'current' | 'auto' | 'skeleton' | 'manual' | 'features'; dx?: number; dy?: number; dz?: number; yawDeg?: number; searchRadius?: number; yawRangeDeg?: number; dtmCell?: number; featureVoxel?: number },
+      init: { mode: 'current' | 'auto' | 'skeleton' | 'manual' | 'features' | 'stems'; dx?: number; dy?: number; dz?: number; yawDeg?: number; searchRadius?: number; yawRangeDeg?: number; dtmCell?: number; featureVoxel?: number },
       params: {
         method: 'symmetric' | 'pointToPlane' | 'pointToPoint' | 'gicp'; kernel: 'welsch' | 'cauchy' | 'tukey' | 'none';
         dof: 'full' | 'levelled' | 'translation'; voxel: number; levels: number; maxCorrDist: number;
@@ -985,6 +1047,10 @@ function installShim(ctx: BridgeCtx) {
     // exact-code match when the query is numeric.
     crsLookup: (code: number) => ctx.invoke<EpsgLookupEntry>('crs_lookup', { code }),
     crsSearch: (query: string, limit: number) => ctx.invoke<EpsgLookupEntry[]>('crs_search', { query, limit }),
+    // An EPSG code (and its vertical one) as OGC WKT, for a LAS
+    // 1.4 file the front end writes itself (io/branchLas.ts); null when
+    // the code has no WKT form (commands/crs/wkt.rs).
+    crsWkt: (epsg: number, vertical: number | null) => ctx.invoke<string | null>('crs_wkt', { epsg, vertical }),
 
     // ----- Geodetic data (NTv2 datum-shift grids) -----
     //
@@ -1020,6 +1086,43 @@ function installShim(ctx: BridgeCtx) {
     octreePointQc: (octreeDir: string, params: Record<string, unknown>) =>
       ctx.invoke<unknown>('octree_point_qc', { octreeDir, params }),
 
+
+    // The project's files (commands/outputs.rs).
+    projectFiles: () => ctx.invoke<unknown>('project_files'),
+
+    // ----- PointCloudLabeler: one door for data -----
+    //
+    // src/io/dataOpen.ts and components/DataDoor.tsx use these; the Rust
+    // side is src-tauri/src/commands/dataopen.rs. A drop arrives already
+    // granted and classified on 'data-drop'.
+    dataClassify: (path: string) => ctx.invoke<unknown>('data_classify', { path }),
+    dataExtract: (archive: string, dest: string, only: string[]) => ctx.invoke<unknown>('data_extract', { archive, dest, only }),
+    onDataDrop: (cb: (entries: unknown) => void) => ctx.listen<unknown>('data-drop', (e) => {
+      // { window, entries } — a drop on the other window is its own.
+      const w = windowOf(e.payload);
+      if (w !== undefined && w !== ctx.label) return;
+      cb(Array.isArray(e.payload) ? e.payload : (e.payload as { entries?: unknown }).entries);
+    }),
+    onDataProgress: (cb: (e: { stage: string; pct: number }) => void) =>
+      ctx.listen<{ stage: string; pct: number }>('data-progress', (e) => cb(e.payload)),
+    onDataDrag: (cb: (over: boolean) => void) => {
+      dragHandlers.add(cb);
+      return () => { dragHandlers.delete(cb); };
+    },
+
+    // ----- PointCloudLabeler: survey analyses of a dataset -----
+    //
+    // The Survey panel (components/shell/SurveyPanel.tsx); the Rust side is
+    // src-tauri/src/commands/octree/survey.rs. Progress arrives on
+    // 'octree-progress' with the tool's stage, Stop is octreeCancel.
+    surveyContours: (params: unknown) => ctx.invoke<unknown>('survey_contours', { params }),
+    surveyVolume: (params: unknown) => ctx.invoke<unknown>('survey_volume', { params }),
+    surveyVoxelChange: (params: unknown) => ctx.invoke<unknown>('survey_voxel_change', { params }),
+    surveyOrtho: (params: unknown) => ctx.invoke<unknown>('survey_ortho', { params }),
+    surveyProfile: (params: unknown) => ctx.invoke<unknown>('survey_profile', { params }),
+    surveySaveGeometry: (params: unknown) => ctx.invoke<unknown>('survey_save_geometry', { params }),
+    surveyMesh: (params: unknown) => ctx.invoke<unknown>('survey_mesh', { params }),
+    surveyDxfPoints: (params: unknown) => ctx.invoke<unknown>('survey_dxf_points', { params }),
 
     // ----- E57 preprocessing -----
     //
@@ -1281,8 +1384,29 @@ function installShim(ctx: BridgeCtx) {
     // Geometric leaf–wood separation (LeWoS / TLSeparation family): per-point
     // PCA eigenfeatures — linear (branch) or planar (trunk) vs scattered
     // (foliage) — plus majority-vote smoothing, written to the semantic byte
-    // (1 = wood, 2 = leaf, 0 = ground). Overwrites semantic. Ground classified
-    // first is recommended so ground surfaces aren't called wood.
+    // (PointCloudLabeler: 1 = stem, 2 = branch, 4 = leaf, 0 = ground). Overwrites
+    // semantic. Ground classified first is recommended so ground surfaces
+    // aren't called wood.
+    // The forest pass — stems found, every tree grown from them,
+    // wood / leaf; writes tree_id and semantic, and forest/*.json.
+    octreeSegmentForest: (octreeDir: string, params: import('../components/shell/forest').ForestParams) =>
+      withDatasetBusy(() => ctx.invoke<import('../components/shell/forest').ForestResult>('octree_segment_forest', { octreeDir, params })),
+    octreeForestSeeds: (octreeDir: string) =>
+      ctx.invoke<import('../components/shell/forest').ForestSeedsFile | null>('octree_forest_seeds', { octreeDir }),
+    octreeForestSaveSeeds: (octreeDir: string, seeds: import('../components/shell/forest').ForestSeedsFile) =>
+      ctx.invoke<void>('octree_forest_save_seeds', { octreeDir, seeds }),
+    octreeForestFile: (octreeDir: string, name: 'trees' | 'suggestions' | 'report' | 'seed_review' | 'near_ties') =>
+      ctx.invoke<unknown>('octree_forest_file', { octreeDir, name }),
+    // the points of a near-tie branch still its tree's: [record, point indices]
+    octreeForestBranchPoints: (octreeDir: string, id: number) =>
+      ctx.invoke<[number, number[]][]>('octree_forest_branch_points', { octreeDir, id }),
+    octreeForestSaveReview: (octreeDir: string, review: unknown) =>
+      ctx.invoke<void>('octree_forest_save_review', { octreeDir, review }),
+    // QSMs as .qsm / .qsf files and tube meshes, and back
+    qsmExportFiles: (octreeDir: string, formats: string[], outDir?: string, sides?: number) =>
+      ctx.invoke<import('../components/shell/qsmFiles').QsmExportResult>('qsm_export_files', { octreeDir, outDir: outDir ?? null, formats, sides: sides ?? null }),
+    qsmImportFile: (path: string, outPly?: string, sides?: number) =>
+      ctx.invoke<import('../components/shell/qsmFiles').QsmImportResult>('qsm_import_file', { path, outPly: outPly ?? null, sides: sides ?? null }),
     octreeLeafWood: (octreeDir: string, params: {
       searchRadius: number; minNeighbors: number; linearityMin: number;
       planarityMin: number; scatterMax: number; smoothPasses: number;
@@ -1380,18 +1504,48 @@ function installShim(ctx: BridgeCtx) {
     projectRecent: () => ctx.invoke('project_recent'),
     projectRemoveRecent: (folder: string) =>
       ctx.invoke<string[]>('project_remove_recent', { folder }),
+    // Rename Project… (commands/project_rename.rs)
+    projectRename: (folder: string, name: string) => ctx.invoke('project_rename', { folder, name }),
+    projectRenameCheck: (folder: string, name: string) => ctx.invoke<string>('project_rename_check', { folder, name }),
     projectBrowseForFolder: (mode: 'new' | 'open') =>
       ctx.invoke<string | null>('dialog_pick_folder', {
         title: mode === 'open' ? 'Open Project' : 'Choose parent folder for new project',
       }),
 
     // Menu actions: `menu:<id>` for every native-menu click (payload: the
-    // folder, for a recent project), `menu:open-file` for a dropped file,
-    // and `project:changed` from the backend.
+    // folder, for a recent project), and `project:changed` from the
+    // backend. (A dropped file is 'data-drop', above.)
     onMenuAction: (cb: ProjectChangedHandler) => {
       menuHandlers.add(cb);
       return () => { menuHandlers.delete(cb); };
     },
+
+    // The second window — commands/compare_window.rs,
+    // state/compareWindow.ts.
+    windowLabel: () => ctx.label,
+    compareWindowOpen: (dataset: string | null, sideBySide: boolean) =>
+      ctx.invoke<void>('compare_window_open', { dataset, sideBySide }),
+    compareWindowArrange: () => ctx.invoke<void>('compare_window_arrange'),
+    compareWindowIsOpen: () => ctx.invoke<boolean>('compare_window_is_open'),
+    compareWindowClose: () => ctx.invoke<void>('compare_window_close'),
+    /** Null: this window may write to `dir`. Otherwise the label of the
+     *  window that holds it. */
+    windowClaimDataset: (dir: string) => ctx.invoke<string | null>('window_claim_dataset', { dir }),
+    windowReleaseDataset: (dir: string) => ctx.invoke<void>('window_release_dataset', { dir }),
+    setReadOnlyDatasets: (dirs: string[]) => {
+      readOnlyKeys.clear();
+      for (const d of dirs) readOnlyKeys.add(dirKey(d));
+    },
+    compareSend: (msg: OutgoingCompareMessage) => ctx.emit(COMPARE_EVENT, { ...msg, from: ctx.label }),
+    onCompareMessage: (cb: (msg: CompareMessage) => void) => ctx.listen<CompareMessage>(COMPARE_EVENT, (e) => {
+      if (e.payload.from !== ctx.label) cb(e.payload);
+    }),
+    onCompareOpenDataset: (cb: (dir: string) => void) => ctx.listen<{ window?: string; dir?: string }>('compare-open-dataset', (e) => {
+      if (windowOf(e.payload) === ctx.label && e.payload.dir) cb(e.payload.dir);
+    }),
+    onCompareWindowClosed: (cb: () => void) => ctx.listen<{ window?: string }>('compare-window-closed', (e) => {
+      if (windowOf(e.payload) === ctx.label) cb();
+    }),
   };
 
   (window as unknown as Record<string, unknown>).desktop = api;

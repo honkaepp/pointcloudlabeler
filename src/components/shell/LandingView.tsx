@@ -1,10 +1,15 @@
 // Landing view — shown in the viewport area when no dataset is open.
-// A calm, centred hero with the two primary actions (import / open
-// recent) so a fresh project isn't a blank void. Recent datasets are
-// the project's saved octrees; clicking one opens it straight into the
-// editor.
+// A calm, centred hero with the primary actions so a fresh project isn't
+// a blank void. Recent datasets are the project's saved octrees; clicking
+// one opens it straight into the editor.
+//
+// The one door for data (io/dataOpen.ts) — a point cloud comes into the
+// editor, a PTX goes to the Data tab, and a drop anywhere does the same.
 
 import type { OctreeListEntry } from '../../persistence/octreeReader';
+import { PRODUCT_NAME } from '../PointCloudLabelerLogo';
+import { OPENABLE_SUMMARY, pickData } from '../../io/dataOpen';
+import { formatChord } from '../../state/keybindings';
 
 interface Props {
   list: OctreeListEntry[];
@@ -15,7 +20,7 @@ interface Props {
 export default function LandingView({ list, onImport, onOpen }: Props) {
   return (
     <div className="absolute inset-0 flex items-center justify-center">
-      <div className="flex flex-col items-center" style={{ width: 560, maxWidth: '90%' }}>
+      <div className="flex flex-col items-center" style={{ width: 600, maxWidth: '90%' }}>
         {/* Hero mark */}
         <div
           className="rounded-2xl mb-5 flex items-center justify-center"
@@ -34,25 +39,30 @@ export default function LandingView({ list, onImport, onOpen }: Props) {
         </div>
 
         <h1 className="text-[22px] font-semibold mb-1.5" style={{ color: 'var(--text)' }}>
-          PointCloudLabeler point cloud editor
+          {PRODUCT_NAME} point cloud editor
         </h1>
-        <p className="text-[13px] mb-7 text-center" style={{ color: 'var(--text-dim)', lineHeight: 1.6 }}>
+        <p className="text-[13px] mb-6 text-center" style={{ color: 'var(--text-dim)', lineHeight: 1.6 }}>
           Out-of-core segmentation + labelling for TLS / MLS / ULS / ALS clouds.<br />
-          Import a LAS / LAZ, text, PLY or E57 cloud to build a streaming octree and start editing.
+          Open a point cloud, or raw scanner data to process first — or drop it anywhere.
         </p>
 
-        <div className="flex gap-2.5 mb-8">
+        <div className="flex gap-2.5 mb-4">
           <button className="btn btn-primary !h-10 !px-5 gap-2 text-[13px]" onClick={onImport}>
-            <PlusIcon /> Import point cloud
+            <PlusIcon /> Open data…
           </button>
-          <button
-            className="btn !h-10 !px-4 gap-2 text-[13px]"
-            onClick={() => { /* opens command palette via parent hint */ }}
-            disabled
-            style={{ display: 'none' }}
-          >
-            Command palette
+          <button className="btn !h-10 !px-4 gap-2 text-[13px]" onClick={() => void pickData('folder')}
+            title="A folder of point clouds, or a project">
+            Open folder…
           </button>
+        </div>
+
+        <div className="grid gap-x-4 gap-y-0.5 mb-8" style={{ gridTemplateColumns: 'max-content max-content' }}>
+          {OPENABLE_SUMMARY.slice(0, 3).map(([k, v]) => (
+            <div key={k} className="contents">
+              <span className="mono text-[10px]" style={{ color: 'var(--text-dim)' }}>{k}</span>
+              <span className="mono text-[10px]" style={{ color: 'var(--text-mute)' }}>{v}</span>
+            </div>
+          ))}
         </div>
 
         {list.length > 0 && (
@@ -82,7 +92,7 @@ export default function LandingView({ list, onImport, onOpen }: Props) {
         )}
 
         <div className="mono text-[10px] mt-7 flex items-center gap-1.5" style={{ color: 'var(--text-mute)' }}>
-          Press <span className="kbd">⌘K</span> for commands
+          Press <span className="kbd">{formatChord('mod+k')}</span> for commands
         </div>
       </div>
     </div>

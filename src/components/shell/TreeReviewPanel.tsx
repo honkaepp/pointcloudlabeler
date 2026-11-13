@@ -20,6 +20,8 @@ import { farExtent, isolateGeomFor, neighboursOf } from './treeNeighbourhood';
 import { marginReach, type IsolateMargin, type MarginReach } from '../../three/filterGeometry';
 import { editReach, relinkReach, DIRECTION_LABELS, DIRECTION_TITLES } from './marginFields';
 import { confirmDialog } from '../../ui/dialogs';
+import { forestNotes, useForestStore } from './forestStore';
+import TreeShiftSection from './TreeShiftSection'; // Pull apart, view only
 
 type SortMode = 'id' | 'count';
 /** Per-tree QA status: absent = unreviewed. Persisted to review.json. */
@@ -40,7 +42,8 @@ interface Desktop {
 const METRIC_PARAMS = DEFAULT_METRIC_PARAMS;
 
 export default function TreeReviewPanel() {
-  const { octree, api, tools, filters, setFilters, setTools, display, setDisplay, selectedCount } = useOctreeShell();
+  const { octree, api, tools, filters, setFilters, setTools, display, setDisplay, selectedCount, setWorldPicker } = useOctreeShell();
+  const forest = useForestStore(); // The forest pass's flags
   /** Result line for the absorb (select-grey → assign) action. */
   const [absorbNote, setAbsorbNote] = useState<string | null>(null);
   const [trees, setTrees] = useState<TreeSummaryEntry[] | null>(null);
@@ -816,6 +819,15 @@ export default function TreeReviewPanel() {
               onChange={(v) => setFilters({ isolateShowOthers: v })}
             />
           </label>
+          {/* A stray ten metres off is a pixel or two at 1 px points */}
+          <label className="flex items-center justify-between cursor-pointer"
+            title="This tree's points beyond the margin ring (horizontally) drawn large and yellow, so stray points far from the tree show at any zoom. Widen the ring to leave a wide crown's edges out.">
+            <span className="mono text-[11px]" style={{ color: 'var(--text)' }}>Highlight strays outside the ring</span>
+            <Toggle
+              on={filters.isolateHighlightStrays}
+              onChange={(v) => setFilters({ isolateHighlightStrays: v })}
+            />
+          </label>
           {/* WHICH neighbours. All of them at once is the wrong default
               in a dense plot: the one crown you are trying to separate
               from disappears behind four others. */}
@@ -825,6 +837,19 @@ export default function TreeReviewPanel() {
               picked={filters.isolateOtherIds}
               onChange={(ids) => setFilters({ isolateOtherIds: ids })}
               onGo={(id) => { const t = trees?.find(x => x.treeId === id); if (t) focusTree(t); }}
+            />
+          )}
+          {/* Draw the shown neighbours aside to pull interleaved
+              crowns apart — the view only, never the coordinates */}
+          {filters.isolateShowOthers && octree && selectedEntry && selectedEntry.treeId === filters.isolateTreeId && (
+            <TreeShiftSection
+              dir={octree.dir}
+              anchor={selectedEntry}
+              candidates={filters.isolateOtherIds === null
+                ? neighbours
+                : neighbours.filter(n => filters.isolateOtherIds!.includes(n.id))}
+              trees={trees}
+              setWorldPicker={setWorldPicker}
             />
           )}
           {/* Distance/height ring around the tree: how far out the
@@ -845,7 +870,9 @@ export default function TreeReviewPanel() {
                 Points of tree {selectedEntry.treeId} lie up to {farReach.toFixed(0)} m outside the framed box.
                 {isoStatus?.scanRecords == null
                   ? ' This scan predates the record list: Re-scan trees, then isolate again, to load them.'
-                  : ' They are loaded and shown; the frame is not around them.'}
+                  : filters.isolateHighlightStrays
+                    ? ' They are loaded and drawn large in yellow; the frame is not around them.'
+                    : ' They are loaded and shown; the frame is not around them.'}
               </span>
               <button
                 className="btn !h-6 mono text-[10px] shrink-0"
@@ -1319,6 +1346,14 @@ export default function TreeReviewPanel() {
                     >
                       <span style={{ color: SEV_COLOR[f.severity] }}>{f.severity}</span> · {f.reason}
                       <div style={{ color: 'var(--text-mute)' }}>→ {f.hint}</div>
+                    </div>
+                  ))}
+                  {/* What the forest pass says about this tree */}
+                  {forest.dir === octree?.dir && forestNotes(forest, selectedId).map((n, i) => (
+                    <div key={`forest-${i}`} className="mono text-[9.5px] px-2 py-1.5 rounded-md"
+                      style={{ color: 'var(--text-dim)', background: 'var(--wash-1)', borderLeft: '3px solid #4ade80', lineHeight: 1.45 }}>
+                      <span style={{ color: '#4ade80' }}>forest</span> · {n.label}
+                      <div style={{ color: 'var(--text-mute)' }}>→ {n.hint}</div>
                     </div>
                   ))}
                 </>

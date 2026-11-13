@@ -247,6 +247,7 @@ fn project_meta_roundtrips_through_camel_case_json() {
         },
         default_cloud_format: "txt".into(),
         notes: "boreal sample".into(),
+        last_folder: None,
     };
 
     let json = serde_json::to_string(&meta).unwrap();
@@ -256,6 +257,9 @@ fn project_meta_roundtrips_through_camel_case_json() {
     assert!(json.contains("\"updatedAt\""));
     assert!(json.contains("\"defaultCloudFormat\""));
     assert!(!json.contains("created_at"));
+    // `lastFolder` is written only when known, so a project.json
+    // reads the same to PointCloudLabeler.
+    assert!(!json.contains("lastFolder"));
 
     let back: ProjectMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(back.name, "Test Plot");
@@ -281,7 +285,9 @@ fn project_state_serializes_with_camel_case_meta() {
             },
             default_cloud_format: "txt".into(),
             notes: String::new(),
+            last_folder: None,
         },
+        relocated: None,
     };
     let json = serde_json::to_string(&state).unwrap();
     assert!(json.contains("\"folder\":\"/tmp/example\""));

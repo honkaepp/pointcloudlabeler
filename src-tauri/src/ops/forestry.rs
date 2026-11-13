@@ -1419,7 +1419,7 @@ mod tests {
 
     fn qsm(trees: Vec<TreeQsm>) -> QsmResult {
         let total: f64 = trees.iter().map(|t| t.stem_volume).sum();
-        QsmResult { trees, total_stem_volume: total, total_stem_volume_std: 0.0, qsm_path: String::new(), slice_height: 0.5, min_points_per_slice: 10 }
+        QsmResult { trees, total_stem_volume: total, total_stem_volume_std: 0.0, qsm_path: String::new(), slice_height: 0.5, min_points_per_slice: 10, leaf_points: 0 }
     }
 
     #[test]

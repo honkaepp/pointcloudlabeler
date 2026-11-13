@@ -9,11 +9,13 @@
 // the rest of the editor surface via context so any panel can reach
 // undo / save / export / preset views without threading callbacks.
 
+import type { TreeMetricKey } from '../../three/treeMetricColors';
 import { createContext, useContext } from 'react';
 import type { AnalysisLayer, LayerKind, LayerPayload } from '../../layers/analysisLayers';
 import type { CompareApi, CompareRequest } from '../../three/comparePose';
 import type { IsolateMargin } from '../../three/filterGeometry';
 import type { OctreeListEntry, OpenOctree, RasterLayer } from '../../persistence/octreeReader';
+import type { BranchFile } from '../../persistence/branchStore';
 
 /** A second (and beyond) point cloud rendered into the scene as a
  *  read-only overlay alongside the primary editable cloud. Edits +
@@ -40,6 +42,11 @@ export interface SecondaryCloud {
    *  filter state, which is useful when an overlay is a reference layer
    *  whose points wouldn't carry meaningful tree ids in the first place. */
   syncFilters: boolean;
+  /** When true, the Filters panel's extent (X / Y / Z ranges, the height
+   *  filter among them) clips this overlay too, without the rest of the
+   *  primary's filters. On for a newly added overlay. Implied by
+   *  `syncFilters`. */
+  syncExtent: boolean;
   octree: OpenOctree;
 }
 
@@ -47,7 +54,9 @@ export interface SecondaryCloud {
  *  string literals; per-extra modes are encoded as `extra:<name>` so the
  *  same ColorMode field carries everything the Display panel exposes
  *  without a separate `extraName` field. */
-export type ColorMode = 'height' | 'intensity' | 'classification' | 'tree_id' | 'semantic' | 'standing_deadwood' | 'laying_deadwood' | 'flat' | 'x' | 'y' | 'return_number' | 'number_of_returns' | `extra:${string}`;
+export type ColorMode = 'height' | 'intensity' | 'classification' | 'tree_id' | 'semantic' | 'standing_deadwood' | 'laying_deadwood' | 'flat' | 'x' | 'y' | 'return_number' | 'number_of_returns' | `extra:${string}`
+  // every tree by what was measured of it (three/treeMetricColors.ts)
+  | 'tree_metric';
 export type SelectTool = 'rect' | 'lasso' | 'poly';
 export type SelectDepth = 'visible' | 'through';
 /** Continuous colour ramp applied to the scalar modes (height /
@@ -141,6 +150,42 @@ export interface SkeletonAlignment extends AlignmentParam {
 }
 
 export type SkeletonColorMode = 'tree' | 'class' | 'radius';
+
+/** The branches cut out by hand (Branches panel) as the viewer draws
+ *  them: which branch each marked point belongs to, per node, and how
+ *  to show them. See persistence/branchStore.ts for the file behind it. */
+export interface BranchMarksView {
+  /** Node key ("tile:record") → point index → branch id. */
+  marks: Map<string, Map<number, number>>;
+  /** Branch id → paint colour. */
+  colors: Map<number, [number, number, number]>;
+  /** The branch being worked on: drawn brighter, and the one the branch
+   *  filter keeps. */
+  activeId: number | null;
+  /** Paint the branches' points in their colours over the colour mode,
+   *  so the branches already gone through stand out. */
+  paint: boolean;
+  /** 'all' leaves visibility alone; 'hideMarked' hides every branch's
+   *  points except the active branch's (what is left is what has not
+   *  been cut yet); 'onlyActive' shows nothing but the active branch. */
+  filter: 'all' | 'hideMarked' | 'onlyActive';
+}
+
+/** Measurement graphics the Branches panel draws in the viewport: the
+ *  caliper jaws and section ring, the length polyline. World / source
+ *  CRS; each segment and dot carries its own colour (hex). */
+export interface BranchViewState {
+  activeId: number | null;
+  paint: boolean;
+  filter: BranchMarksView['filter'];
+}
+
+export const DEFAULT_BRANCH_VIEW: BranchViewState = { activeId: null, paint: true, filter: 'all' };
+
+export interface BranchOverlayData {
+  segments: Array<{ a: [number, number, number]; b: [number, number, number]; color: string }>;
+  dots: Array<{ p: [number, number, number]; color: string }>;
+}
 
 /** Result of the Tree Skeleton Transfer (Honkanen et al. 2026,
  *  doi:10.1016/j.ophoto.2026.100147)
@@ -236,6 +281,22 @@ export interface DisplayConfig {
    *  the original crisp-dot default; raise it for sparse clouds or to
    *  read structure on a high-DPI display. */
   pointSize: number;
+  /** Perspective, or a parallel (orthographic) projection for measuring
+   *  views and sections (three/viewCamera.ts). Optional: perspective when
+   *  absent. */
+  projection?: 'perspective' | 'ortho';
+  /** A stretched range for a built-in ramp, in the units the legend shows
+   *  (elevation or height above ground in metres, eastings, northings, raw
+   *  intensity). Absent: the cloud's own range. */
+  rampRanges?: Partial<Record<'height' | 'heightAboveGround' | 'intensity' | 'x' | 'y', { lo: number; hi: number }>>;
+  /** Intensity shading over any colour mode, 0 (off) … 1. */
+  shade?: number;
+  /** What the 'tree_metric' mode colours each tree by. Optional: height
+   *  when absent. */
+  treeMetric?: TreeMetricKey;
+  /** A set range for a tree metric's ramp, in its units, by metric.
+   *  Absent: the measured trees' 2–98 %. */
+  treeRanges?: Partial<Record<TreeMetricKey, { lo: number; hi: number }>>;
   /** Low → high colours (hex) for the 'custom' ramp, so the user can
    *  define their own colouring for a scalar / extra column instead of
    *  picking a preset. Only consulted when ramp === 'custom'. */
@@ -440,6 +501,10 @@ export interface FilterConfig {
    *  Only the ELEVATION bounds apply; the margin box's horizontal walls
    *  never clip the tree, or a wide crown would lose its edges. */
   isolateZBandCutsTree: boolean;
+  /** Draw the isolated tree's points beyond the margin ring (horizontally)
+   *  large and bright: a stray ten metres off is a pixel or two otherwise,
+   *  and Frame all seemed to show nothing. */
+  isolateHighlightStrays: boolean;
   /** Arbitrary-orientation slab filter — keep only points whose signed
    *  perpendicular distance to the plane (anchor, normal) lies in
    *  [-halfHeight, halfHeight]. Stacks with X/Y/Z range filters and
@@ -499,6 +564,7 @@ export const DEFAULT_FILTERS: FilterConfig = {
   isolateRecords: null,
   isolateZRange: null,
   isolateZBandCutsTree: false,
+  isolateHighlightStrays: true,
   planeSlab: null,
   viewpointHpr: null,
 };
@@ -552,6 +618,10 @@ export interface ViewerStats {
    *  show a guess. */
   rampLo: number | null;
   rampHi: number | null;
+  /** The last selection's pass over unloaded nodes stopped at its cap, so
+   *  part of the shape's points is not selected (zoom in). Optional: false
+   *  when absent. */
+  deepSelectTruncated?: boolean;
 }
 
 export const ZERO_STATS: ViewerStats = {
@@ -564,8 +634,20 @@ export const ZERO_STATS: ViewerStats = {
 /** Imperative actions the shell exposes. OctreeView populates this on
  *  mount and clears it on unmount; panels call into it directly. Null
  *  while the viewer is still booting (panels disable themselves). */
+/** The values of the colour mode over the loaded points (a sample of the
+ *  cloud), in the units the legend shows, for stretching its ramp: `counts`
+ *  over [lo, hi], and the percentiles a stretch cuts at. */
+export interface ColorHistogram {
+  key: string;
+  lo: number;
+  hi: number;
+  counts: number[];
+  p: { p1: number; p2: number; p98: number; p99: number };
+  samples: number;
+}
+
 export interface OctreeShellApi {
-  apply: (action: { treeId?: number; semantic?: 0 | 1 | 2 | 3; deleted?: 0 | 1 | 2; standingDeadwood?: number; layingDeadwood?: number }) => void;
+  apply: (action: { treeId?: number; semantic?: 0 | 1 | 2 | 3 | 4; deleted?: 0 | 1 | 2; standingDeadwood?: number; layingDeadwood?: number }) => void;
   clearSelection: () => void;
   save: () => Promise<void>;
   exportLas: () => Promise<void> | void;
@@ -592,6 +674,9 @@ export interface OctreeShellApi {
    *  the rotation-pivot pick used elsewhere, big enough for any
    *  realistic UI gesture. */
   pickScenePointAt: (x: number, y: number, maxSamples?: number) => [number, number, number] | null;
+  /** The colour mode's values over the loaded points, for the ramp's
+   *  stretch (Display panel, legend). Null for a mode without a ramp. */
+  colorHistogram: (bins?: number) => ColorHistogram | null;
   /** Largest tree_id across loaded nodes + patches. Tree Review uses
    *  this to auto-pick the next free id when splitting a crown. */
   maxTreeId: () => number;
@@ -602,11 +687,16 @@ export interface OctreeShellApi {
    *  that tree's points, so the action is safely scoped). */
   applyToSelection: (action: {
     treeId?: number;
-    semantic?: 0 | 1 | 2 | 3;
+    semantic?: 0 | 1 | 2 | 3 | 4;
     deleted?: 0 | 1 | 2;
     standingDeadwood?: number;
     layingDeadwood?: number;
   }) => number;
+  /** Apply an edit to given points — `[record, point indices in the
+   *  record]` — loaded or not, as ONE undo step like any other edit. The
+   *  branch review moves a near-tie branch to the other tree with it.
+   *  Returns how many points were edited. */
+  applyToRecords: (groups: ReadonlyArray<readonly [number, ReadonlyArray<number>]>, action: { treeId?: number }) => number;
   /** Select every VISIBLE unassigned (tree_id ≤ 0) point — exactly the
    *  grey points on screen, already narrowed by the active filters
    *  (isolate box, margin ring, height band …). Returns how many were
@@ -663,6 +753,8 @@ export interface OctreeShellApi {
    *  semantic + clears its patch overrides, then reloads. Returns wood/leaf
    *  point counts. Pure geometry — no ML / GPU / network. */
   leafWood: (params: LeafWoodParams) => Promise<{ woodPoints: number; leafPoints: number }>;
+  /** The forest pass (stems → trees, wood / leaf). */
+  segmentForest: (params: import('./forest').ForestParams) => Promise<import('./forest').ForestResult>;
   /** Tree Skeleton Transfer (Honkanen et al. 2026,
    *  doi:10.1016/j.ophoto.2026.100147) — propagate
    *  the BASELINE octree's per-point tree_id + semantic labels onto
@@ -678,6 +770,18 @@ export interface OctreeShellApi {
    *  loaded point with tree_id > 0)? Used to warn before a destructive
    *  re-segmentation overwrites an imported tree_id column. */
   hasTreeIds: () => boolean;
+  /** The current selection as node key → point indices (a copy). The
+   *  Branches panel turns it into a branch's members. */
+  getSelection: () => Map<string, number[]>;
+  /** World positions (source CRS) of the given points, for those whose
+   *  node is resident. `missing` counts the ones that are not (or are
+   *  deleted). Measurements run on what this returns. */
+  pointsWorld: (members: Array<{ tile: number; record: number; points: number[] }>) => { xyz: Float64Array; missing: number };
+  /** World positions of every resident, undeleted point of tree
+   *  `treeId` (after merges) — only those labelled `semantic` when given
+   *  (1 = stem). The Stems panel measures on these when no stem has been
+   *  cut out by hand. */
+  treePointsWorld: (treeId: number, semantic?: number) => Float64Array;
 }
 
 /** Parameters for CHM-based auto-segmentation (individual-tree-crown
@@ -1099,7 +1203,9 @@ export interface TaperMeasurement {
   pulpwoodM3: number;
 }
 
-export type PanelId = 'tools' | 'display' | 'filters' | 'review' | 'ground' | 'history' | 'layers' | 'subset' | 'segment' | 'keys' | 'qc' | 'pointqc' | 'rescan' | 'validation' | 'bucking' | 'thinning' | 'density' | 'report' | 'caliper' | 'slab' | 'scaninspect' | 'plotbound' | 'treehandle' | 'centerline' | 'tst' | 'm3c2' | 'taper' | 'growth' | 'crosssensor' | 'finereg' | 'register';
+// 'survey', 'viewtools' and 'height' are the Survey, Views & video and
+// Height panels (SurveyPanel.tsx, ViewToolsPanel.tsx, HeightPanel.tsx).
+export type PanelId = 'survey' | 'viewtools' | 'tools' | 'display' | 'filters' | 'review' | 'ground' | 'history' | 'layers' | 'subset' | 'segment' | 'keys' | 'qc' | 'pointqc' | 'rescan' | 'validation' | 'bucking' | 'thinning' | 'density' | 'report' | 'caliper' | 'slab' | 'scaninspect' | 'plotbound' | 'treehandle' | 'centerline' | 'tst' | 'm3c2' | 'taper' | 'growth' | 'crosssensor' | 'finereg' | 'branches' | 'stems' | 'height' | 'register';
 
 export interface OctreeShellState {
   /** Currently visible floating panels. The activity bar toggles these. */
@@ -1154,6 +1260,20 @@ export interface OctreeShellState {
    *  pick or when the panel cancels. */
   worldPicker: ((hit: [number, number, number]) => void) | null;
   setWorldPicker: (cb: ((hit: [number, number, number]) => void) | null) => void;
+
+  /** Branches cut out of trees by hand and what was measured on them
+   *  (branches.json), loaded with the dataset. `updateBranches` applies
+   *  a change and writes the file; a failed write lands in
+   *  `branchError` and the change stays on screen to be saved again. */
+  branchFile: BranchFile;
+  updateBranches: (fn: (f: BranchFile) => BranchFile) => void;
+  branchError: string | null;
+  /** How the viewer shows the branches — see BranchMarksView. */
+  branchView: BranchViewState;
+  setBranchView: (patch: Partial<BranchViewState>) => void;
+  /** Caliper jaws / length polyline the Branches panel is drawing. */
+  branchOverlay: BranchOverlayData | null;
+  setBranchOverlay: (o: BranchOverlayData | null) => void;
   /** Plot boundary — a property of the DATASET, not this UI session.
    *  Persisted to plot.json next to the dataset (PlotBoundaryPanel
    *  writes it on apply/clear/auto-fit; EditorShell's octreeDir-keyed
@@ -1249,7 +1369,7 @@ export interface OctreeShellState {
   removeSecondary: (id: string) => void;
   toggleSecondary: (id: string) => void;
   /** Change an overlay's tint, colour mode, or filter-sync in place. */
-  updateSecondary: (id: string, patch: Partial<Pick<SecondaryCloud, 'color' | 'colorMode' | 'syncFilters'>>) => void;
+  updateSecondary: (id: string, patch: Partial<Pick<SecondaryCloud, 'color' | 'colorMode' | 'syncFilters' | 'syncExtent'>>) => void;
 
   /** Live counts pushed up by OctreeView. */
   selectedCount: number;

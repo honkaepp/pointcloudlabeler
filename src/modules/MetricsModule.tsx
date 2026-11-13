@@ -26,6 +26,7 @@ import { treeIdColor } from '../three/palette';
 import { csvNum, csvText } from '../io/csv';
 import { mean as statMean } from '../metrics/stats';
 import { TQSM_COLUMNS, tqsmRow } from '../metrics/qsmAttributesCsv';
+import { exportQsmFiles, openQsmFile, showQsmTubes } from '../components/shell/qsmFiles';
 
 interface Desktop {
   octreeTreeMetrics?: (dir: string, params: { crownCell: number; bhLow: number; bhHigh: number; dtmCell: number }) => Promise<TreeMetric[]>;
@@ -202,7 +203,9 @@ export default function MetricsModule() {
       setQsmTotal(res.totalStemVolume);
       setQsmTotalStd(res.totalStemVolumeStd);
       const ci = res.totalStemVolumeStd > 0 ? ` ± ${(1.96 * res.totalStemVolumeStd).toFixed(3)}` : '';
-      setStatus(`QSM: ${res.trees.length} trees · Σ stem volume ${res.totalStemVolume.toFixed(3)}${ci} m³`);
+      // The leaves the forest pass labelled are left out of the fit
+      const leaves = res.leafPoints ? ` · ${res.leafPoints.toLocaleString()} leaf points left out` : '';
+      setStatus(`QSM: ${res.trees.length} trees · Σ stem volume ${res.totalStemVolume.toFixed(3)}${ci} m³${leaves}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -546,7 +549,7 @@ export default function MetricsModule() {
               <summary className="chip cursor-pointer" style={{ width: 'fit-content' }}>Stem fit · RANSAC</summary>
               <div className="flex flex-col gap-2.5 mt-2">
                 <div className="mono text-[9px]" style={{ color: 'var(--text-mute)', lineHeight: 1.45 }}>
-                  Fits a vertical stem cylinder per tree and refines DBH (overrides the algebraic estimate in the table). Compute metrics first.
+                  Fits each stem in slices along its own axis and refines DBH (overrides the algebraic estimate in the table). Compute metrics first.
                 </div>
                 <div className="flex items-end gap-2">
                   <Num label="Stem band" unit="m" value={stemParams.bandLow} min={0.1} step={0.1} onChange={(v) => setStem({ bandLow: v })} compact />
@@ -679,6 +682,25 @@ export default function MetricsModule() {
                   <button className="btn !h-7 w-full justify-center mono text-[11px] -mt-1" onClick={() => cancelStage('qsm')} disabled={!canCancel()}
                     title="Stop the QSM — nothing is written until every tree is done">Cancel QSM</button>
                 )}
+                {/* The QSM as files, as tubes in the view, and
+                    a QSM from other software beside it */}
+                <div className="flex gap-1">
+                  <button className="btn !h-7 flex-1 justify-center mono text-[10.5px]" disabled={!qsm || !dir || qsmRunning}
+                    title="Draw every tree's cylinders in the editor's view as tubes, coloured by how each was measured (green all round, yellow from one side, orange corrected, red a gap bridged)"
+                    onClick={() => { if (dir) void showQsmTubes(dir).then(r => setStatus(`QSM tubes of ${r.trees} trees added to the view (Survey → meshes)`)).catch(e => setError(e instanceof Error ? e.message : String(e))); }}>
+                    Show tubes
+                  </button>
+                  <button className="btn !h-7 flex-1 justify-center mono text-[10.5px]" disabled={!qsm || !dir || qsmRunning}
+                    title="Write the QSM as open .qsm files with a .qsf manifest (read by other QSM software), an OBJ with one object per tree (Blender) and a PLY in world coordinates, into the dataset's qsm/ folder"
+                    onClick={() => { if (dir) void exportQsmFiles(dir).then(r => setStatus(`QSM written: ${r.trees} trees, ${r.files} files${r.qsf ? ` (${r.qsf})` : ''}${r.obj ? ` · OBJ relative to ${r.origin.map(v => v.toFixed(0)).join(' ')}` : ''}`)).catch(e => setError(e instanceof Error ? e.message : String(e))); }}>
+                    Export .qsm
+                  </button>
+                  <button className="btn !h-7 flex-1 justify-center mono text-[10.5px]" disabled={qsmRunning}
+                    title="Open a .qsm or a .qsf from other QSM software (Arbor's among them) and draw it as tubes beside the cloud, coloured by its quality levels"
+                    onClick={() => { void openQsmFile().then(r => { if (r) setStatus(`Opened ${r.trees} trees (${r.edges} cylinders) as tubes${r.messages.length ? ` · ${r.messages.length} log messages` : ''}`); }).catch(e => setError(e instanceof Error ? e.message : String(e))); }}>
+                    Open .qsm…
+                  </button>
+                </div>
                 {qsmRunning && (
                   <div className="w-full rounded-full overflow-hidden -mt-1.5" style={{ height: 4, background: 'var(--wash-3)' }}>
                     <div style={{ width: `${Math.round(qsmPct * 100)}%`, height: '100%', background: 'var(--accent)', transition: 'width 0.2s' }} />

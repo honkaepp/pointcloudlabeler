@@ -5,7 +5,7 @@
 // the exporter via the export dialog, and surface long-running status
 // + progress through the shell's banner.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useProject } from '../context/ProjectContext';
 import EditorShell, { type ShellStatus } from '../components/shell/EditorShell';
 import type { FilterConfig } from '../components/shell/OctreeShellContext';
@@ -30,6 +30,13 @@ import {
 import type { ScannerType } from '../state/multiCloud';
 import { invalidateTreeMetrics } from '../metrics/loadMetrics';
 import { confirmDialog } from '../ui/dialogs';
+import { onEditorImportRequest, type ImportRequest } from '../state/editorImport';
+import { pickData } from '../io/dataOpen';
+import { pushNotice } from '../state/notices';
+import { setJob } from '../state/jobs';
+import { compareBridge } from '../components/CompareWindowControls';
+import { getCompare, initialDataset, setCompare } from '../state/compareWindow';
+import { setEditorSession } from '../state/editorSession';
 
 interface FileLike { name: string; size: number; path?: string }
 
@@ -44,6 +51,10 @@ interface PendingImport {
   suggested: ColumnMapping;
   /** A text, PLY or E57 file: what the probe found. null = LAS/LAZ. */
   pointFile: { kind: PointFileKind; probe: PointFileProbe } | null;
+  /** The scanner, when the file's source says it, and whether to convert
+   *  without asking (a LAZ this program wrote). */
+  scannerType?: ScannerType;
+  auto?: boolean;
 }
 
 export default function EditorModule() {
@@ -87,13 +98,13 @@ export default function EditorModule() {
     return () => { cancelled = true; };
   }, [octreeList, viewingOctree]);
 
-  // Native menu clicks are dispatched by EditorShell (File → Add Cloud…
+  // Native menu clicks are dispatched by EditorShell (the editor's import
   // reaches triggerImport through the shell's onImport), so that the
   // menu, the keyboard and the command palette run one and the same code.
 
   // Open a LAS/LAZ via the OS file dialog → show the import-mapping
   // dialog → convert via the Rust pipeline → list refresh.
-  const triggerImport = useCallback(async () => {
+  const triggerImport = useCallback(async (preset?: FileLike, hint?: Pick<ImportRequest, 'scannerType' | 'auto'>) => {
     if (!project?.folder) {
       setStatus({ kind: 'warn', msg: 'Open or create a project first.' });
       return;
@@ -106,7 +117,7 @@ export default function EditorModule() {
       setStatus({ kind: 'err', msg: 'Native file picker not available (desktop build needed).' });
       return;
     }
-    const picked = await d.openFileDialog({ filters: CLOUD_OPEN_FILTERS });
+    const picked = preset ?? await d.openFileDialog({ filters: CLOUD_OPEN_FILTERS });
     if (!picked) return;
     const fileKind = pointFileKindOf(picked.name);
     if (!isLasLikeName(picked.name) && !fileKind) {
@@ -134,6 +145,7 @@ export default function EditorModule() {
           columns: probe.columns,
           suggested: suggestMapping(probe.columns),
           pointFile: { kind: fileKind, probe },
+          scannerType: hint?.scannerType,
         });
       } catch (e) {
         setStatus({ kind: 'err', msg: `Could not read ${picked.name}: ${e instanceof Error ? e.message : String(e)}` });
@@ -174,8 +186,24 @@ export default function EditorModule() {
       columns,
       suggested: suggestMapping(columns),
       pointFile: null,
+      scannerType: hint?.scannerType,
+      auto: hint?.auto,
     });
   }, [project?.folder]);
+  // Clouds from the data door (several, one after another) come in the
+  // same way, without the picker. The next one starts when the dialog of the last is answered and
+  // its conversion is done.
+  const importQueue = useRef<ImportRequest[]>([]);
+  const importDraining = useRef(false);
+  const drainImports = useCallback(async () => {
+    if (importDraining.current || pendingImport || loading) return;
+    const next = importQueue.current.shift();
+    if (!next) return;
+    importDraining.current = true;
+    try { await triggerImport(next, next); } finally { importDraining.current = false; }
+  }, [pendingImport, loading, triggerImport]);
+  useEffect(() => onEditorImportRequest((f) => { importQueue.current.push(f); void drainImports(); }), [drainImports]);
+  useEffect(() => { void drainImports(); }, [drainImports]);
 
   // Run the Rust converter. The dialog already validated the scanner +
   // pre-segmented column picks; we just plumb them through.
@@ -186,6 +214,8 @@ export default function EditorModule() {
     extraNames?: string[],
     includeDeadwood?: boolean,
     mapping?: PointFileMapping,
+    /** False converts without opening (edits in the open cloud are not saved). */
+    openAfter = true,
   ) => {
     if (!project?.folder) return;
     const outDir = `${project.folder}/octrees/${safeOutputName(p.fileName)}`;
@@ -195,9 +225,11 @@ export default function EditorModule() {
     setStatus({ kind: 'info', msg: `Converting ${p.fileName} → octree…` });
     let unlisten: (() => void) | null = null;
     try {
+      setJob('editor-convert', { label: `Converting ${p.fileName}`, stage: 'starting', pct: 0, module: 'editor' });
       unlisten = await onOctreeProgress((stage, pct) => {
         setProgress(pct);
         setStatus({ kind: 'info', msg: `Octree · ${stage} · ${Math.round(pct * 100)}%` });
+        setJob('editor-convert', { label: `Converting ${p.fileName}`, stage, pct: pct * 100, module: 'editor' });
       });
       const res = await importLazAsOctree({
         srcPath: p.srcPath, outDir, name: p.fileName,
@@ -228,6 +260,10 @@ export default function EditorModule() {
       }
       setStatus({ kind: 'ok', msg: `Converted ${p.fileName} in ${sec}s — ${res.pointCount.toLocaleString()} pts${extra}` });
       await refreshList();
+      if (!openAfter) {
+        pushNotice({ kind: 'ok', title: `${p.fileName} is ready`, text: 'Not opened: the open cloud has unsaved edits. Save them, then open it from the datasets list.' });
+        return;
+      }
       // Open it in the viewer immediately — under the LIST's spelling of
       // its folder, not the importer's: the list spells it as the OS does
       // and the importer as this code did, and a cloud open under the
@@ -239,11 +275,21 @@ export default function EditorModule() {
       setStatus({ kind: 'err', msg: `Convert failed: ${e instanceof Error ? e.message : String(e)}` });
     } finally {
       unlisten?.();
+      setJob('editor-convert', null);
       setLoading(false);
       setOperation(null);
       setProgress(0);
     }
   }, [project?.folder, refreshList]);
+
+  // Our own LAZ (`auto`) needs no questions — its scanner is known and
+  // every attribute it carries comes along.
+  useEffect(() => {
+    if (!pendingImport?.auto || pendingImport.pointFile) return;
+    const p = pendingImport;
+    setPendingImport(null);
+    void runConvert(p, p.scannerType ?? 'other', undefined, p.columns, true, undefined, !dirty);
+  }, [pendingImport, runConvert, dirty]);
 
   // Export the active octree via the dialog → save-file picker → Rust.
   const handleExport = useCallback(async (octreeDir: string, name: string, opts: OctreeExportOptions) => {
@@ -342,6 +388,63 @@ export default function EditorModule() {
     }
   }, []);
 
+  // The second window (commands/compare_window.rs). A dataset
+  // the other window holds opens read-only here; one this window opens
+  // first is its own until it is closed.
+  const [readOnly, setReadOnly] = useState<{ holder: string } | null>(null);
+  const openDir = viewingOctree?.dir ?? null;
+  useEffect(() => {
+    const d = compareBridge();
+    setReadOnly(null);
+    if (!openDir || !d?.windowClaimDataset) return;
+    let cancelled = false;
+    void d.windowClaimDataset(openDir).then((holder) => {
+      if (cancelled) return;
+      d.setReadOnlyDatasets?.(holder ? [openDir] : []);
+      setReadOnly(holder ? { holder } : null);
+      setCompare({ readOnly: holder ? { dir: openDir, holder } : null });
+    }).catch(() => { /* an older backend: one window */ });
+    return () => {
+      cancelled = true;
+      void d.windowReleaseDataset?.(openDir).catch(() => { /* ignore */ });
+      d.setReadOnlyDatasets?.([]);
+      setCompare({ readOnly: null });
+    };
+  }, [openDir]);
+  // …and the second window opens the dataset it was asked for: at start
+  // (in its address) and whenever the editor asks for another.
+  const openForCompare = useCallback(async (dir: string) => {
+    try {
+      const opened = await openOctree(dir);
+      setDirty(false);
+      setViewingOctree(opened);
+    } catch (e) {
+      setStatus({ kind: 'err', msg: `Open octree failed: ${(e as Error).message}` });
+    }
+  }, []);
+  useEffect(() => {
+    if (getCompare().role !== 'compare') return;
+    const dir = initialDataset(window.location.search);
+    if (dir) void openForCompare(dir);
+    const d = compareBridge();
+    let off: (() => void) | null = null;
+    let alive = true;
+    void d?.onCompareOpenDataset?.((next) => {
+      void (async () => {
+        if (dirtyRef.current && !await confirmDialog('The open cloud has unsaved edits. Open the other one anyway and lose them?')) return;
+        await openForCompare(next);
+      })();
+    }).then((u) => { if (alive) off = u; else u(); });
+    return () => { alive = false; off?.(); };
+  }, [openForCompare]);
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+  // What is open, for Rename Project (state/editorSession.ts)
+  useEffect(() => {
+    setEditorSession({ dir: viewingOctree?.dir ?? null, dirty });
+    return () => setEditorSession({ dir: null, dirty: false });
+  }, [viewingOctree?.dir, dirty]);
+
   const closeOctreeView = useCallback(async () => {
     if (dirty && !await confirmDialog('Octree has unsaved edits. Close anyway and lose them?')) return;
     setViewingOctree(null);
@@ -362,7 +465,7 @@ export default function EditorModule() {
         octree={viewingOctree}
         projectName={project?.meta.name ?? null}
         octreeList={octreeList}
-        onImport={() => void triggerImport()}
+        onImport={() => void pickData('file')}
         onOpenOctree={async (entry) => {
           if (entry.dir === viewingOctree?.dir) return;
           if (dirty && !await confirmDialog('The active cloud has unsaved edits. Switch anyway and lose them?')) return;
@@ -419,6 +522,7 @@ export default function EditorModule() {
         operation={operation}
         onDismissStatus={() => setStatus(null)}
         onDatasetsChanged={refreshList}
+        readOnly={readOnly}
         onReloadActiveOctree={async () => {
           if (!viewingOctree) return;
           // Defence in depth. Editing is blocked while a dataset-mutating
@@ -469,8 +573,9 @@ export default function EditorModule() {
         />
       )}
 
-      {pendingImport && (
+      {pendingImport && !pendingImport.auto && (
         <ImportMappingDialog
+          initialScanner={pendingImport.scannerType}
           fileName={pendingImport.fileName}
           isLas={pendingImport.pointFile === null}
           columns={pendingImport.columns}

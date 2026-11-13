@@ -54,10 +54,19 @@ import type { ColorRamp } from '../components/shell/OctreeShellContext';
  *  spread about as evenly as any sequence can be, so neighbouring ids —
  *  which is what adjacent trees usually get — never land on adjacent
  *  hues. */
-const GOLDEN = 0.6180339887;
+export const GOLDEN = 0.6180339887;
 
-const TREE_SAT = 0.65;
-const TREE_LIGHT = 0.55;
+export const TREE_SAT = 0.65;
+export const TREE_LIGHT = 0.55;
+
+/** The deadwood bands: a base hue and saturation per channel, and how far
+ *  the golden-ratio hop moves within the band. Exported so the point
+ *  shader is generated from the same numbers. */
+export const DEADWOOD_HSL = {
+  standing: { hue: 0.05, sat: 0.8 },
+  laying: { hue: 0.5, sat: 0.7 },
+  jitter: 0.12,
+} as const;
 
 /** The default unassigned/unlabelled grey, matching DEFAULT display
  *  config's unlabeledColor (#787878).
@@ -138,6 +147,31 @@ export function classColor(cls: number): [number, number, number] {
   }
 }
 
+/** The class codes a dataset's source file named
+ *  (`classNames` in its metadata, from the file's Classification
+ *  Lookup), in code order. */
+export function namedClassCodes(names: Record<string, string> | undefined): number[] {
+  if (!names) return [];
+  return Object.keys(names)
+    .map(Number)
+    .filter(c => Number.isInteger(c) && c >= 0 && c <= 255)
+    .sort((a, b) => a - b); // class codes: integers by the filter above
+}
+
+/** Classes the ASPRS palette above colours. */
+const ASPRS_COLOURED = new Set([2, 3, 4, 5, 6, 7, 9]);
+
+/** The class colour for a dataset whose source file named some
+ *  of its classes. A named code the ASPRS palette leaves grey gets a hue
+ *  of its own, in code order, so two named classes never share the grey;
+ *  0 and 1 (never classified, unassigned) stay grey. */
+export function classColorIn(cls: number, named: readonly number[]): [number, number, number] {
+  if (cls < 2 || ASPRS_COLOURED.has(cls)) return classColor(cls);
+  const own = named.filter(c => c >= 2 && !ASPRS_COLOURED.has(c));
+  const i = own.indexOf(cls);
+  return i < 0 ? classColor(cls) : hslToRgb(0.08 + i * GOLDEN, 0.6, 0.55);
+}
+
 /** ASPRS classification palette, 0–1. */
 export function classColor01(cls: number): [number, number, number] {
   const [r, g, b] = classColor(cls);
@@ -151,10 +185,9 @@ export function classColor01(cls: number): [number, number, number] {
  *  the golden-ratio hop WITHIN each band keeps neighbouring instances
  *  distinct without letting either channel wander into the other's. */
 export function deadwoodColor(id: number, channel: 'standing' | 'laying'): [number, number, number] {
-  const jitter = wrapHue(id * GOLDEN) * 0.12;
-  return channel === 'standing'
-    ? hslToRgb(0.05 + jitter, 0.8, TREE_LIGHT)
-    : hslToRgb(0.5 + jitter, 0.7, TREE_LIGHT);
+  const jitter = wrapHue(id * GOLDEN) * DEADWOOD_HSL.jitter;
+  const band = DEADWOOD_HSL[channel];
+  return hslToRgb(band.hue + jitter, band.sat, TREE_LIGHT);
 }
 
 // Colour ramps for the scalar modes. Each is a short list of [r,g,b]

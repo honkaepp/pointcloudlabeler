@@ -1,7 +1,9 @@
-// Auto-segment panel — two automatic seed-segmentation tools that both
-// write straight into octree.bin (and clear the matching patch overrides),
-// surfaced here so their parameter rails don't crowd the editing panels:
+// Auto-segment panel — automatic segmentation tools that all write straight
+// into octree.bin (and clear the matching patch overrides), surfaced here so
+// their parameter rails don't crowd the editing panels:
 //
+//   0. PointCloudLabeler: the forest pass (stems → trees, wood / leaf) → tree_id and
+//      semantic (ForestSection)
 //   1. Tree crowns (CHM watershed) → writes tree_id
 //   2. Laying deadwood (near-ground PCA + DBSCAN) → writes laying_deadwood
 //
@@ -19,6 +21,7 @@ import {
 import { isDeadwoodExtra } from '../../persistence/octreeReader';
 import { onOctreeProgress } from '../../persistence/octreeStore';
 import { confirmDialog } from '../../ui/dialogs';
+import ForestSection from './ForestSection';
 
 export default function SegmentPanel() {
   const { octree, api } = useOctreeShell();
@@ -32,6 +35,7 @@ export default function SegmentPanel() {
           Auto-segmentation needs the desktop build and an open dataset.
         </div>
       )}
+      <ForestSection canRun={canRun} />
       <CrownSection canRun={canRun} />
       <TreeIsolationSection canRun={canRun} />
       <Li2012Section canRun={canRun} />
@@ -399,7 +403,8 @@ function LeafWoodSection({ canRun }: { canRun: boolean }) {
       <div className="mono text-[10px]" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
         Classifies every point wood vs leaf from its local shape: wood is
         linear (branches) or planar (trunk), leaf is scattered. Writes the
-        semantic column. Classify ground first so ground surfaces aren't
+        semantic column: stem (planar wood), branch (linear wood) and leaf.
+        Classify ground first so ground surfaces aren't
         called wood. A clean wood set feeds QSM / biomass.
       </div>
       <Warn>Overwrites the semantic column. You'll be asked to confirm; existing semantic labels (AI / skeleton transfer) are replaced.</Warn>
@@ -478,7 +483,7 @@ function EnableDeadwood() {
 
 // ---------------- building blocks ----------------
 
-function Drawer({ title, sub, defaultOpen, children }: {
+export function Drawer({ title, sub, defaultOpen, children }: {
   title: string; sub: string; defaultOpen?: boolean; children: React.ReactNode;
 }) {
   return (
@@ -492,21 +497,21 @@ function Drawer({ title, sub, defaultOpen, children }: {
   );
 }
 
-function Warn({ children }: { children: React.ReactNode }) {
+export function Warn({ children }: { children: React.ReactNode }) {
   return (
     <div className="mono text-[9.5px] px-1.5 py-1 rounded" style={{ color: '#e0b84a', background: 'rgba(224,184,74,0.10)', border: '1px solid rgba(224,184,74,0.4)', lineHeight: 1.45 }}>
       ⚠ {children}
     </div>
   );
 }
-function Ok({ children }: { children: React.ReactNode }) {
+export function Ok({ children }: { children: React.ReactNode }) {
   return <div className="mono text-[10.5px]" style={{ color: 'var(--accent)' }}>✓ {children}</div>;
 }
-function Err({ children }: { children: React.ReactNode }) {
+export function Err({ children }: { children: React.ReactNode }) {
   return <div className="mono text-[10.5px]" style={{ color: 'var(--danger, #e0506b)', lineHeight: 1.5 }}>{children}</div>;
 }
 
-function RunButton({ busy, disabled, onClick, label, busyLabel, pct, cancelStages }: {
+export function RunButton({ busy, disabled, onClick, label, busyLabel, pct, cancelStages }: {
   busy: boolean; disabled: boolean; onClick: () => void; label: string; busyLabel: string; pct?: number;
   /** The progress stage(s) a Cancel stops. Omitted for a rewrite that
    *  cannot stop half-way (adding columns). */
@@ -553,7 +558,7 @@ function ProgressBar({ pct }: { pct: number }) {
 //
 // `Number`, not `parseFloat`: parseFloat takes a valid PREFIX, so a
 // half-typed "1e" would commit as 1 with the field still reading "1e".
-function Num({ label, unit, value, min, max, step, onChange, hint }: {
+export function Num({ label, unit, value, min, max, step, onChange, hint }: {
   label: string; unit: string; value: number; min: number; max?: number; step: number;
   onChange: (v: number) => void; hint?: string;
 }) {

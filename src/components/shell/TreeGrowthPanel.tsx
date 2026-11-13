@@ -21,6 +21,7 @@ import { useOctreeShell } from './OctreeShellContext';
 import type { TreeMetric } from '../../persistence/octreeReader';
 import { DEFAULT_METRIC_PARAMS } from '../../metrics/params';
 import { loadTreeMetrics } from '../../metrics/loadMetrics';
+import { publishTreeGrowth } from '../../three/treeMetricColors';
 import {
   matchTrees, summarise, vol,
   type Pair, type GrowthResult,
@@ -42,7 +43,7 @@ const METRICS_PARAMS = DEFAULT_METRIC_PARAMS;
 // --- Panel --------------------------------------------------------------
 
 export default function TreeGrowthPanel() {
-  const { octree, octreeList, api, setGrowthSummary } = useOctreeShell();
+  const { octree, octreeList, api, setGrowthSummary, setDisplay } = useOctreeShell();
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
   const canRun = !!api && !!octree && !!desktop?.octreeTreeMetrics;
   const candidates = octreeList.filter(e => e.dir !== octree?.dir);
@@ -121,6 +122,12 @@ export default function TreeGrowthPanel() {
   }, []);
 
   const summary = useMemo(() => result ? summarise(result, formFactor) : null, [result, formFactor]);
+
+  // The pairs to the viewer, so the trees can be coloured by
+  // their growth (Display → Tree metrics → Δ DBH / Δ height)
+  useEffect(() => {
+    if (octree?.dir) publishTreeGrowth(octree.dir, result?.matches ?? null);
+  }, [result, octree?.dir]);
 
   // Hand the growth summary to the Report panel whenever the displayed
   // numbers change — a fresh compute, or a form-factor / interval tweak on
@@ -268,6 +275,16 @@ export default function TreeGrowthPanel() {
           </div>
 
           <GrowthMap result={result} />
+          {/* The same growth on the trees themselves */}
+          <div className="flex gap-1">
+            {([['ddbh', 'Colour trees by Δ DBH'], ['dheight', 'by Δ height']] as const).map(([m, label]) => (
+              <button key={m} type="button" className="btn !h-7 mono text-[10.5px] !px-2"
+                onClick={() => setDisplay({ colorMode: 'tree_metric', treeMetric: m, ramp: 'rdylgn' })}
+                title="Colour every matched tree in the viewport by its growth since the reference epoch (red: shrank, green: grew); unmatched trees are drawn as not measured">
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="mono text-[8.5px]" style={{ color: 'var(--text-mute)', lineHeight: 1.4 }}>
             <span style={{ color: '#67d391' }}>●</span> grew · <span style={{ color: '#e0817b' }}>●</span> shrank · <span style={{ color: '#e0817b' }}>✕</span> harvested · <span style={{ color: '#78c8dc' }}>+</span> new. Dot size ∝ current DBH.
           </div>

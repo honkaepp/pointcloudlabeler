@@ -767,7 +767,7 @@ mod tests {
     }
 
     fn qsm(trees: Vec<TreeQsm>) -> QsmResult {
-        QsmResult { trees, total_stem_volume: 0.0, total_stem_volume_std: 0.0, qsm_path: String::new(), slice_height: 0.5, min_points_per_slice: 10 }
+        QsmResult { trees, total_stem_volume: 0.0, total_stem_volume_std: 0.0, qsm_path: String::new(), slice_height: 0.5, min_points_per_slice: 10, leaf_points: 0 }
     }
 
     const OPTS: SimulateOptions = SimulateOptions {

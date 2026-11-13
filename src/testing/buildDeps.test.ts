@@ -20,8 +20,9 @@
 import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = new URL('../..', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const read = (p: string) => readFileSync(join(ROOT, p), 'utf8');
 
 /** Every TypeScript file `tsc` compiles, TESTS INCLUDED — they are what

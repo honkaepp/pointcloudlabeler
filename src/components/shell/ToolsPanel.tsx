@@ -192,14 +192,15 @@ export default function ToolsPanel() {
         <Section label="Semantic">
           <div className="grid grid-cols-3 gap-1.5">
             <SemBtn color="#af6e3c" label="Stem" disabled={!ready || !hasSel} onClick={() => api?.apply({ semantic: 1 })} />
-            <SemBtn color="#46b45a" label="Branch" disabled={!ready || !hasSel} onClick={() => api?.apply({ semantic: 2 })} />
+            <SemBtn color="#e1a55f" label="Branch" disabled={!ready || !hasSel} onClick={() => api?.apply({ semantic: 2 })} />
+            <SemBtn color="#46b45a" label="Leaf" disabled={!ready || !hasSel} onClick={() => api?.apply({ semantic: 4 })} />
             <SemBtn color="#888" label="Unlabel" disabled={!ready || !hasSel} onClick={() => api?.apply({ semantic: 3 })} />
           </div>
           <ClearSelButton ready={ready} hasSel={hasSel} count={selectedCount} onClear={() => api?.clearSelection()} />
           <ResetColumnButton
             ready={ready}
             label="Clear every semantic label"
-            confirmMsg="Clear EVERY point's semantic label (stem / branch) across the whole cloud? Undoable edits are discarded and the change is saved immediately."
+            confirmMsg="Clear EVERY point's semantic label (stem / branch / leaf) across the whole cloud? Undoable edits are discarded and the change is saved immediately."
             onReset={() => api?.resetAttribute('semantic')}
           />
           <Hint>Lasso points → paint <b>Stem</b> / <b>Branch</b> · <b>Unlabel</b> removes the label. Works on any visible tree.</Hint>

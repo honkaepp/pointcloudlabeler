@@ -33,15 +33,22 @@ describe('heights above ground in the renderer', () => {
   });
 
   it('the planner grows every node’s sphere by the relief, in the plan and in the prefetch', () => {
-    expect(view).toMatch(/sphere\.radius = r \+ shared\.relief;/);
-    expect(view).toMatch(/sphere\.radius = idx\.radius\[rec\] \+ shared\.relief;/);
+    // (and by Tree Review's pull-apart reach — treeShift.ts)
+    expect(view).toMatch(/sphere\.radius = r \+ shared\.relief \+ shared\.shiftReach;/);
+    expect(view).toMatch(/sphere\.radius = idx\.radius\[rec\] \+ shared\.relief \+ shared\.shiftReach;/);
   });
 
   it('every CPU-side projection tests the point where it is drawn, and returns the stored one', () => {
-    // Seven loops read a point; each projects its drawn height.
-    expect(view.match(/const dy = drawnY\(px, py, pz\);/g)?.length).toBe(7);
+    // Seven loops read a point; each projects its drawn position — the
+    // drawn height, and the offset of a tree Tree Review draws aside, by
+    // the point's current id (treeShift.ts).
+    expect(view.match(/const d = drawnAt\(px, py, pz, [\w.]+(?:\[\w+\][\w.]*)*\[\w+\]\);/g)?.length).toBe(7);
+    expect(view).toMatch(/drawnPosition\(DRAWN, sx, sy, sz, id, drawnY\(sx, sy, sz\), shiftLookupRef\.current\)/);
     expect(view, 'a projection still uses the stored height').not.toMatch(/\.set\(px, py, pz, 1\)/);
-    expect(view.match(/\.set\(px, dy, pz, 1\)/g)?.length).toBe(13);
+    expect(view, 'a projection still uses the stored x and z').not.toMatch(/\.set\(px, dy, pz, 1\)/);
+    expect(view.match(/\.set\(d\[0\], d\[1\], d\[2\], 1\)/g)?.length).toBe(13);
+    // The vertex shader moves the same point by the same offset.
+    expect(view).toMatch(/if \(uFlatten > 0\.5\) pos\.y -= dtmShift\(pos\.xz\);\s*if \(uShiftOn > 0\.5 && aShift > 0\.5\) pos \+= treeShift\(aShift\);/);
     // …and what a pick hands back is the stored point.
     expect(view).toMatch(/best = \[px, py, pz\]/);
     expect(view).toMatch(/return t \? sy - t\.shift\(sx \+ offDraw\[0\], offDraw\[1\] - sz\) : sy;/);
@@ -59,7 +66,7 @@ describe('heights above ground in the renderer', () => {
     const raster = stripComments(read('src/three/RasterLayers.tsx'));
     expect(raster).toMatch(/if \(terrain && !Number\.isNaN\(v\)\) sceneY -= terrain\.shift\(wx, wy\);/);
     const overlay = stripComments(read('src/three/OverlayCloud.tsx'));
-    expect(overlay).toMatch(/ps\[i \* 3 \+ 1\] -= terrain\.shift\(x \+ off\[0\], off\[1\] - z\);/);
+    expect(overlay).toMatch(/const g = terrain\.shift\(x \+ off\[0\], off\[1\] - z\);\s*ps\[i \* 3 \+ 1\] -= g;/);
     expect(overlay, 'a secondary cloud with no ground of its own is not flattened by the primary’s').toMatch(/own\.terrain \?\? fallbackTerrain/);
   });
 

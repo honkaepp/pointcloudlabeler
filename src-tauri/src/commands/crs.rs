@@ -117,6 +117,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+pub mod wkt; // WKT for a LAS 1.4 export's coordinate system
+
 /// One entry in the curated CRS table: an EPSG code, a short label for
 /// the UI picker, and the proj4 string proj4rs consumes directly.
 /// `crs_list` returns this table verbatim so the front end never
@@ -359,7 +361,83 @@ fn proj_string_for_epsg(code: u32) -> Option<String> {
 /// names a CRS this app can actually use; recording an unresolvable one
 /// would put a coordinate system on a dataset that no later transform
 /// could honour.
+///
+/// In a compound system (`COMPD_CS`, `COMPOUNDCRS`) only the
+/// horizontal part is read. The vertical part comes last, so the last
+/// clause of the whole text is the vertical code — N2000 would be
+/// recorded as the dataset's horizontal system. See
+/// `vertical_epsg_from_wkt`.
 pub fn epsg_from_wkt(wkt: &str) -> Option<u32> {
+    let wkt = if wkt_clause(wkt, &["COMPD_CS", "COMPOUNDCRS"]).is_some() {
+        wkt_clause(wkt, &["PROJCS", "PROJCRS", "PROJECTEDCRS", "GEOGCS", "GEOGCRS", "GEOGRAPHICCRS", "GEODCRS", "GEODETICCRS"])?
+    } else {
+        wkt
+    };
+    last_epsg_code(wkt).filter(|&c| proj_string_for_epsg(c).is_some())
+}
+
+/// The EPSG code of the vertical part of a WKT coordinate
+/// system (`VERT_CS`, `VERTCRS`), read as `epsg_from_wkt` reads the
+/// horizontal one.
+pub fn vertical_epsg_from_wkt(wkt: &str) -> Option<u32> {
+    last_epsg_code(wkt_clause(wkt, &["VERT_CS", "VERTCRS", "VERTICALCRS"])?)
+        .filter(|&c| proj_string_for_epsg(c).is_some())
+}
+
+/// The EPSG unit code of a vertical CRS's heights — 9001 metre,
+/// 9002 foot, 9003 US survey foot — from its `+vunits`, as a GeoTIFF
+/// VerticalUnitsGeoKey would state it.
+pub fn vertical_unit_code(code: u32) -> Option<u16> {
+    let proj = proj_string_for_epsg(code)?;
+    match proj.split_whitespace().find_map(|t| t.strip_prefix("+vunits="))? {
+        "m" => Some(9001),
+        "ft" => Some(9002),
+        "us-ft" => Some(9003),
+        _ => None,
+    }
+}
+
+/// The first `KEYWORD[...]` clause of `wkt` for any of
+/// `keywords`, brackets balanced and quoted names skipped. A keyword
+/// counts only as a whole word: `GEOGCRS` is not found inside
+/// `BASEGEOGCRS`.
+fn wkt_clause<'a>(wkt: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    let bytes = wkt.as_bytes();
+    let start = keywords
+        .iter()
+        .filter_map(|kw| {
+            let mut from = 0;
+            while let Some(rel) = wkt[from..].find(kw) {
+                let at = from + rel;
+                from = at + kw.len();
+                let whole = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+                let opens = matches!(wkt[from..].trim_start().as_bytes().first(), Some(b'[') | Some(b'('));
+                if whole && opens {
+                    return Some(at);
+                }
+            }
+            None
+        })
+        .min()?;
+    let (mut depth, mut quoted) = (0i32, false);
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        match b {
+            b'"' => quoted = !quoted,
+            b'[' | b'(' if !quoted => depth += 1,
+            b']' | b')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&wkt[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The code of the last EPSG `AUTHORITY` / `ID` clause in `wkt`.
+fn last_epsg_code(wkt: &str) -> Option<u32> {
     let mut found: Option<u32> = None;
     let bytes = wkt.as_bytes();
     for (kw, wkt2) in [("AUTHORITY", false), ("ID", true)] {
@@ -387,7 +465,7 @@ pub fn epsg_from_wkt(wkt: &str) -> Option<u32> {
             }
         }
     }
-    found.filter(|&c| proj_string_for_epsg(c).is_some())
+    found
 }
 
 /// EPSG unit-of-measure code for a projected CRS's linear unit, for the
@@ -1142,6 +1220,20 @@ mod tests {
 
         let wkt2 = r#"PROJCRS["ETRS89 / TM35FIN(E,N)",BASEGEOGCRS["ETRS89",ID["EPSG",4258]],ID["EPSG",3067]]"#;
         assert_eq!(epsg_from_wkt(wkt2), Some(3067));
+        assert_eq!(vertical_epsg_from_wkt(wkt2), None);
+    }
+
+    /// A compound system's last code is its vertical part (or
+    /// the compound's own code), never the horizontal system.
+    #[test]
+    fn a_compound_wkt_is_read_as_its_two_parts() {
+        let wkt1 = r#"COMPD_CS["ETRS89 / TM35FIN(E,N) + N2000 height",PROJCS["ETRS89 / TM35FIN(E,N)",GEOGCS["ETRS89",AUTHORITY["EPSG","4258"]],AUTHORITY["EPSG","3067"]],VERT_CS["N2000 height",VERT_DATUM["N2000",2005,AUTHORITY["EPSG","1030"]],AUTHORITY["EPSG","3900"]],AUTHORITY["EPSG","5048"]]"#;
+        assert_eq!(epsg_from_wkt(wkt1), Some(3067));
+        assert_eq!(vertical_epsg_from_wkt(wkt1), Some(3900));
+
+        let wkt2 = r#"COMPOUNDCRS["ETRS89 / TM35FIN(E,N) + N2000 height",PROJCRS["ETRS89 / TM35FIN(E,N)",BASEGEOGCRS["ETRS89",ID["EPSG",4258]],ID["EPSG",3067]],VERTCRS["N2000 height",VDATUM["N2000"],ID["EPSG",3900]]]"#;
+        assert_eq!(epsg_from_wkt(wkt2), Some(3067));
+        assert_eq!(vertical_epsg_from_wkt(wkt2), Some(3900));
     }
 
     /// A number scraped out of a string is a guess until it is confirmed

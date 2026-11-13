@@ -24,8 +24,7 @@ const panel = (id: PanelId): MenuTarget => ({ kind: 'panel', id });
 
 /** Menu item id → what it does. Keys are the `.id("…")` strings in menu.rs. */
 export const MENU_TARGETS: Readonly<Record<string, MenuTarget>> = {
-  // File
-  'open-cloud': action('file.import'),
+  // File (Open Data… is App's — the data door — not here)
   'save': action('file.save'),
   'export': action('file.export'),
   // Edit
@@ -42,6 +41,7 @@ export const MENU_TARGETS: Readonly<Record<string, MenuTarget>> = {
   'view-front': action('view.front'),
   'view-side': action('view.side'),
   'view-edl': action('view.edl'),
+  'view-ortho': action('view.ortho'),
   'palette': action('view.palette'),
   'panel-tools': panel('tools'),
   'panel-display': panel('display'),
@@ -49,9 +49,14 @@ export const MENU_TARGETS: Readonly<Record<string, MenuTarget>> = {
   'panel-layers': panel('layers'),
   'panel-history': panel('history'),
   // Tools
+  'panel-survey': panel('survey'),
+  'panel-height': panel('height'),
+  'panel-viewtools': panel('viewtools'),
   'panel-ground': panel('ground'),
   'panel-segment': panel('segment'),
   'panel-review': panel('review'),
+  'panel-branches': panel('branches'),
+  'panel-stems': panel('stems'),
   'panel-qc': panel('qc'),
   'panel-pointqc': panel('pointqc'),
   'panel-tst': panel('tst'),
@@ -66,7 +71,7 @@ export const MENU_TARGETS: Readonly<Record<string, MenuTarget>> = {
 };
 
 /** Ids App.tsx dispatches itself; the editor leaves them alone. */
-export const APP_MENU_IDS: readonly string[] = ['project-new', 'project-open', 'project-close'];
+export const APP_MENU_IDS: readonly string[] = ['project-new', 'project-open', 'project-close', 'project-rename', 'open-data', 'compare-window'];
 
 /** The target of a bridge event, or null when the event is not a menu
  *  click the editor handles (an App id, a dropped file, project:changed,

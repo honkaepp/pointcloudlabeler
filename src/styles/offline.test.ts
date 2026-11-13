@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** PointCloudLabeler is a desktop application for people working in a forest. It has
  *  to start and run with no network at all, and it must not call a third
@@ -20,7 +21,7 @@ import { join } from 'node:path';
  *  gone, and persistence/noNetwork.test.ts holds the rule for the
  *  application code the way this file holds it for the document. */
 
-const ROOT = new URL('../..', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
 function walk(dir: string, ext: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {

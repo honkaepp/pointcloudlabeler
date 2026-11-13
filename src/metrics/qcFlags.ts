@@ -25,7 +25,9 @@ export type FlagCode =
   | 'few-points'
   | 'qsm-coverage'
   | 'qsm-completeness'
-  | 'qsm-volume';
+  | 'qsm-volume'
+  | 'hd-curve'
+  | 'qsm-note';
 
 /** Short label per check, for the panel's filter chips. */
 export const FLAG_LABEL: Record<FlagCode, string> = {
@@ -39,6 +41,8 @@ export const FLAG_LABEL: Record<FlagCode, string> = {
   'qsm-coverage': 'QSM coverage',
   'qsm-completeness': 'QSM gaps',
   'qsm-volume': 'QSM volume',
+  'hd-curve': 'height–DBH curve',
+  'qsm-note': 'QSM log',
 };
 
 export interface Flag {
@@ -116,6 +120,49 @@ function excessText(e: Excess): string {
   return e.z !== null ? `${e.z.toFixed(1)}σ above` : `${e.ratio.toFixed(1)}×`;
 }
 
+/** The plot's own height–DBH curve — Näslund's
+ *  h = 1.3 + d² / (b0 + b1·d)², d in cm — fitted to its trees by least
+ *  squares on the linear form d / √(h − 1.3) = b0 + b1·d, then once more
+ *  without the residuals beyond 2.5 robust σ (the trees the check is
+ *  looking for must not bend the curve). Null under 15 trees. A curve of
+ *  the plot itself needs no species or region: it is what the rest of the
+ *  stand does. Same as ops/qc.rs's hd_curve. */
+export function hdCurve(metrics: TreeMetric[]): [number, number] | null {
+  const pairs: [number, number][] = metrics
+    .filter(t => Number.isFinite(t.dbh) && t.dbh > 0 && Number.isFinite(t.height) && t.height > 1.8)
+    .map(t => { const d = t.dbh * 100; return [d, d / Math.sqrt(t.height - 1.3)]; });
+  if (pairs.length < 15) return null;
+  const fit = (p: [number, number][]): [number, number] | null => {
+    const n = p.length;
+    const md = p.reduce((a, q) => a + q[0], 0) / n;
+    const my = p.reduce((a, q) => a + q[1], 0) / n;
+    let sxx = 0, sxy = 0;
+    for (const q of p) { sxx += (q[0] - md) * (q[0] - md); sxy += (q[0] - md) * (q[1] - my); }
+    if (sxx <= 0) return null;
+    const b1 = sxy / sxx;
+    return [my - b1 * md, b1];
+  };
+  const first = fit(pairs);
+  if (!first) return null;
+  const res = pairs.map(([d, y]) => y - (first[0] + first[1] * d));
+  const rMed = median(res);
+  const rSig = robustSigma(mad(res, rMed));
+  const kept = rSig > 0 ? pairs.filter((_, i) => Math.abs(res[i] - rMed) <= 2.5 * rSig) : pairs;
+  if (kept.length < 10) return null;
+  const c = fit(kept);
+  if (!c || c[0] <= 0) return null;
+  return c;
+}
+
+/** The DBH (cm) the curve gives a tree of height `h`, where defined. */
+export function hdExpected(curve: [number, number], h: number): number | null {
+  if (!(h > 1.8)) return null;
+  const s = Math.sqrt(h - 1.3);
+  const den = 1 - curve[1] * s;
+  if (den <= 0.05) return null;
+  return curve[0] * s / den;
+}
+
 export function computeQcFlags(
   metrics: TreeMetric[] | null,
   qsm: Map<number, TreeQsm> | null,
@@ -144,6 +191,8 @@ export function computeQcFlags(
     vMed = median(vols);
     vSig = robustSigma(mad(vols, vMed));
   }
+
+  const curve = hdCurve(metrics);
 
   for (const t of metrics) {
     const bbox = bboxes?.get(t.treeId);
@@ -229,9 +278,29 @@ export function computeQcFlags(
       });
     }
 
+    // (10) PointCloudLabeler: a diameter far off the plot's height–DBH curve.
+    if (curve && Number.isFinite(t.dbh) && t.dbh > 0 && Number.isFinite(t.height)) {
+      const dExp = hdExpected(curve, t.height);
+      if (dExp !== null) {
+        const d = t.dbh * 100;
+        const ratio = d / dExp;
+        if (ratio > 1.6 || ratio < 0.6) {
+          out.push({
+            treeId: t.treeId, code: 'hd-curve', severity: 'warning', bbox: box,
+            reason: `DBH ${d.toFixed(1)} cm is ${ratio.toFixed(2)}× what the plot's height–DBH curve gives a ${t.height.toFixed(1)} m tree (${dExp.toFixed(1)} cm)`,
+            hint: 'A diameter far off the curve the rest of the stand follows: the stem fit caught a branch, a neighbour or a buttress, or the height is wrong (a broken top, a crown merged in). Check the stem by eye.',
+          });
+        }
+      }
+    }
+
     // --- QSM-derived checks (when a QSM cache exists) ---
     const q = qsm?.get(t.treeId);
     if (q) {
+      // (11) PointCloudLabeler: what the QSM fit itself warns about.
+      for (const n of (q.notes ?? []).filter(n => n.severity === 'warning')) {
+        out.push({ treeId: t.treeId, code: 'qsm-note', severity: 'warning', bbox: box, reason: n.text, hint: n.hint });
+      }
       // (7) Low angular coverage — stem seen from one side only.
       if (q.confidence < 0.50) {
         out.push({

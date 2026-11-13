@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
-  serialize, deserialize, applyToNode, nodeKey, savePatches,
-  PatchStore, type PatchEntry, type NodeKey,
+  serialize, deserialize, deserializePacked, applyToNode, nodeKey, savePatches,
+  NodePatches, PatchStore, type PatchEntry, type NodeKey,
 } from './octreePatches';
 
 const HEADER = 8;
@@ -360,7 +360,7 @@ describe('PatchStore', () => {
     const s = new PatchStore();
     s.applyEdits([edit(5, { treeId: 3 })]);
     s.applyEdits([edit(5, { semantic: 1 })]);
-    const list = s.map.get(K)!;
+    const list = s.entries(K)!;
     expect(list).toHaveLength(1);
     expect(list[0]).toEqual(entry({ pointIdx: 5, treeId: 3, semantic: 1 }));
   });
@@ -368,7 +368,7 @@ describe('PatchStore', () => {
   it('drops an entry that no longer changes anything', () => {
     const s = new PatchStore();
     s.applyEdits([edit(5, { treeId: 3 })]);
-    expect(s.map.get(K)).toHaveLength(1);
+    expect(s.entries(K)).toHaveLength(1);
     s.applyEdits([edit(5, { treeId: -1 })]);
     expect(s.map.has(K)).toBe(false);
   });
@@ -382,25 +382,25 @@ describe('PatchStore', () => {
     // Point 40 moved slots; a later edit to it must find it, not create
     // a second entry or land on 20.
     s.applyEdits([edit(40, { semantic: 2 })]);
-    expect(s.map.get(K)).toHaveLength(3);
-    const e40 = s.map.get(K)!.find(e => e.pointIdx === 40)!;
+    expect(s.entries(K)).toHaveLength(3);
+    const e40 = s.entries(K)!.find(e => e.pointIdx === 40)!;
     expect(e40).toEqual(entry({ pointIdx: 40, treeId: 40, semantic: 2 }));
-    const e20 = s.map.get(K)!.find(e => e.pointIdx === 20)!;
+    const e20 = s.entries(K)!.find(e => e.pointIdx === 20)!;
     expect(e20.semantic).toBe(0);
   });
 
   it('undoes a whole brush stroke in one step, and redoes it', () => {
     const s = new PatchStore();
     s.applyEdits([edit(1, { treeId: 7 }), edit(2, { treeId: 7 }), edit(3, { treeId: 7 })]);
-    expect(s.map.get(K)).toHaveLength(3);
+    expect(s.entries(K)).toHaveLength(3);
 
     expect(s.undo().ok).toBe(true);
     expect(s.map.has(K)).toBe(false);
     expect(indexIsConsistent(s)).toBe(true);
 
     expect(s.redo().ok).toBe(true);
-    expect(s.map.get(K)).toHaveLength(3);
-    expect(new Set(s.map.get(K)!.map(e => e.pointIdx))).toEqual(new Set([1, 2, 3]));
+    expect(s.entries(K)).toHaveLength(3);
+    expect(new Set(s.entries(K)!.map(e => e.pointIdx))).toEqual(new Set([1, 2, 3]));
   });
 
   it('undo restores the previous value, not just "no patch"', () => {
@@ -408,7 +408,7 @@ describe('PatchStore', () => {
     s.applyEdits([edit(1, { treeId: 7 })]);
     s.applyEdits([edit(1, { treeId: 9 })]);
     s.undo();
-    expect(s.map.get(K)![0].treeId).toBe(7);
+    expect(s.entries(K)![0].treeId).toBe(7);
     s.undo();
     expect(s.map.has(K)).toBe(false);
   });
@@ -441,12 +441,12 @@ describe('PatchStore', () => {
   it('rewinds a batch that touched one point twice', () => {
     const s = new PatchStore();
     s.applyEdits([edit(5, { treeId: 3 }), edit(5, { semantic: 1 })]);
-    expect(s.map.get(K)).toHaveLength(1);
+    expect(s.entries(K)).toHaveLength(1);
     s.undo();
     expect(s.map.has(K)).toBe(false);
     expect(indexIsConsistent(s)).toBe(true);
     s.redo();
-    expect(s.map.get(K)![0]).toEqual(entry({ pointIdx: 5, treeId: 3, semantic: 1 }));
+    expect(s.entries(K)![0]).toEqual(entry({ pointIdx: 5, treeId: 3, semantic: 1 }));
   });
 
   it('tracks dirtiness across load, edit and save', () => {
@@ -474,7 +474,7 @@ describe('PatchStore', () => {
     s.applyEdits([edit(1, { treeId: 7 })]);
     s.loadFrom(new Map([[nodeKey(9, 9), [entry({ pointIdx: 2, treeId: 4 })]]]));
     expect(s.map.has(K)).toBe(false);
-    expect(s.map.get(nodeKey(9, 9))).toHaveLength(1);
+    expect(s.entries(nodeKey(9, 9))).toHaveLength(1);
     expect(s.dirty).toBe(false);
     expect(s.undo().ok).toBe(false);
     expect(s.takeTouched()).toBe('all');
@@ -512,7 +512,7 @@ describe('PatchStore', () => {
     it('strips one column and drops the entries left saying nothing', () => {
       const s = loaded();
       expect(s.clearAttribute('tree_id')).toBe(2);
-      const list = s.map.get(K)!;
+      const list = s.entries(K)!;
       // Point 1 carried only a tree id, so its entry is gone.
       expect(list.map(e => e.pointIdx).sort((a, b) => a - b)).toEqual([2, 3, 4, 5]);
       expect(list.every(e => e.treeId === -1)).toBe(true);
@@ -525,7 +525,7 @@ describe('PatchStore', () => {
       const s = loaded();
       s.clearAttribute('tree_id');
       s.applyEdits([edit(5, { semantic: 1 })]);
-      const e5 = s.map.get(K)!.filter(e => e.pointIdx === 5);
+      const e5 = s.entries(K)!.filter(e => e.pointIdx === 5);
       expect(e5).toHaveLength(1);
       expect(e5[0].standingDeadwood).toBe(6);
       expect(indexIsConsistent(s)).toBe(true);
@@ -553,5 +553,93 @@ describe('PatchStore', () => {
       expect(s.undo().ok).toBe(false);
       expect(s.dirty).toBe(true);
     });
+  });
+});
+
+// The packed store (NodePatches) and its bulk path.
+describe('packed patches', () => {
+  const K = nodeKey(2, 7);
+
+  it('decode packed exactly what deserialize decodes, sorted, a repeated point keeping its last record', () => {
+    const src = new Map<NodeKey, PatchEntry[]>([
+      [K, [entry({ pointIdx: 9, treeId: 1 }), entry({ pointIdx: 3, semantic: 2 }), entry({ pointIdx: 9, treeId: 5, deleted: 1 })]],
+      [nodeKey(0, 1), [entry({ pointIdx: 0, standingDeadwood: 4, layingDeadwood: 0 })]],
+    ]);
+    const packed = deserializePacked(serialize(src).buffer as ArrayBuffer);
+    expect(packed.get(K)!.toEntries()).toEqual([entry({ pointIdx: 3, semantic: 2 }), entry({ pointIdx: 9, treeId: 5, deleted: 1 })]);
+    expect(packed.get(nodeKey(0, 1))!.toEntries()).toEqual(src.get(nodeKey(0, 1)));
+    // And a v1 file the same way.
+    const v1 = v1Buffer([{ tile: 2, record: 7, point: 4, treeId: 8, semantic: 1, deleted: 0 }]);
+    expect(deserializePacked(v1).get(K)!.toEntries()).toEqual(deserialize(v1).get(K));
+    expect(deserializePacked(new ArrayBuffer(0)).size).toBe(0);
+    expect(() => deserializePacked(new ArrayBuffer(5))).toThrow(/too short/);
+  });
+
+  it('save the same bytes as entry lists', () => {
+    const list = [entry({ pointIdx: 1, treeId: 3 }), entry({ pointIdx: 6, deleted: 2, layingDeadwood: 9 })];
+    const a = serialize(new Map([[K, list]]));
+    const b = serialize(new Map([[K, NodePatches.fromEntries(list)]]));
+    expect(b).toEqual(a);
+  });
+
+  it('apply to a node as the entry lists do', () => {
+    const list = [entry({ pointIdx: 0, treeId: 4, semantic: 3 }), entry({ pointIdx: 2, deleted: 1, standingDeadwood: 6 })];
+    const run = (p: NodePatches | PatchEntry[]) => {
+      const t = new Int32Array([1, 1, 1]), sem = new Uint8Array([2, 2, 2]), del = new Uint8Array(3);
+      const pos = new Float32Array(9).fill(1), sd = new Int32Array(3);
+      applyToNode(t, sem, del, pos, pos.slice(), p, sd, null);
+      return [Array.from(t), Array.from(sem), Array.from(del), Array.from(pos).map(String), Array.from(sd)];
+    };
+    expect(run(NodePatches.fromEntries(list))).toEqual(run(list));
+  });
+
+  it('apply one action to many points, sorted and each once, and undo it to the exact state before', () => {
+    const s = new PatchStore();
+    s.loadFrom(new Map([[K, [entry({ pointIdx: 2, semantic: 1 }), entry({ pointIdx: 5, treeId: 9 }), entry({ pointIdx: 50, deleted: 1 })]]]));
+    const before = s.entries(K);
+    const n = s.applyAction([[K, [7, 2, 5, 5, 3]], [nodeKey(0, 0), []]], { treeId: 11 }, 'meta');
+    expect(n).toBe(4);
+    const after = [
+      entry({ pointIdx: 2, treeId: 11, semantic: 1 }), entry({ pointIdx: 3, treeId: 11 }),
+      entry({ pointIdx: 5, treeId: 11 }), entry({ pointIdx: 7, treeId: 11 }), entry({ pointIdx: 50, deleted: 1 }),
+    ];
+    expect(s.entries(K)).toEqual(after);
+    expect(s.map.has(nodeKey(0, 0))).toBe(false);
+    expect(s.undo()).toEqual({ ok: true, meta: 'meta' });
+    expect(s.entries(K)).toEqual(before);
+    expect(s.redo()).toEqual({ ok: true, meta: 'meta' });
+    expect(s.entries(K)).toEqual(after);
+  });
+
+  it('load packed nodes as copies, without going through entry objects', () => {
+    const packed = NodePatches.fromEntries([entry({ pointIdx: 4, treeId: 2 }), entry({ pointIdx: 1, deleted: 1 })]);
+    const s = new PatchStore();
+    s.loadFrom(new Map([[K, packed]]));
+    s.applyAction([[K, [4]]], { treeId: 3 });
+    // The caller's node is untouched.
+    expect(packed.toEntries()).toEqual([entry({ pointIdx: 1, deleted: 1 }), entry({ pointIdx: 4, treeId: 2 })]);
+    expect(s.entries(K)).toEqual([entry({ pointIdx: 1, deleted: 1 }), entry({ pointIdx: 4, treeId: 3 })]);
+  });
+
+  it('drop the node when an action leaves nothing, and bring it back on undo', () => {
+    const s = new PatchStore();
+    s.loadFrom(new Map([[K, [entry({ pointIdx: 1, treeId: 3 })]]]));
+    s.applyAction([[K, [1]]], { treeId: -1 });
+    expect(s.map.has(K)).toBe(false);
+    s.undo();
+    expect(s.entries(K)).toEqual([entry({ pointIdx: 1, treeId: 3 })]);
+  });
+
+  it('keep a million-point assignment and its undo in typed arrays', () => {
+    const s = new PatchStore();
+    const idx = Array.from({ length: 1_000_000 }, (_, i) => i);
+    s.applyAction([[K, idx]], { treeId: 5 });
+    const node = s.map.get(K)!;
+    expect(node.count).toBe(1_000_000);
+    expect(node.treeId).toBeInstanceOf(Int32Array);
+    expect(node.indexOf(999_999)).toBe(999_999);
+    expect(node.indexOf(1_000_000)).toBe(-1);
+    s.undo();
+    expect(s.map.has(K)).toBe(false);
   });
 });

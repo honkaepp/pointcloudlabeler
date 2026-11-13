@@ -75,6 +75,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
+        // Which window holds which dataset (commands/compare_window.rs).
+        .manage(commands::compare_window::DatasetClaims::default())
         .setup(|app| {
             // Build the native menu once at startup. project:* commands rebuild
             // it whenever state changes so File/Recent stay in sync.
@@ -85,6 +87,8 @@ pub fn run() {
                 crash::watch_webview(&main);
                 // …and what every process holds, over time, to memory.log.
                 crash::start_memory_watch(main.clone());
+                // The second window closes with the editor.
+                commands::compare_window::watch_main(&main);
             }
             // Re-apply the geodetic data folder (NTv2 datum-shift grids) from
             // the settings file before anything can transform a coordinate. The
@@ -98,6 +102,9 @@ pub fn run() {
             Ok(())
         })
         .on_menu_event(|app, event| menu::handle_event(app, event))
+        // A dropped file or folder is granted and classified, then routed
+        // by the renderer — see commands/dataopen.rs.
+        .on_webview_event(commands::dataopen::on_webview_event)
         .invoke_handler(tauri::generate_handler![
             // file dialogs — in Rust so the grant registry learns what
             // the user chose; see fsgrant.rs
@@ -126,6 +133,9 @@ pub fn run() {
             project::project_save_meta,
             project::project_recent,
             project::project_remove_recent,
+            // Rename Project… — see commands/project_rename.rs.
+            commands::project_rename::project_rename,
+            commands::project_rename::project_rename_check,
             // cloud io
             cloud::cloud_write_open,
             cloud::file_write_open,
@@ -144,6 +154,10 @@ pub fn run() {
             pointfile::pointfile_probe,
             octree::octree_list,
             octree::octree_read_meta,
+            // metadata and the raw hierarchy, without the JSON
+            octree::hierarchy::octree_read_metadata,
+            octree::hierarchy::octree_read_hierarchy,
+            octree::octree_max_tree_id,
             octree::octree_read_block,
             octree::octree_read_block_columns,
             octree::octree_remove_dataset,
@@ -163,6 +177,8 @@ pub fn run() {
             octree::octree_write_treemap,
             octree::octree_read_review,
             octree::octree_write_review,
+            octree::octree_read_branches,
+            octree::octree_write_branches,
             octree::octree_read_species,
             octree::octree_write_species,
             octree::octree_read_plot,
@@ -221,11 +237,45 @@ pub fn run() {
             octree::octree_m3c2,
             octree::octree_segment_deadwood,
             octree::octree_leaf_wood,
+            // the forest pass and its reviews — see commands/octree/forest.rs
+            octree::octree_segment_forest,
+            octree::octree_forest_seeds,
+            octree::octree_forest_save_seeds,
+            octree::octree_forest_file,
+            octree::octree_forest_save_review,
+            octree::octree_forest_branch_points,
+            // .qsm / .qsf files and QSM tubes — see commands/qsmfile.rs
+            commands::qsmfile::qsm_export_files,
+            commands::qsmfile::qsm_import_file,
+            // run outputs for the Layers panel — see commands/outputs.rs
+            commands::outputs::project_files,
             octree::octree_tree_metrics,
             octree::octree_fit_stems,
             octree::octree_read_stems,
             octree::octree_tree_qsm,
             octree::octree_read_qsm,
+            // One door for data (what a file is; archives unpacked) — see
+            // commands/dataopen.rs.
+            commands::dataopen::data_classify,
+            commands::dataopen::data_extract,
+            // A second window for another tree or cloud — see
+            // commands/compare_window.rs.
+            commands::compare_window::compare_window_open,
+            commands::compare_window::compare_window_arrange,
+            commands::compare_window::compare_window_is_open,
+            commands::compare_window::compare_window_close,
+            commands::compare_window::window_claim_dataset,
+            commands::compare_window::window_release_dataset,
+            // Survey analyses and meshes — see commands/octree/survey.rs
+            // and commands/octree/mesh.rs.
+            commands::octree::survey::survey_contours,
+            commands::octree::survey::survey_volume,
+            commands::octree::survey::survey_voxel_change,
+            commands::octree::survey::survey_ortho,
+            commands::octree::survey::survey_profile,
+            commands::octree::survey::survey_save_geometry,
+            commands::octree::mesh::survey_mesh,
+            commands::octree::survey::survey_dxf_points,
             // E57 preprocessing (ASTM E2807 — pure Rust, no SDK
             // needed). Covers FARO / Leica / Trimble / NavVis / Emesent
             // / XGRIDS / GreenValley via their export paths.
@@ -265,6 +315,7 @@ pub fn run() {
             crs::crs_transform,
             crs::crs_lookup,
             crs::crs_search,
+            crs::wkt::crs_wkt, // WKT for a LAS 1.4 export's coordinate system
             // NTv2 datum-shift grids: the user supplies the .gsb files
             // (national data products PointCloudLabeler cannot redistribute), PointCloudLabeler
             // finds and uses them — see commands/nadgrid.rs.

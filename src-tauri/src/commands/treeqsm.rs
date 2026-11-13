@@ -2492,23 +2492,41 @@ pub fn define_main_branches(
     // ---- Make each main branch one connected piece.
     let cell = (3.0 * patch_diam2_max).max(1e-6);
     let grid = build_grid(centres, &(0..nb as u32).collect::<Vec<_>>(), cell);
+    let cells: Vec<[i64; 3]> = centres.iter().map(|&c| cell_of(c, cell)).collect();
     let mut inside = vec![false; nb];
+    // The sets of each main branch, in index order, gathered once
+    // (a scan of every set per branch was quadratic in a big crown), and
+    // the per-component flags kept and cleared rather than allocated for
+    // every component and every widening of the search
+    let mut of_main: Vec<Vec<u32>> = vec![Vec::new(); ns];
+    for (i, m) in main.iter().enumerate() {
+        if let Some(s) = m { of_main[*s as usize].push(i as u32); }
+    }
+    let mut in_branch = vec![false; nb];
+    let mut in_comp = vec![false; nb];
+    let mut seen = vec![false; nb];
+    let cheb = |a: &[i64; 3], b: &[i64; 3]| (a[0] - b[0]).abs().max((a[1] - b[1]).abs()).max((a[2] - b[2]).abs());
     for (bi, &main_here) in is_main.iter().enumerate() {
         if !main_here { continue; }
-        let ids: Vec<u32> = (0..nb as u32)
-            .filter(|&i| main[i as usize] == Some(bi as u32)).collect();
+        let ids = &of_main[bi];
         if ids.len() < 2 { continue; }
-        let mut in_branch = vec![false; nb];
-        for &i in &ids { in_branch[i as usize] = true; }
+        for &i in ids { in_branch[i as usize] = true; }
+        // the cells holding sets of this branch, and those sets
+        let mut branch_cells: FxHashMap<[i64; 3], Vec<u32>> = FxHashMap::default();
+        for &i in ids { branch_cells.entry(cells[i as usize]).or_default().push(i); }
 
         let mut guard = 0usize;
         loop {
-            let comps = components_within(neighbours, &ids, &mut inside);
+            let comps = components_within(neighbours, ids, &mut inside);
             if comps.len() <= 1 { break; }
             guard += 1;
             if guard > ids.len() + 8 { break; }
+            // A round that links nothing leaves the graph as it
+            // was, so every round after it would too — stop there rather
+            // than at the guard (pieces out of reach of each other kept it
+            // going for as many rounds as the branch has sets)
+            let mut linked = false;
             for comp in &comps {
-                let mut in_comp = vec![false; nb];
                 for &c in comp { in_comp[c as usize] = true; }
 
                 // The reference's expanding cube: widen the search a
@@ -2516,15 +2534,43 @@ pub fn define_main_branches(
                 // outside the component, then take the nearest of those.
                 // Note it is the nearest within the shell that stopped
                 // the search, not necessarily the nearest overall.
+                //
+                // The same search without walking the cube. The
+                // cube of radius t holds a set of the branch outside the
+                // component from the first t at least the Chebyshev
+                // distance, in cells, from the component's cells to such a
+                // set's cell, so that is where the search stops (1 at the
+                // least, as the cube starts at 1; past 64 it finds nothing).
+                // The sets it collects there are then visited in the cube's
+                // own order — component set by component set, cells in
+                // (dx, dy, dz) order, each cell's sets in grid order — so
+                // `near`, and the pair taken from it, are the same. A piece
+                // tens of metres off made the cube walk minutes long.
+                let targets: Vec<[i64; 3]> = branch_cells.iter()
+                    .filter(|(_, sets)| sets.iter().any(|&j| !in_comp[j as usize]))
+                    .map(|(k, _)| *k).collect();
+                let mut own_cells: Vec<[i64; 3]> = comp.iter().map(|&c| cells[c as usize]).collect();
+                own_cells.sort_unstable();
+                own_cells.dedup();
+                let mut first = i64::MAX;
+                'stop: for a in &own_cells {
+                    for b in &targets {
+                        first = first.min(cheb(a, b));
+                        if first == 0 { break 'stop; }
+                    }
+                }
+                let t = first.max(1);
                 let mut near: Vec<u32> = Vec::new();
-                let mut t: i64 = 1;
-                while near.is_empty() && t <= 64 {
-                    let mut seen = vec![false; nb];
+                if t <= 64 {
+                    let mut done: FxHashMap<[i64; 3], ()> = FxHashMap::default();
                     for &c in comp {
-                        let cc = cell_of(centres[c as usize], cell);
-                        for dx in -t..=t { for dy in -t..=t { for dz in -t..=t {
-                            let Some(v) = grid.get(&[cc[0]+dx, cc[1]+dy, cc[2]+dz])
-                                else { continue };
+                        let cc = cells[c as usize];
+                        // a later set in the same cell sees only what the first saw
+                        if done.insert(cc, ()).is_some() { continue; }
+                        let mut ks: Vec<[i64; 3]> = targets.iter().filter(|k| cheb(k, &cc) <= t).copied().collect();
+                        ks.sort_unstable();
+                        for k in &ks {
+                            let Some(v) = grid.get(k) else { continue };
                             for &j in v {
                                 let j = j as usize;
                                 if in_branch[j] && !in_comp[j] && !seen[j] {
@@ -2532,29 +2578,32 @@ pub fn define_main_branches(
                                     near.push(j as u32);
                                 }
                             }
-                        }}}
+                        }
                     }
-                    t += 1;
+                    for &j in &near { seen[j as usize] = false; }
                 }
+                for &c in comp { in_comp[c as usize] = false; }
                 if near.is_empty() { continue; }
                 let Some((a, b)) = nearest_pair(centres, comp, &near) else { continue };
                 neighbours[a as usize].push(b);
                 neighbours[b as usize].push(a);
+                linked = true;
             }
+            if !linked { break; }
         }
+        for &i in ids { in_branch[i as usize] = false; }
     }
 
     // ---- A first-order branch touching no stem set is joined to it.
-    let stem: Vec<u32> = (0..nb as u32).filter(|&i| main[i as usize] == Some(0)).collect();
+    let stem: &[u32] = &of_main[0];
     if !stem.is_empty() {
         for &bi in &data.branch1 {
-            let ids: Vec<u32> = (0..nb as u32)
-                .filter(|&i| main[i as usize] == Some(bi)).collect();
+            let Some(ids) = of_main.get(bi as usize) else { continue };
             if ids.is_empty() { continue; }
             let touches = ids.iter().any(|&i| neighbours[i as usize].iter()
                 .any(|&n| main[n as usize] == Some(0)));
             if touches { continue; }
-            let Some((a, b)) = nearest_pair(centres, &ids, &stem) else { continue };
+            let Some((a, b)) = nearest_pair(centres, ids, stem) else { continue };
             neighbours[a as usize].push(b);
             neighbours[b as usize].push(a);
         }
@@ -11284,6 +11333,219 @@ mod main_branches_tests {
         }
         for &l in &low {
             assert!(!base.contains(&l), "the low branch set {l} was taken as base");
+        }
+    }
+
+    /// `define_main_branches` as it was before its search was sped up:
+    /// the cube walked cell by cell. The fast one must give the same links
+    /// in the same order and the same trunk.
+    fn reference(
+        centres: &[[f64; 3]],
+        balls: &[Vec<u32>],
+        neighbours: &mut [Vec<u32>],
+        data: &SegmentData,
+        patch_diam2_max: f64,
+    ) -> Vec<bool> {
+        let nb = centres.len();
+        if nb == 0 { return Vec::new(); }
+        let ns = data.segment_of_point.iter().filter(|&&s| s != u32::MAX)
+            .max().map(|&s| s as usize + 1).unwrap_or(0);
+        if ns == 0 { return vec![false; nb]; }
+
+        let mut is_main = vec![false; ns];
+        is_main[0] = true;                       // the stem
+        for &s in data.branch1.iter().chain(&data.branch2).chain(&data.branch3) {
+            if (s as usize) < ns { is_main[s as usize] = true; }
+        }
+
+        let mut main: Vec<Option<u32>> = vec![None; nb];
+        for (i, slot) in main.iter_mut().enumerate() {
+            let Some(ball) = balls.get(i) else { continue };
+            let m = ball.iter()
+                .filter_map(|&p| data.segment_of_point.get(p as usize).copied())
+                .filter(|&s| s != u32::MAX)
+                .min();
+            if let Some(s) = m {
+                if (s as usize) < ns && is_main[s as usize] { *slot = Some(s); }
+            }
+        }
+        let mut trunk: Vec<bool> = main.iter().map(|m| m.is_some()).collect();
+
+        // ---- Make each main branch one connected piece.
+        let cell = (3.0 * patch_diam2_max).max(1e-6);
+        let grid = build_grid(centres, &(0..nb as u32).collect::<Vec<_>>(), cell);
+        let mut inside = vec![false; nb];
+        for (bi, &main_here) in is_main.iter().enumerate() {
+            if !main_here { continue; }
+            let ids: Vec<u32> = (0..nb as u32)
+                .filter(|&i| main[i as usize] == Some(bi as u32)).collect();
+            if ids.len() < 2 { continue; }
+            let mut in_branch = vec![false; nb];
+            for &i in &ids { in_branch[i as usize] = true; }
+
+            let mut guard = 0usize;
+            loop {
+                let comps = components_within(neighbours, &ids, &mut inside);
+                if comps.len() <= 1 { break; }
+                guard += 1;
+                if guard > ids.len() + 8 { break; }
+                for comp in &comps {
+                    let mut in_comp = vec![false; nb];
+                    for &c in comp { in_comp[c as usize] = true; }
+
+                    // The reference's expanding cube: widen the search a
+                    // cell at a time until it finds ANY set of this branch
+                    // outside the component, then take the nearest of those.
+                    // Note it is the nearest within the shell that stopped
+                    // the search, not necessarily the nearest overall.
+                    let mut near: Vec<u32> = Vec::new();
+                    let mut t: i64 = 1;
+                    while near.is_empty() && t <= 64 {
+                        let mut seen = vec![false; nb];
+                        for &c in comp {
+                            let cc = cell_of(centres[c as usize], cell);
+                            for dx in -t..=t { for dy in -t..=t { for dz in -t..=t {
+                                let Some(v) = grid.get(&[cc[0]+dx, cc[1]+dy, cc[2]+dz])
+                                    else { continue };
+                                for &j in v {
+                                    let j = j as usize;
+                                    if in_branch[j] && !in_comp[j] && !seen[j] {
+                                        seen[j] = true;
+                                        near.push(j as u32);
+                                    }
+                                }
+                            }}}
+                        }
+                        t += 1;
+                    }
+                    if near.is_empty() { continue; }
+                    let Some((a, b)) = nearest_pair(centres, comp, &near) else { continue };
+                    neighbours[a as usize].push(b);
+                    neighbours[b as usize].push(a);
+                }
+            }
+        }
+
+        // ---- A first-order branch touching no stem set is joined to it.
+        let stem: Vec<u32> = (0..nb as u32).filter(|&i| main[i as usize] == Some(0)).collect();
+        if !stem.is_empty() {
+            for &bi in &data.branch1 {
+                let ids: Vec<u32> = (0..nb as u32)
+                    .filter(|&i| main[i as usize] == Some(bi)).collect();
+                if ids.is_empty() { continue; }
+                let touches = ids.iter().any(|&i| neighbours[i as usize].iter()
+                    .any(|&n| main[n as usize] == Some(0)));
+                if touches { continue; }
+                let Some((a, b)) = nearest_pair(centres, &ids, &stem) else { continue };
+                neighbours[a as usize].push(b);
+                neighbours[b as usize].push(a);
+            }
+        }
+
+        // ---- If the trunk is still in pieces, keep the piece with the
+        // stem in it.
+        let trunk_ids: Vec<u32> = (0..nb as u32).filter(|&i| trunk[i as usize]).collect();
+        let comps = components_within(neighbours, &trunk_ids, &mut inside);
+        if comps.len() > 1 {
+            let mut order: Vec<usize> = (0..comps.len()).collect();
+            order.sort_by_key(|&k| std::cmp::Reverse(comps[k].len()));
+            // Largest first, then the first one holding a stem set. The
+            // reference walks past the end of the list when no component
+            // holds one and errors; this keeps the largest instead, which
+            // at least leaves a tree to model.
+            let pick = order.iter().copied()
+                .find(|&k| comps[k].iter().any(|&c| main[c as usize] == Some(0)))
+                .or_else(|| order.first().copied());
+            trunk = vec![false; nb];
+            if let Some(k) = pick {
+                for &c in &comps[k] { trunk[c as usize] = true; }
+            }
+        }
+        trunk
+    }
+
+    /// A small deterministic generator for the covers below.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); self.0 >> 33 }
+        fn unit(&mut self) -> f64 { (self.next() % 1_000_000) as f64 / 1_000_000.0 }
+    }
+
+    /// A crown-like cover: pieces of branches in clusters, some of them
+    /// linked, segment ids at random, now and then a piece metres away.
+    fn random_cover(seed: u64, n: usize, far: f64) -> (Cover, SegmentData) {
+        let mut r = Lcg(seed);
+        let mut c = Cover::new();
+        let pieces = 3 + (r.next() % 12) as usize;
+        let mut last: Vec<u32> = Vec::new();
+        for k in 0..pieces {
+            let away = if k > 0 && r.unit() < 0.2 { far * r.unit() } else { 0.0 };
+            let at = [r.unit() * 2.0 + away, r.unit() * 2.0, r.unit() * 6.0];
+            let step = [(r.unit() - 0.5) * 0.12, (r.unit() - 0.5) * 0.12, r.unit() * 0.1];
+            let seg = (r.next() % 7) as u32;
+            let run = c.run(at, step, n / pieces, seg);
+            if !last.is_empty() && r.unit() < 0.5 {
+                let a = last[(r.next() as usize) % last.len()];
+                c.link(a, run[0]);
+            }
+            last = run;
+        }
+        // a few stray links and a few balls with a second point
+        for _ in 0..n / 20 {
+            let a = (r.next() as usize % c.centres.len()) as u32;
+            let b = (r.next() as usize % c.centres.len()) as u32;
+            if a != b && r.unit() < 0.3 { c.link(a, b); }
+            let extra = c.seg_of_point.len() as u32;
+            c.seg_of_point.push((r.next() % 7) as u32);
+            c.balls[a as usize].push(extra);
+        }
+        let d = data(&c, vec![1, 2], vec![3, 4], vec![5]);
+        (c, d)
+    }
+
+    /// THE FAST SEARCH IS THE SAME SEARCH: same trunk, same links in the
+    /// same order, on covers in many pieces, some of them metres apart.
+    #[test]
+    fn the_fast_search_links_exactly_what_the_cube_walk_did() {
+        // pieces a metre or two apart: the reference walks its cube out to
+        // them cell by cell, which a debug build does in seconds, not hours
+        for seed in 0..4u64 {
+            for &(n, far, patch) in &[(150usize, 1.0, 0.105), (300, 1.5, 0.105), (300, 1.0, 0.07)] {
+                let (c, d) = random_cover(seed * 7 + n as u64, n, far);
+                let mut a = c.nei.clone();
+                let mut b = c.nei.clone();
+                let ta = define_main_branches(&c.centres, &c.balls, &mut a, &d, patch);
+                let tb = reference(&c.centres, &c.balls, &mut b, &d, patch);
+                assert_eq!(ta, tb, "trunk differs (seed {seed}, n {n})");
+                assert_eq!(a, b, "links differ (seed {seed}, n {n})");
+            }
+        }
+    }
+
+    /// …and a piece 30 m away no longer holds the search for minutes. The
+    /// reference tree that stalled it (an MLS plot, two trees under one
+    /// id) had a main branch with a piece that far: the cube walked out to
+    /// 64 cells round every set of every piece, every round. Nothing is
+    /// within 64 cells, so nothing is linked to it either way.
+    #[test]
+    fn a_piece_far_away_is_searched_in_a_moment() {
+        let mut c = Cover::new();
+        let stem = c.run([0.0, 0.0, 0.0], [0.0, 0.0, 0.05], 400, 0);
+        let mut pieces = Vec::new();
+        for k in 0..60 {
+            // the stem's own pieces, and its far twin
+            let x = if k % 2 == 0 { 0.3 + 0.01 * k as f64 } else { 30.0 + 0.01 * k as f64 };
+            pieces.push(c.run([x, 0.0, 0.5 + 0.2 * k as f64], [0.0, 0.0, 0.05], 40, 0));
+        }
+        let d = data(&c, vec![], vec![], vec![]);
+        let t0 = std::time::Instant::now();
+        let trunk = define_main_branches(&c.centres, &c.balls, &mut c.nei, &d, 0.07);
+        let took = t0.elapsed().as_secs_f64();
+        assert!(took < 5.0, "the search took {took:.1} s");
+        assert!(stem.iter().all(|&i| trunk[i as usize]));
+        for (k, p) in pieces.iter().enumerate() {
+            let linked_far = p.iter().any(|&i| c.nei[i as usize].iter().any(|&n| (c.centres[n as usize][0] < 15.0) != (c.centres[i as usize][0] < 15.0)));
+            assert!(!linked_far, "piece {k} was linked across the 30 m gap");
         }
     }
 

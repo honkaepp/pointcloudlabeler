@@ -823,7 +823,10 @@ describe('the long operations consult the cancellation flag', () => {
     // now names each tree's records, the planner forces exactly those,
     // the panel says how far the tree reaches, and the build log names
     // the fragment.
-    expect(octree, 'the scan does not list the records a tree lives in').toMatch(/records: recs\.remove\(&tree_id\)\.unwrap_or_default\(\)/);
+    // The scan lives in tree_tally.rs (parallel, cached).
+    const tally = stripComments(read('src-tauri/src/commands/octree/tree_tally.rs'));
+    expect(tally, 'the scan does not list the records a tree lives in').toMatch(/if acc\.records\.last\(\) != Some\(&r\) \{ acc\.records\.push\(r\); \}/);
+    expect(tally, 'the summary drops the records').toMatch(/records: a\.records,/);
     expect(octree, 'the build does not look for far fragments').toMatch(/far_fragments\(&pts, FRAGMENT_CELL_M, FRAGMENT_MIN_POINTS, FRAGMENT_MIN_GAP_M\)/);
     expect(octree, 'a fragment is not named in the log').toMatch(/# tree \{tree_id\} fragments: \{\}/);
     const view = stripComments(read('src/three/OctreeView.tsx'));

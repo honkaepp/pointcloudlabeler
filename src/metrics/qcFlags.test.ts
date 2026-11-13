@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { TreeMetric } from '../persistence/octreeReader';
 import {
-  computeQcFlags, worstByTree, SEV_RANK, SEV_COLOR, FLAG_LABEL,
+  computeQcFlags, worstByTree, SEV_RANK, SEV_COLOR, FLAG_LABEL, hdCurve, hdExpected,
   type Flag, type Severity, type FlagCode,
 } from './qcFlags';
 
@@ -238,5 +238,27 @@ describe('worstByTree', () => {
   it('gives every severity a distinct colour — they are the only cue in a dense list', () => {
     const colours = Object.values(SEV_COLOR);
     expect(new Set(colours).size).toBe(colours.length);
+  });
+});
+
+// The plot's own height–DBH curve (the same stand as ops/qc.rs)
+describe('the height–DBH curve', () => {
+  const stand = () => Array.from({ length: 40 }, (_, i) => {
+    const d = 8 + i * 0.8;
+    const wobble = 1 + 0.03 * (((i * 7) % 5) - 2) / 2;
+    const h = 1.3 + (d / (1.5 + 0.22 * d)) ** 2 * wobble;
+    return { ...ok(i + 1), dbh: d / 100, height: h };
+  });
+  it('is recovered from the stand and flags only the diameter off it', () => {
+    const m = stand();
+    const c = hdCurve(m)!;
+    expect(Math.abs(c[0] - 1.5)).toBeLessThan(0.15);
+    expect(Math.abs(c[1] - 0.22)).toBeLessThan(0.01);
+    expect(Math.abs(hdExpected(c, m[20].height)! - 24)).toBeLessThan(2); // its height is 3 % low
+    expect(computeQcFlags(m, null, null).filter(f => f.code === 'hd-curve')).toEqual([]);
+    m[20] = { ...m[20], dbh: m[20].dbh * 2 };
+    const hd = computeQcFlags(m, null, null).filter(f => f.code === 'hd-curve');
+    expect(hd.map(f => f.treeId)).toEqual([21]);
+    expect(hdCurve(m.slice(0, 14))).toBeNull();
   });
 });

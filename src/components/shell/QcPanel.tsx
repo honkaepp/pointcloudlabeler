@@ -19,6 +19,7 @@
 // pairs with Tree Review's merge / split / lasso-assign tools: QC
 // tells you WHICH trees to fix, Tree Review is HOW you fix them.
 
+import { publishTreeQc } from '../../three/treeMetricColors';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useOctreeShell } from './OctreeShellContext';
 import { type TreeMetric, type QsmResult, type TreeQsm, type TreeSummaryEntry } from '../../persistence/octreeReader';
@@ -51,7 +52,7 @@ interface Desktop {
 const LIST_MAX_H = '52vh';
 
 export default function QcPanel() {
-  const { octree, api, setFilters, setTools } = useOctreeShell();
+  const { octree, api, setFilters, setTools, setDisplay } = useOctreeShell();
   const { project } = useProject();
   const desktop = (window as unknown as { desktop?: Desktop }).desktop;
 
@@ -153,6 +154,10 @@ export default function QcPanel() {
   }, [summary]);
 
   const flags = useMemo<Flag[]>(() => computeQcFlags(metrics, qsm, bboxes), [metrics, qsm, bboxes]);
+  // The flags to the viewer, to colour the trees by them
+  useEffect(() => {
+    if (octree?.dir && metrics) publishTreeQc(octree.dir, metrics, flags);
+  }, [octree?.dir, metrics, flags]);
 
   const filtered = useMemo(() => {
     const keep = flags.filter(f =>
@@ -298,6 +303,12 @@ export default function QcPanel() {
             <SeverityChip label={`${counts.critical} critical`} sev="critical" active={showCritical} onClick={() => setShowCritical(s => !s)} disabled={counts.critical === 0} />
             <SeverityChip label={`${counts.warning} warn`} sev="warning" active={showWarning} onClick={() => setShowWarning(s => !s)} disabled={counts.warning === 0} />
             <SeverityChip label={`${counts.info} info`} sev="info" active={showInfo} onClick={() => setShowInfo(s => !s)} disabled={counts.info === 0} />
+            {/* Every tree in the viewport in its worst flag's colour */}
+            <button type="button" className="btn !h-6 !px-1.5 mono text-[10px]"
+              onClick={() => setDisplay({ colorMode: 'tree_metric', treeMetric: 'qc' })}
+              title="Colour every tree in the viewport by its worst flag: red critical, amber warning, blue info, green none">
+              Show on trees
+            </button>
           </div>
 
           {stale && (

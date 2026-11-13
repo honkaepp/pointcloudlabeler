@@ -73,10 +73,13 @@ function disposeGroup(g: THREE.Group) {
   }
 }
 
-function buildSurface(
+/** `baseZ` (PointCloudLabeler): the world height a quantity grid with no ground to
+ *  drape on is drawn at — the cloud's lowest points rather than the scene
+ *  origin. */
+export function buildSurface(
   grid: RasterGrid, kind: RasterLayer['kind'], offset: [number, number, number],
   opacity: number, wireframe: boolean, elevationGrid: RasterGrid | null,
-  terrain: TerrainDisplay | null = null,
+  terrain: TerrainDisplay | null = null, baseZ?: number,
 ): THREE.Mesh | null {
   const { cols, rows, cellSize, minX, minY, values, vmin, vmax } = grid;
   if (cols < 2 || rows < 2) return null;
@@ -127,7 +130,7 @@ function buildSurface(
         const g = drape[idx];
         if (Number.isNaN(g)) sceneY = useValueAsHeight ? v : 0;
         else sceneY = useValueAsHeight ? (g + v - offset[2]) : (g - offset[2]);
-      } else sceneY = useValueAsHeight ? v : 0;
+      } else sceneY = useValueAsHeight ? v : baseZ !== undefined ? baseZ - offset[2] : 0;
       if (terrain && !Number.isNaN(v)) sceneY -= terrain.shift(wx, wy);
       positions[idx * 3 + 1] = sceneY;
       // sceneZ = −north (matches the point cloud's right-handed mapping).
@@ -277,6 +280,10 @@ function ramp(kind: RasterLayer['kind'], t: number): [number, number, number] {
     // Pure grayscale — the cartographic standard. Hillshade values
     // are already in [0..1] so the ramp passes through directly.
     stops = [[16, 16, 16], [64, 64, 64], [128, 128, 128], [192, 192, 192], [240, 240, 240]];
+  } else if (kind === 'grid') {
+    // A quantity opened from a file (gap fraction cover, PAI, …):
+    // a perceptually even dark-blue → green → yellow ramp.
+    stops = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]];
   } else {
     // DTM / DSM: muted earth → pale.
     stops = [[60, 50, 40], [110, 95, 70], [165, 150, 120], [220, 215, 200]];

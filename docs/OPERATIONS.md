@@ -63,6 +63,17 @@ read-only · command line `pointcloudlabeler project recent` · MCP tool `projec
 
 No parameters.
 
+### `project.rename`
+
+Rename a project: its folder (beside where it is) and its name together, with the paths stored inside it moved along.
+
+writes · command line `pointcloudlabeler project rename` · MCP tool `project_rename`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | *required* | The new name, which is the folder's new name too (beside where it is). |
+| `projectFolder` | string, nullable | `null` | The project folder. Defaults to the open project. |
+
 ### `project.datasets`
 
 The datasets under a project's octrees/ folder.
@@ -179,6 +190,7 @@ writes · stage `downsample` · command line `pointcloudlabeler dataset downsamp
 | `name` | string | *required* | The name of the thing created. |
 | `srcDir` | string | *required* | The dataset to read from. |
 | `voxelSize` | number | *required* | One point kept per voxel of this size, metres. |
+| `keep` | string, nullable | `null` | Which point a voxel keeps: "first" (the default) or "centroid" (the one nearest the voxel's centroid). |
 | `outDir` | string, nullable | `null` | Where the new dataset goes. |
 | `scannerType` | string | `other` | "tls", "mls", "als", "uls" or "other". |
 
@@ -353,6 +365,169 @@ writes · command line `pointcloudlabeler preprocess msa` · MCP tool `preproces
 
 ## ground
 
+### `ground.contours`
+
+Contour lines of the ground model at an interval (index lines every n-th), written as GeoJSON and DXF into the dataset's terrain/ folder.
+
+writes · stage `contours` · command line `pointcloudlabeler ground contours` · MCP tool `ground_contours`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `cellSize` | number | `0.5` | DTM cell size, metres (default 0.5). |
+| `indexEvery` | integer | `5` | Every n-th line is an index contour (default 5). |
+| `interval` | number | `0.5` | Height between two contour lines, metres (default 0.5). |
+| `minLength` | number | `2.0` | Lines shorter than this are left out, metres (default 2). |
+| `polygon` | JSON | `[]` | Only inside this polygon of world [x, y] vertices (empty = the whole ground model). |
+| `smooth` | integer | `2` | Smoothing passes over the DTM before contouring (3×3 mean, default 2). |
+
+### `ground.volume`
+
+Volume of a surface above and below a reference (a plane fitted to the area's edge, a level plane or the ground model) inside a polygon; writes the height-difference raster to survey/.
+
+writes · stage `volume` · command line `pointcloudlabeler ground volume` · MCP tool `ground_volume`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `cellSize` | number | `0.1` | Grid cell, metres (default 0.1). |
+| `classes` | JSON | `[]` | Only points of these classes make the surface (empty = all). |
+| `fillGaps` | boolean | `true` | Empty cells inside the area take the mean of their filled neighbours instead of being left out. |
+| `outName` | string | `volume` | Name of the height-difference raster written to `survey/<name>.tif` (default "volume"). |
+| `planeZ` | number, nullable | `null` | Height of the level plane for reference "plane", metres. |
+| `polygon` | JSON | `[]` | The area: a polygon of world [x, y] vertices (closed implicitly); empty = the whole dataset. |
+| `reference` | string | `rim` | What it is compared with: "rim" (a plane fitted to the surface along the area's edge — a pile on uneven ground), "plane" (a level plane at planeZ), "lowest" (a level plane at the lowest surface cell) or "dtm" (the ground model). |
+| `surface` | string | `top` | The measured surface per cell: "top" (highest point — a pile, a canopy), "lowest" (lowest point), "ground" (lowest ground point, class 2) or "mean". |
+
+## change
+
+### `change.voxels`
+
+Voxel change against another acquisition: voxels that appeared and that are gone, their volume, and a voxel_change column (1 = new) on the points.
+
+writes · stage `voxel_change` · command line `pointcloudlabeler change voxels` · MCP tool `change_voxels`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `referenceDir` | string | *required* | The other acquisition of the same place (a dataset directory), in the same coordinates. |
+| `minPoints` | integer | `1` | Points a voxel needs to count as occupied (default 1). |
+| `neighbours` | boolean | `true` | A voxel is unchanged when the other acquisition occupies it or one of its 26 neighbours (absorbs registration noise; default true). |
+| `voxelSize` | number | `0.1` | Voxel edge, metres (default 0.1). |
+| `writeColumn` | boolean | `true` | Write the per-point column `voxel_change` (1 = in a voxel the reference does not have, 0 = unchanged). |
+
+## export
+
+### `export.ortho`
+
+Ortho image of the dataset: a top view (PNG with world file and RGBA GeoTIFF) or a side view along a bearing, coloured by RGB, intensity, height, class or a column.
+
+writes · stage `ortho` · command line `pointcloudlabeler export ortho` · MCP tool `export_ortho`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `bearingDeg` | number | `0.0` | Side view: the direction looked in, degrees clockwise from grid north. |
+| `color` | string | `height` | "rgb", "intensity", "height", "class", or the name of an extra column (a ramp). |
+| `depth` | JSON, nullable | `null` | Side view: only points this far in front of / behind the plane through the area's centre, metres ([near, far]; empty = all). |
+| `outName` | string | `ortho` | Name of the files in `survey/` (default "ortho"). |
+| `pixelSize` | number | `0.02` | Pixel size, metres (default 0.02). |
+| `polygon` | JSON | `[]` | The area: a polygon of world [x, y] vertices; a top view images its bounding box (outside transparent), a side view the points inside it. Empty = everything. |
+| `shade` | boolean | `true` | Shade by the relief of the nearest surface (default true). |
+| `view` | string | `top` | "top" (looking down) or "side" (a vertical plane, looking toward bearingDeg). |
+
+### `export.profile`
+
+Section profile along a polyline: the points of a corridor with station and offset (CSV), a drawing (SVG) and the ground line (DXF).
+
+writes · stage `profile` · command line `pointcloudlabeler export profile` · MCP tool `export_profile`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `line` | JSON | *required* | The section line: world [x, y] vertices, at least two. |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `maxPreview` | integer | `200000` | Points returned for drawing, at most (default 200 000); the files hold every point. |
+| `outName` | string | `profile` | Name of the files in `survey/` (default "profile"). |
+| `width` | number | `0.5` | Width of the corridor around the line, metres (default 0.5: 0.25 m to each side). |
+
+### `export.mesh`
+
+Triangle mesh of the dataset: a 2.5D height field or a closed 3D surface around the points, smoothed and decimated as asked; PLY, OBJ, STL and DXF into mesh/.
+
+writes · stage `mesh` · command line `pointcloudlabeler export mesh` · MCP tool `export_mesh`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `cellSize` | number | `0.1` | Grid cell (2.5D) or voxel (3D), metres (default 0.1). |
+| `classes` | JSON | `[]` | Only points of these classes (empty = all). |
+| `decimate` | number | `0.0` | Decimation: vertices closer than this merge (vertex clustering), metres; 0 = none. |
+| `fillGaps` | boolean | `true` | 2.5D: empty cells inside the area take the mean of their neighbours (default true). |
+| `formats` | JSON | `["ply","obj"]` | Files to write: any of "ply", "obj", "stl", "dxf" (PLY always, the viewer reads it). |
+| `method` | string | `2.5d` | "2.5d" (a height field over a grid) or "3d" (a closed surface around the points' voxels). |
+| `minPoints` | integer | `1` | 3D: points a voxel needs (default 1). |
+| `outName` | string | `mesh` | Name of the files in `mesh/` (default "mesh"). |
+| `polygon` | JSON | `[]` | The area: a polygon of world [x, y] vertices; empty = everything. |
+| `smooth` | integer | `0` | Smoothing iterations (Taubin; 0 = none, default 0). |
+| `surface` | string | `top` | 2.5D: the height of a cell — "top", "lowest", "ground" (class 2) or "mean". |
+| `zRange` | JSON, nullable | `null` | Only points between these heights, metres ([low, high]; empty = all). |
+
+### `export.dxf`
+
+The points as DXF POINT entities, one layer per class (CLASS_<n>), inside an area, of chosen classes, every n-th; into survey/.
+
+writes · stage `dxf_points` · command line `pointcloudlabeler export dxf` · MCP tool `export_dxf`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `classes` | JSON | `[]` | Only points of these classes (empty = all). |
+| `every` | integer | `1` | Keep every n-th point (default 1 = all). |
+| `maxPoints` | integer | `5000000` | Refuse to write more points than this (DXF is large and slow to read; default 5 000 000). |
+| `outName` | string | `points` | Name of the file in `survey/` (default "points"). |
+| `polygon` | JSON | `[]` | The area: a polygon of world [x, y] vertices; empty = everything. |
+| `zRange` | JSON, nullable | `null` | Only points between these heights, metres ([low, high]; empty = all). |
+
+### `export.geometry`
+
+Measure a polyline or polygon (3D and plan length, plan area, heights) and write it to survey/ as GeoJSON, DXF and CSV.
+
+writes · command line `pointcloudlabeler export geometry` · MCP tool `export_geometry`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `points` | JSON | *required* | The vertices, world [x, y, z]. |
+| `closed` | boolean | `false` | An area (the last vertex joins the first) rather than a line. |
+| `name` | string | `polyline` | Name of the files in `survey/` (default "polyline"). |
+
+### `export.qsm`
+
+The dataset's QSM as files: one .qsm per tree with a .qsf manifest (the open QSM format other software reads), an OBJ of tubes with one object per tree (for Blender) and a PLY of tubes in world coordinates coloured by how each cylinder was measured.
+
+read-only · command line `pointcloudlabeler export qsm` · MCP tool `export_qsm`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `formats` | JSON | `["qsm","obj","ply"]` | Any of "qsm" (one .qsm per tree and a .qsf manifest), "obj" (one object per tree, near the origin, for Blender) and "ply" (world coordinates, coloured by quality). |
+| `outDir` | string, nullable | `null` | Folder to write into; the dataset's qsm/ when empty. |
+| `sides` | integer | `12` | Sides of each tube (default 12). |
+
+### `export.qsmTubes`
+
+Read a .qsm or a .qsf from any QSM software into a PLY of tubes coloured by its quality levels, to show beside the cloud.
+
+read-only · command line `pointcloudlabeler export qsm-tubes` · MCP tool `export_qsm_tubes`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | *required* | A .qsm file or a .qsf manifest. |
+| `outPly` | string, nullable | `null` | The PLY to write; `<name>_tubes.ply` beside it when empty. |
+| `sides` | integer | `12` | Sides of each tube (default 12). |
+
+## ground
+
 ### `ground.classify`
 
 Classify ground points (class 2) with the progressive morphological or the cloth simulation filter.
@@ -413,6 +588,24 @@ writes · stage `normalize` · command line `pointcloudlabeler ground normalize`
 | `cellSize` | number | `0.5` | DTM cell size, metres (default 0.5). |
 
 ## segment
+
+### `segment.forest`
+
+Find the stems and grow every tree from them: wood and leaf from shape and the flow to the ground, trees by geodesic growth over the wood; writes tree ids and stem / branch / leaf, and forest/seeds.json, trees.json, suggestions.json.
+
+writes · stage `forest` · command line `pointcloudlabeler segment forest` · MCP tool `segment_forest`.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `octreeDir` | string | *required* | The dataset directory (`<project>/octrees/<name>`). |
+| `cut` | number | `0.25` | Points lower than this above the ground stay out of the graph, metres (default 0.25). |
+| `dtmCell` | number | `0.5` | Ground model cell, metres (default 0.5). |
+| `edgeBuffer` | number | `2.0` | Flag trees standing this close to the data's edge, metres (default 2). |
+| `understory` | number | `2.0` | Flag trees lower than this as understory, metres (default 2). |
+| `useReflectance` | boolean | `true` | Blend a Reflectance column (as some TLS scanners write) into the wood likelihood where present (default true). |
+| `useSavedSeeds` | boolean | `false` | Grow the trees from forest/seeds.json (stems corrected by hand). |
+| `voxel` | number | `0.04` | Voxel edge of the working set, metres (default 0.04). |
+| `writeSemantic` | boolean | `true` | Also write stem / branch / leaf into the semantic column (default true). |
 
 ### `segment.chm`
 
@@ -490,7 +683,7 @@ writes · stage `deadwood` · command line `pointcloudlabeler segment deadwood` 
 
 ### `segment.leafwood`
 
-Separate wood from foliage by local geometry; writes the stem/branch label.
+Separate wood from foliage by local geometry; writes stem (1), branch (2) and leaf (4) labels.
 
 writes · stage `leafwood` · command line `pointcloudlabeler segment leafwood` · MCP tool `segment_leafwood`.
 
@@ -595,7 +788,7 @@ writes · stage `density` · command line `pointcloudlabeler metrics density` ·
 
 ### `qc.flags`
 
-Run the ten per-tree checks over the metrics and the QSM cache; flags ranked by severity.
+Run the twelve per-tree checks (with the plot's own height–DBH curve and the QSM log) over the metrics and the QSM cache; flags ranked by severity.
 
 read-only · stage `metrics` · command line `pointcloudlabeler qc flags` · MCP tool `qc_flags`.
 
@@ -986,7 +1179,7 @@ read-only · stage `export` · command line `pointcloudlabeler export las` · MC
 | `includeTreeId` | boolean, nullable | `null` |  |
 | `keepClassification` | boolean, nullable | `null` |  |
 | `keepIntensity` | boolean, nullable | `null` |  |
-| `las14` | boolean, nullable | `null` | LAS 1.4 / point format 6 instead of LAS 1.2 / format 0. |
+| `las14` | boolean, nullable | `null` | LAS 1.4 / point format 6 instead of LAS 1.2 / format 0 (classes above 31, the coordinate system as WKT). |
 | `normalize` | boolean, nullable | `null` | Write Z as height above ground (point Z minus the DTM) with a zero Z offset. |
 | `plyAscii` | boolean, nullable | `null` | A `.ply` export as ascii rather than binary little-endian (default false). |
 | `standardFields` | boolean, nullable | `null` | The standard fields carried as columns (GPS time, colour, scan angle, …) back into the record (default true). |
@@ -1152,13 +1345,13 @@ read-only · stage `register` · command line `pointcloudlabeler change register
 | `referenceDir` | string | *required* | The dataset that stays. |
 | `apply` | boolean | `false` | Also write the moving dataset, moved, as a new dataset (default false). |
 | `dof` | string | `full` | "full" (default), "levelled" (xyz + yaw) or "translation". One of: `full`, `levelled`, `translation`. |
-| `dtmCell` | number | `0.5` | Automatic start: the ground cell for heights above ground, metres (default 0.5). |
+| `dtmCell` | number | `0.5` | Automatic and stem-map starts: the ground cell for heights above ground, metres (default 0.5). |
 | `dx` | number | `0.0` | Manual start: metres east, north, up, and degrees of yaw about the moving cloud's centre. |
 | `dy` | number | `0.0` |  |
 | `dz` | number | `0.0` |  |
 | `featureIterations` | integer | `50000` | Feature start: transform hypotheses at most (default 50000) — eight per feature pair, the pairs agreeing with the most others first. |
 | `featureVoxel` | number | `0.3` | Feature start: the cell the features are computed on, metres (default 0.3). |
-| `init` | string | `current` | Where the fit starts: "current" (as they stand), "auto" (a coarse search by stems and crowns), "skeleton" (the stored skeleton alignment), "manual" (the offset below), "features" (a global search by surface features, any heading). One of: `current`, `auto`, `skeleton`, `manual`, `features`. |
+| `init` | string | `current` | Where the fit starts: "current" (as they stand), "auto" (a coarse search by stems and crowns), "skeleton" (the stored skeleton alignment), "manual" (the offset below), "features" (a global search by surface features, any heading), "stems" (the two stem maps matched by spacing and thickness, any heading; the forest pass's stems where a dataset has them, else found at breast height). One of: `current`, `auto`, `skeleton`, `manual`, `features`, `stems`. |
 | `jackknifeBlock` | number | `2.0` | The side of the spatial blocks the jackknife covariance leaves out one at a time, metres (default 2.0). |
 | `kernel` | string | `welsch` | "welsch" (default), "cauchy", "tukey" or "none". One of: `welsch`, `cauchy`, `tukey`, `none`. |
 | `kernelFloor` | number | `0.002` | The robust scale's floor, metres (default 0.002). |

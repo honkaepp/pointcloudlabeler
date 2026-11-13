@@ -28,7 +28,7 @@ import NumberField, { parseNum, parseCount } from '../NumberField';
 import {
   FINE_REG_DEFAULTS, REGISTER_STAGE, TRANSFORM_STAGE, coarseVerdict, constraintVerdict, copyOutDir,
   defaultCopyName, describeTranslation, histogramBars, isWorthApplying, lengthText, plusMinus, quotedStdErr,
-  registerStageLabel, rotationAtPlotEdge,
+  registerStageLabel, rotationAtPlotEdge, stemSourceText, stemsVerdict,
   type FineRegistrationReport, type RegisterDof, type RegisterInitMode, type RegisterKernel, type RegisterMethod,
 } from './fineRegistration';
 
@@ -278,7 +278,13 @@ export default function FineRegistrationPanel() {
           ['skeleton', 'The stored skeleton alignment', 'The Cloud registration panel’s measurement beside the moving cloud, against this reference, inverted.'],
           ['manual', 'A manual offset', 'An offset you know — from a GNSS log, a survey, another tool — about the moving cloud’s centre.'],
           ['features', 'Global search by surface features', 'FPFH histograms on both clouds whole, paired; transforms tried from triples of pairs that agree with each other on their distances, the pairs agreeing with the most others first; the hypothesis chosen by how much of the cloud lands on the reference: any heading, any offset. No ground classification needed. A start only.'],
+          ['stems', 'Stem maps — where the stems stand, how thick they are', 'The stems of both clouds at breast height — the forest pass’s where it has run, otherwise found now from four thin slices above the ground — matched pair by pair by their spacing and thickness: any heading, any offset, no skeletons. A start only: the turn, the shift and the height from the ground under the stems; the fit then adds the tilt.'],
         ])}
+        {init === 'stems' && (
+          <div className="mono text-[9.5px]" style={{ color: 'var(--text-mute)', lineHeight: 1.5 }}>
+            A cloud without the forest pass needs a ground classification: its stems are found between 0.8 and 2.2 m above the ground.
+          </div>
+        )}
         {init === 'features' && (
           <div className="flex items-end gap-1.5">
             <NumberField label="Feature cell (m)" value={featureVoxel} onChange={setFeatureVoxel} width={120}
@@ -382,6 +388,14 @@ export default function FineRegistrationPanel() {
                 <span>Feature search</span>
                 <span style={{ color: 'var(--text)', textAlign: 'right' }}>
                   {(result.global.overlap * 100).toFixed(0)} % of the cloud on the reference · {result.global.inliers} of {result.global.correspondences} pairs · {result.global.iterations.toLocaleString()} draws
+                </span>
+              </>
+            )}
+            {result.stems && (
+              <>
+                <span title={`Reference: ${stemSourceText(result.stems.referenceSource)}; moving: ${stemSourceText(result.stems.movingSource)}. ${result.stems.hypotheses.toLocaleString()} hypotheses judged.`}>Stem maps</span>
+                <span style={{ color: 'var(--text)', textAlign: 'right' }}>
+                  {result.stems.matched} of {result.stems.movingStems} stems paired (RMS {lengthText(result.stems.rms)}) · {result.stems.yawDeg.toFixed(2)}° · runner-up {result.stems.runnerUp} · {stemsVerdict(result.stems.matched, result.stems.runnerUp)}
                 </span>
               </>
             )}

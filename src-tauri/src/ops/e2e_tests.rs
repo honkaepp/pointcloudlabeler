@@ -91,6 +91,72 @@ fn synthetic_plot(path: &Path) -> (usize, usize) {
     (n_ground, n_tree)
 }
 
+/// The branch review's points. A branch listed in
+/// forest/near_ties.json is found again by its voxels' keys in the dataset
+/// the forest pass wrote — the points of its tree in those voxels, and no
+/// other tree's.
+#[test]
+fn a_near_tie_branch_is_found_again_by_its_voxels() {
+    let dir = scratch("ties");
+    let las = dir.join("plot.las");
+    synthetic_plot(&las);
+    let ctx = OpContext::silent();
+    let go = |name: &str, v: Value| -> Value { run(name, v, &ctx).unwrap_or_else(|e| panic!("{name}: {e}")) };
+    go("project.create", json!({ "folder": dir.join("proj").to_string_lossy(), "name": "Ties" }));
+    let imported = go("dataset.import", json!({ "srcPath": las.to_string_lossy(), "scannerType": "mls" }));
+    let octree_dir = imported["outDir"].as_str().unwrap().to_string();
+    let od = Path::new(&octree_dir);
+    go("ground.classify", json!({ "octreeDir": octree_dir }));
+    go("segment.forest", json!({ "octreeDir": octree_dir }));
+    let listed: Value = serde_json::from_slice(&std::fs::read(od.join("forest/near_ties.json")).unwrap()).unwrap();
+    assert!(listed["branches"].is_array(), "the list is written on every run, empty or not");
+    // the dataset's points: (record, index, tree, x, y, z less the offset)
+    let meta: Value = serde_json::from_slice(&std::fs::read(od.join("metadata.json")).unwrap()).unwrap();
+    let scale: Vec<f64> = meta["scale"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let pb = meta["pointBytes"].as_u64().unwrap() as usize;
+    let hier = std::fs::read(od.join("hierarchy.bin")).unwrap();
+    let bin = std::fs::read(od.join("octree.bin")).unwrap();
+    let mut pts = Vec::new();
+    for r in 0..hier.len() / 24 {
+        let h = &hier[r * 24..r * 24 + 24];
+        let off = u64::from_le_bytes(h[8..16].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(h[16..24].try_into().unwrap()) as usize;
+        for p in 0..size / pb {
+            let o = off + p * pb;
+            let i = |k: usize| i32::from_le_bytes(bin[o + 4 * k..o + 4 * k + 4].try_into().unwrap());
+            pts.push((r as u32, p as u32, i(3), [i(0) as f64 * scale[0], i(1) as f64 * scale[1], i(2) as f64 * scale[2]]));
+        }
+    }
+    // a branch by hand: every 4 cm voxel of a tree's points 3-4 m up
+    let tree = pts.iter().map(|q| q.2).filter(|&t| t > 0).min().expect("the forest pass grew trees");
+    let low = pts.iter().filter(|q| q.2 == tree).map(|q| q.3[2]).fold(f64::INFINITY, f64::min);
+    let key = |q: &[f64; 3]| [(q[0] / 0.04).floor() as i32, (q[1] / 0.04).floor() as i32, (q[2] / 0.04).floor() as i32];
+    let mut keys: Vec<[i32; 3]> = pts.iter().filter(|q| q.2 == tree && q.3[2] > low + 3.0 && q.3[2] < low + 4.0).map(|q| key(&q.3)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert!(!keys.is_empty());
+    let mut kb = Vec::new();
+    for k in &keys { for v in k { kb.extend_from_slice(&v.to_le_bytes()); } }
+    std::fs::write(od.join("forest/near_ties.bin"), &kb).unwrap();
+    let other = tree + 1000;
+    let ties = json!({ "version": 1, "voxel": 0.04, "run": 1, "branches": [
+        { "id": 1, "tree": tree, "other": other, "ratio": 0.995, "nodes": keys.len(), "points": 0, "first": 0, "count": keys.len() },
+        { "id": 2, "tree": other, "other": tree, "ratio": 0.995, "nodes": keys.len(), "points": 0, "first": 0, "count": keys.len() },
+    ]});
+    std::fs::write(od.join("forest/near_ties.json"), serde_json::to_vec(&ties).unwrap()).unwrap();
+    let got = crate::commands::octree::forest::branch_points(od, 1).unwrap();
+    let mut got: Vec<(u32, u32)> = got.iter().flat_map(|(r, idx)| idx.iter().map(move |&i| (*r, i))).collect();
+    got.sort_unstable();
+    let set: std::collections::HashSet<[i32; 3]> = keys.iter().copied().collect();
+    let mut want: Vec<(u32, u32)> = pts.iter().filter(|q| q.2 == tree && set.contains(&key(&q.3))).map(|q| (q.0, q.1)).collect();
+    want.sort_unstable();
+    assert!(!want.is_empty());
+    assert_eq!(got, want, "the branch's points are its tree's points in its voxels");
+    // the same voxels as another tree's branch: none of these points are
+    assert!(crate::commands::octree::forest::branch_points(od, 2).unwrap().is_empty());
+    assert!(crate::commands::octree::forest::branch_points(od, 3).is_err(), "no such branch");
+}
+
 #[test]
 fn the_manuscript_workflow_runs_headless_from_import_to_export() {
     let dir = scratch("flow");
@@ -506,6 +572,24 @@ fn the_manuscript_workflow_runs_headless_from_import_to_export() {
     }
     assert_eq!(feat["initMode"], "features");
     assert!(feat["global"]["inliers"].as_u64().unwrap() >= 6, "{}", feat["global"]);
+    // …and by the stem maps: the stems found at breast height in
+    // both, matched by their spacing and thickness. On this lattice the
+    // places alone match four ways; the thicknesses decide.
+    let by_stems = go("change.register", json!({ "referenceDir": octree_dir, "movingDir": turned_dir, "init": "stems", "method": "gicp", "maxCorrDist": 1.5 }));
+    {
+        let m: Vec<f64> = by_stems["matrix"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let found = Rigid::from_mat4(&m).unwrap();
+        let want = turned_by.inverse();
+        for c in [[500_000.0, 6_800_000.0, 100.0], [500_030.0, 6_800_030.0, 100.0], [500_030.0, 6_800_000.0, 120.0]] {
+            let a = found.apply(c);
+            let b = want.apply(c);
+            let d = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            assert!(d < 0.01, "corner {c:?} is {d} m off after the stem-map start ({})", by_stems["stems"]);
+        }
+    }
+    assert_eq!(by_stems["initMode"], "stems");
+    assert_eq!(by_stems["stems"]["movingSource"], "found");
+    assert!(by_stems["stems"]["matched"].as_u64().unwrap() >= 8, "{}", by_stems["stems"]);
     go("dataset.remove", json!({ "octreeDir": turned_dir }));
     // A moved copy from the registration's JSON, as a recipe would do it.
     let back = go("dataset.transform", json!({ "octreeDir": moved_dir, "name": "plot back", "registrationJson": reg_json.to_string_lossy() }));
