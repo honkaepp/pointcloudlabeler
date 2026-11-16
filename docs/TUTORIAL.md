@@ -653,7 +653,7 @@ remembers which layers it showed. **Project files** lists what was
 unpacked into the project's `imports/` folder; ●/○ shows or hides a
 file's layer, and **all files** lists the rest too.
 
-11. Transfer a segmentation to another scan of the plot
+## 11. Transfer a segmentation to another scan of the plot
 
 A corrected segmentation can be carried into any other cloud of the same plot, a later year or another sensor. The demo pair on Zenodo is made for this: the 2021 terrestrial scan carries a corrected segmentation in its tree_id column, the 2023 helicopter-borne scan carries none.
 
