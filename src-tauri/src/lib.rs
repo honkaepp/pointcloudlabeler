@@ -27,6 +27,8 @@ pub mod ops;
 pub mod progress;
 pub mod rt;
 pub mod crash;
+/// WebKitGTK's settings on Linux: what keeps the window from staying blank.
+pub mod linux_graphics;
 #[cfg(feature = "gui")]
 mod menu;
 
@@ -54,6 +56,12 @@ pub fn run() {
     // Install the panic hook before anything else so failures during Tauri
     // bring-up also get logged.
     crash::install_panic_hook();
+
+    // Linux: the WebKitGTK settings this machine needs for the window to
+    // show at all (NVIDIA drivers, Wayland, no GPU render node) — set
+    // before WebKitGTK starts and reads them. See linux_graphics.rs.
+    #[cfg(target_os = "linux")]
+    linux_graphics::apply();
 
     // GPU preference flags for WebView2 on Windows so the discrete (NVIDIA /
     // AMD) GPU is preferred over integrated graphics for WebGL.

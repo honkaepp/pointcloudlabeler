@@ -1,0 +1,73 @@
+name: Build Linux packages
+
+# Produces the Linux packages of PointCloudLabeler: a .deb (Debian,
+# Ubuntu and their derivatives) and an .rpm (Fedora). Download them from
+# the run's "Artifacts" section once the job goes green, and attach them
+# to the release beside the Windows zip.
+#
+# Both depend on the distribution's own WebKitGTK and GTK rather than
+# carrying copies: a package manager keeps those patched, and nothing
+# but this program's own code is conveyed (an AppImage would bundle the
+# LGPL libraries and owe their source beside it).
+#
+# Built on Ubuntu 22.04, the oldest supported base: a binary links the
+# glibc it was built against, so one built here runs on 22.04 and on
+# everything newer, while one built on 24.04 would not start on 22.04.
+#
+# On demand only, like the Windows build (see build-windows.yml for why
+# not on every push).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for GITHUB_TOKEN: the job checks out, builds and
+# uploads an artifact; it writes nothing back.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System packages (WebKitGTK, GTK and the bundlers' tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential file patchelf \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libxdo-dev
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build the .deb and the .rpm
+        run: npm run tauri:build:linux
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: PointCloudLabeler-linux-packages
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error

@@ -73,7 +73,7 @@ export default function WelcomeScreen({ onNew, onOpen, onOpenRecent, refreshTick
             <div className="flex items-center gap-3 mb-1 flex-wrap">
               <PointCloudLabelerWordmark size={22} />
               <span className="chip" style={{ color: 'var(--text-mute)' }}>
-                Scanner data &middot; Tree segmentation &middot; Forest inventory
+                Tree segmentation &middot; Forest inventory
               </span>
             </div>
             <div className="mono text-[11px]" style={{ color: 'var(--text-mute)', lineHeight: 1.55 }}>

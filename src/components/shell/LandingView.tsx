@@ -43,7 +43,7 @@ export default function LandingView({ list, onImport, onOpen }: Props) {
         </h1>
         <p className="text-[13px] mb-6 text-center" style={{ color: 'var(--text-dim)', lineHeight: 1.6 }}>
           Out-of-core segmentation + labelling for TLS / MLS / ULS / ALS clouds.<br />
-          Open a point cloud, or raw scanner data to process first — or drop it anywhere.
+          Open a point cloud, a folder of tiles or a .zip of clouds — or drop it anywhere.
         </p>
 
         <div className="flex gap-2.5 mb-4">

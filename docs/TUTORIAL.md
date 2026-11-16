@@ -13,7 +13,11 @@ carries labels across. Or substitute your own.
 
 ## 0. Install
 
-See [`README.md`](../README.md) for installation. Open PointCloudLabeler.
+See [`README.md`](../README.md) for installation: an installer for
+Windows, a `.deb` or `.rpm` package for Linux, or a build from
+source. Open PointCloudLabeler. On Linux, should the window stay blank,
+[Linux: a blank window](../README.md#linux-a-blank-window) in the README
+says what the application already does about it and what else to try.
 
 ## 1. Create a project
 

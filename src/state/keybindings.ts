@@ -39,7 +39,7 @@ export interface KeyAction {
 
 // The canonical action list — order defines panel order within each group.
 export const KEY_ACTIONS: readonly KeyAction[] = [
-  { id: 'file.import',          group: 'File',   label: 'Open data (clouds, scanner data)', defaultChord: 'o' },
+  { id: 'file.import',          group: 'File',   label: 'Open data (point clouds, archives, PTX)', defaultChord: 'o' },
   { id: 'file.save',            group: 'File',   label: 'Save edits',                  defaultChord: 'mod+s' },
   { id: 'file.export',          group: 'File',   label: 'Export cloud',               defaultChord: '' },
 

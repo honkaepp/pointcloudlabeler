@@ -20,8 +20,9 @@ skeletons, so tree identities stay stable across a time series and the
 manual correction is done once. Per-tree metrics (height, DBH, taper,
 stem volume with confidence intervals, biomass and carbon), terrain
 rasters, side-by-side comparison of epochs and exports to LAS/LAZ, CSV
-and GeoTIFF complete the workflow. A Windows installer is on the
-GitHub Releases page; macOS and Linux build from source.
+and GeoTIFF complete the workflow. A Windows installer and Linux
+packages (.deb, .rpm) are on the GitHub Releases page; macOS builds
+from source.
 
 
 Requirements

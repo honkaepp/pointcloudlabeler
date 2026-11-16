@@ -88,8 +88,8 @@ keywords:
   - "TreeQSM"
   - "biomass"
 
-version: "0.1.4"
-date-released: "2026-11-13"   # the day v0.1.4 was tagged
+version: "0.1.5"
+date-released: "2026-11-16"   # the day v0.1.5 was tagged
 type: software
 
 # --- Preferred citation (paper, once published) ------------------------

@@ -24,17 +24,18 @@ stem volume with confidence intervals, biomass and carbon), terrain
 rasters, survey measurements (lengths, areas, contours, volumes, ortho
 images, profiles, meshes), side-by-side comparison of epochs in a
 second window and exports to LAS/LAZ, CSV, GeoTIFF, DXF and open QSM
-files complete the workflow. A Windows installer is on the GitHub
-Releases page; macOS and Linux build from source.
+files complete the workflow. A Windows installer and Linux packages
+(`.deb`, `.rpm`) are on the GitHub Releases page; macOS builds from
+source.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![DOI](https://zenodo.org/badge/1354385548.svg)](https://doi.org/10.5281/zenodo.22824704)
 
 ## Status
 
-Version 0.1.4 is the current release: a Windows installer on the
-[Releases](https://github.com/honkaepp/pointcloudlabeler/releases) page,
-built from this repository. Development continues here. A scientific
+Version 0.1.5 is the current release: a Windows installer and Linux
+packages on the [Releases](https://github.com/honkaepp/pointcloudlabeler/releases)
+page, built from this repository. Development continues here. A scientific
 article describing PointCloudLabeler is in preparation; a preprint is
 on SSRN: <https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7602662>.
 
@@ -250,7 +251,31 @@ digest the release page shows beside the asset:
 certutil -hashfile PointCloudLabeler-<version>.zip SHA256
 ```
 
-macOS and Linux have no installers yet; build from source below.
+### Pre-built packages (Linux)
+
+The same release page has a `.deb` and an `.rpm` package for 64-bit
+Linux, built on Ubuntu 22.04 so that they run on it and on everything
+newer:
+
+```bash
+# Debian 12+, Ubuntu 22.04+ and their derivatives
+sudo apt install ./PointCloudLabeler_<version>_amd64.deb
+
+# Fedora 38+
+sudo dnf install ./PointCloudLabeler-<version>-1.x86_64.rpm
+
+pointcloudlabeler-editor     # or PointCloudLabeler in the applications menu
+```
+
+The package itself is called `point-cloud-labeler`: `sudo apt remove
+point-cloud-labeler` or `sudo dnf remove point-cloud-labeler` uninstalls
+it. Projects and settings stay where they are.
+
+Both use the distribution's own WebKitGTK 4.1 and GTK 3, which the
+package manager installs alongside. If the window opens blank, see
+[Linux: a blank window](#linux-a-blank-window) below.
+
+macOS has no installer yet; build from source below.
 
 ### From source
 
@@ -268,8 +293,8 @@ React + Three.js frontend).
 #                Windows 10; on an older machine install the Evergreen
 #                runtime from Microsoft.
 #       macOS    xcode-select --install
-#       Linux    libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-#                patchelf libssl-dev libgtk-3-dev
+#       Linux    WebKitGTK 4.1 and GTK 3 with their headers — the
+#                commands for each distribution are just below.
 #
 # Clone and run:
 git clone https://github.com/honkaepp/pointcloudlabeler.git
@@ -291,6 +316,80 @@ an `.msi`. Both install the same application.)
 
 `npm run pack` then zips that MSI together with the install guide as
 `PointCloudLabeler-<version>.zip`, ready to hand to someone else.
+
+#### Linux
+
+The system packages Tauri needs (tested on Ubuntu 24.04 with WebKitGTK
+2.52; the lists for the other distributions follow the
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)):
+
+```bash
+# Debian 12+, Ubuntu 22.04+
+sudo apt update
+sudo apt install build-essential curl wget file patchelf libssl-dev \
+  libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+  librsvg2-dev libxdo-dev
+
+# Fedora
+sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
+  libappindicator-gtk3-devel librsvg2-devel libxdo-devel patchelf
+sudo dnf group install "c-development"
+
+# Arch
+sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl \
+  appmenu-gtk-module libappindicator-gtk3 librsvg xdotool patchelf
+```
+
+Then Rust and Node as above, and:
+
+```bash
+npm ci
+npm run tauri dev                 # run it from the source tree
+npm run tauri:build:linux         # the .deb and the .rpm
+```
+
+The packages land in `src-tauri/target/release/bundle/deb/` and
+`src-tauri/target/release/bundle/rpm/`; the bare binary is
+`src-tauri/target/release/pointcloudlabeler-editor`. The
+`Build Linux packages` workflow in `.github/workflows/` makes the same
+two packages on GitHub's Ubuntu 22.04 runner.
+
+#### Linux: a blank window
+
+The window is a WebKitGTK web view, and on some machines WebKitGTK
+draws nothing into it: the window opens, the menu works, the page stays
+blank. PointCloudLabeler sets what is known to fix that before
+WebKitGTK starts, so it should not happen — but which machine needs
+what is a moving target, so here is what it does and what else to try.
+
+What the application sets by itself (only where the variable is not
+already set; a variable you set always wins):
+
+| The machine | Set at start |
+| --- | --- |
+| NVIDIA's proprietary driver | `WEBKIT_DISABLE_DMABUF_RENDERER=1` |
+| NVIDIA's driver on a Wayland session | also `__NV_DISABLE_EXPLICIT_SYNC=1` |
+| No GPU render node (`/dev/dri/renderD*`): a virtual machine, a remote desktop | `WEBKIT_DISABLE_DMABUF_RENDERER=1` |
+| Intel or AMD with Mesa | nothing — WebKitGTK's faster default |
+
+What it decided is printed on start (`[graphics] …` on the terminal) and
+written to `~/.config/fi.honkaepp.pointcloudlabeler/crash.log`.
+
+If the window is still blank, try in this order, from a terminal:
+
+```bash
+POINTCLOUDLABELER_GRAPHICS=safe pointcloudlabeler-editor   # the DMA-BUF renderer off on any machine
+GDK_BACKEND=x11 pointcloudlabeler-editor                   # a Wayland session: run under XWayland
+WEBKIT_DISABLE_COMPOSITING_MODE=1 pointcloudlabeler-editor # last resort: no accelerated compositing,
+                                                           # the 3D view may be slow or missing
+```
+
+(`POINTCLOUDLABELER_GRAPHICS=default` does the opposite: it sets nothing
+and leaves WebKitGTK as it is.) In a virtual machine, turn on 3D
+acceleration in its settings: without it the 3D view still works, drawn
+by the CPU (software OpenGL), but slowly. If none of this helps, please
+open an issue with the `[graphics]` line, your distribution, desktop
+(X11 or Wayland), GPU and driver.
 
 ### Without a window: command line, console, API, MCP
 

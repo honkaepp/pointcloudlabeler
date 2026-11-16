@@ -2688,14 +2688,14 @@ dependencies = [
 
 [[package]]
 name = "pointcloudlabeler"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pointcloudlabeler-editor",
 ]
 
 [[package]]
 name = "pointcloudlabeler-editor"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "clap",
