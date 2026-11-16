@@ -653,6 +653,33 @@ remembers which layers it showed. **Project files** lists what was
 unpacked into the project's `imports/` folder; ●/○ shows or hides a
 file's layer, and **all files** lists the rest too.
 
+11. Transfer a segmentation to another scan of the plot
+
+A corrected segmentation can be carried into any other cloud of the same plot, a later year or another sensor. The demo pair on Zenodo is made for this: the 2021 terrestrial scan carries a corrected segmentation in its tree_id column, the 2023 helicopter-borne scan carries none.
+
+Before you start. Both clouds must be in one project and one coordinate system. The target must have its ground classified (chapter 3): the transfer measures every target point's height above the target's own ground and skips points lower than the ground threshold, and without ground points it stops with "no ground points found". The demo target is delivered without a ground classification, so classify it first. The baseline needs one only for its own per-tree metrics, not for the transfer.
+
+Import both clouds (chapter 2). For the terrestrial cloud, tick This file already carries tree_id / semantic / deadwood in extra columns in the import dialog and check that tree_id is matched to the tree_id column.
+Open the airborne cloud and classify its ground (chapter 3).
+Open Tree Skeleton Transfer from the activity bar.
+1. Build skeletons. Choose the terrestrial cloud as Baseline dataset and press Build skeletons. A stem model is fitted to each of the 65 trees and sampled into a skeleton (about 2.1 million points). The result is cached beside the baseline, so one baseline serves any number of targets.
+3. Transfer labels to target. Choose the airborne cloud as Target dataset. The defaults are a 30 cm distance threshold, a 20 cm ground threshold and label points beyond the threshold on. Press Transfer.
+Read the result box. With the defaults it shows about 39.6 % transferred, 48,102 stem and 1,306,451 branch points; the exact percentage moves a little with the ground classification. It is the share of all target points above the ground threshold, and this target covers 60 m × 60 m against the baseline's 40 m × 40 m. The line outside the skeleton's outline (about 2.17 million points) counts what lay outside the baseline's trees and was left unlabelled on purpose. Of the points inside the outline, 92.5 % received a tree.
+To reproduce the numbers of the article, untick label points beyond the threshold and transfer again: 35.6 % of the target, 83.1 % inside the outline, and tree 50 has 57,528 points.
+4. Compare. Open the two clouds side by side under one camera. Points the transfer did not reach are grey. Repair them in Tree Review like any other segmentation.
+
+From the command line the same run is:
+
+bash
+pointcloudlabeler project create --folder ./evo --name Evo --epsg 3067
+pointcloudlabeler dataset import --src-path Evo_TLS_2021_1001.laz --project-folder ./evo --scanner-type tls --tree-id-extra-name tree_id
+pointcloudlabeler dataset import --src-path Evo_HeliALS-TW_2023_1001.laz --project-folder ./evo --scanner-type als
+pointcloudlabeler ground classify --octree-dir ./evo/octrees/Evo_HeliALS-TW_2023_1001
+pointcloudlabeler transfer build-skeletons --baseline-dir ./evo/octrees/Evo_TLS_2021_1001
+pointcloudlabeler transfer run --baseline-dir ./evo/octrees/Evo_TLS_2021_1001 --target-dir ./evo/octrees/Evo_HeliALS-TW_2023_1001
+
+Add --label-beyond-threshold false to the last line for the stricter mode of step 7.
+
 ## Troubleshooting
 
 - **Empty CHM** → ground classification didn't run. Step 3.
